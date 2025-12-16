@@ -140,17 +140,19 @@ class TestDataPipelineIntegration:
         # 测试采集流程
         with patch.object(rss_collector, 'make_request') as mock_request:
             with patch.object(rss_collector, 'parse_rss') as mock_parse:
-                # 设置模拟响应
-                mock_response = Mock()
-                mock_response.text = "RSS content"
-                mock_request.return_value = mock_response
-                mock_parse.return_value = mock_feed
+                # Mock the collector's logger to avoid AtlasLogger issues
+                with patch.object(rss_collector.logger, 'log_collection'):
+                    # 设置模拟响应
+                    mock_response = Mock()
+                    mock_response.text = "RSS content"
+                    mock_request.return_value = mock_response
+                    mock_parse.return_value = mock_feed
 
-                # 记录采集开始
-                logger.log_collection(source_config['name'], 0, "started")
+                    # 记录采集开始
+                    logger.log_collection(source_config['name'], 0, "started")
 
-                # 执行采集
-                items = rss_collector.collect(source_config)
+                    # 执行采集
+                    items = rss_collector.collect(source_config)
 
                 # 记录采集结果
                 logger.log_collection(source_config['name'], len(items), "completed")
@@ -194,21 +196,23 @@ class TestDataPipelineIntegration:
         # 模拟成功采集
         with patch.object(web_collector, 'make_request') as mock_request:
             with patch.object(web_collector, 'parse_html') as mock_parse:
-                # 设置模拟响应
-                mock_response = Mock()
-                mock_response.text = "<html><body><h1>Test Title</h1><article>Test Content</article></body></html>"
-                mock_request.return_value = mock_response
+                # Mock the collector's logger to avoid AtlasLogger issues
+                with patch.object(web_collector.logger, 'log_collection'):
+                    # 设置模拟响应
+                    mock_response = Mock()
+                    mock_response.text = "<html><body><h1>Test Title</h1><article>Test Content</article></body></html>"
+                    mock_request.return_value = mock_response
 
-                # 设置模拟HTML解析
-                from bs4 import BeautifulSoup
-                mock_soup = BeautifulSoup(mock_response.text, 'html.parser')
-                mock_parse.return_value = mock_soup
+                    # 设置模拟HTML解析
+                    from bs4 import BeautifulSoup
+                    mock_soup = BeautifulSoup(mock_response.text, 'html.parser')
+                    mock_parse.return_value = mock_soup
 
-                # 记录采集开始
-                logger.log_collection(source_config['name'], 0, "started")
+                    # 记录采集开始
+                    logger.log_collection(source_config['name'], 0, "started")
 
-                # 执行采集
-                items = web_collector.collect(source_config)
+                    # 执行采集
+                    items = web_collector.collect(source_config)
 
                 # 记录采集结果
                 logger.log_collection(source_config['name'], len(items), "completed")
@@ -245,13 +249,15 @@ class TestDataPipelineIntegration:
 
         # 测试网络错误处理
         with patch.object(rss_collector, 'make_request') as mock_request:
-            mock_request.return_value = None  # 模拟请求失败
+            # Mock the collector's logger to avoid AtlasLogger issues
+            with patch.object(rss_collector.logger, 'log_collection'):
+                mock_request.return_value = None  # 模拟请求失败
 
-            # 记录采集开始
-            logger.log_collection(source_config['name'], 0, "started")
+                # 记录采集开始
+                logger.log_collection(source_config['name'], 0, "started")
 
-            # 执行采集
-            items = rss_collector.collect(source_config)
+                # 执行采集
+                items = rss_collector.collect(source_config)
 
             # 记录采集失败
             logger.log_collection(source_config['name'], 0, "failed", error="Network error")
@@ -400,35 +406,37 @@ class TestDataPipelineIntegration:
 
             # 模拟采集结果
             with patch.object(collector, 'make_request') as mock_request:
-                if source['type'] == 'rss':
-                    with patch.object(collector, 'parse_rss') as mock_parse:
-                        mock_response = Mock()
-                        mock_response.text = "RSS content"
-                        mock_request.return_value = mock_response
+                # Mock the collector's logger to avoid AtlasLogger issues
+                with patch.object(collector.logger, 'log_collection'):
+                    if source['type'] == 'rss':
+                        with patch.object(collector, 'parse_rss') as mock_parse:
+                            mock_response = Mock()
+                            mock_response.text = "RSS content"
+                            mock_request.return_value = mock_response
 
-                        mock_feed = Mock()
-                        mock_feed.bozo = False
-                        mock_feed.entries = [
-                            {
-                                'title': f'Article from {source["name"]}',
-                                'link': f'https://example.com/article',
-                                'description': f'Description from {source["name"]}'
-                            }
-                        ]
-                        mock_parse.return_value = mock_feed
+                            mock_feed = Mock()
+                            mock_feed.bozo = False
+                            mock_feed.entries = [
+                                {
+                                    'title': f'Article from {source["name"]}',
+                                    'link': f'https://example.com/article',
+                                    'description': f'Description from {source["name"]}'
+                                }
+                            ]
+                            mock_parse.return_value = mock_feed
 
-                        items = collector.collect(source)
-                else:  # web
-                    with patch.object(collector, 'parse_html') as mock_parse:
-                        mock_response = Mock()
-                        mock_response.text = f"<html><h1>{source['name']} Content</h1><article>Article content</article></html>"
-                        mock_request.return_value = mock_response
+                            items = collector.collect(source)
+                    else:  # web
+                        with patch.object(collector, 'parse_html') as mock_parse:
+                            mock_response = Mock()
+                            mock_response.text = f"<html><h1>{source['name']} Content</h1><article>Article content</article></html>"
+                            mock_request.return_value = mock_response
 
-                        from bs4 import BeautifulSoup
-                        mock_soup = BeautifulSoup(mock_response.text, 'html.parser')
-                        mock_parse.return_value = mock_soup
+                            from bs4 import BeautifulSoup
+                            mock_soup = BeautifulSoup(mock_response.text, 'html.parser')
+                            mock_parse.return_value = mock_soup
 
-                        items = collector.collect(source)
+                            items = collector.collect(source)
 
             # 记录采集结果
             logger.log_task("source_collection", "completed", source=source['name'], items_count=len(items))

@@ -27,34 +27,27 @@ dependencies = [
     # HTTP 客户端和网络请求
     "requests>=2.31.0",
     "httpx>=0.25.0",
-
     # HTML 和 XML 解析
     "beautifulsoup4>=4.12.0",
     "lxml>=4.9.0",
-
     # 数据处理和验证
     "pydantic>=2.5.0",
     "python-dateutil>=2.8.0",
-
     # RSS/Atom 解析
     "feedparser>=6.0.0",
-
     # 配置管理
     "pyyaml>=6.0.0",
     "python-dotenv>=1.0.0",
-
     # 日志和监控
     "loguru>=0.7.0",
-
     # 命令行工具
     "click>=8.1.0",
     "rich>=13.0.0",
-
     # 任务调度
     "schedule>=1.2.0",
-
     # 数据库 (SQLite 标准库，但添加辅助工具)
     "sqlite-utils>=3.35.0",
+    "pydantic-settings>=2.12.0",
 ]
 
 [project.optional-dependencies]
@@ -218,4 +211,9 @@ exclude_lines = [
     "if __name__ == .__main__.:",
     "class .*\\bProtocol\\):",
     "@(abc\\.)?abstractmethod",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.2",
 ]

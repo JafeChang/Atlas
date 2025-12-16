@@ -13,7 +13,8 @@ import yaml
 from pathlib import Path
 from typing import Any, Dict, Optional, Union, List
 from dotenv import load_dotenv
-from pydantic import BaseSettings, Field, validator
+from pydantic import Field, validator
+from pydantic_settings import BaseSettings
 
 
 class DatabaseConfig(BaseSettings):
