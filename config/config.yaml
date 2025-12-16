@@ -1,0 +1,37 @@
+# Atlas 系统配置文件
+
+# 基础环境配置
+env: "development"
+debug: false
+log_level: "INFO"
+
+# 数据存储路径
+data_dir: "./data"
+config_dir: "./config"
+log_dir: "./logs"
+
+# 系统设置
+system:
+  name: "Atlas"
+  version: "0.1.0"
+  max_memory_usage: "2GB"
+  max_cpu_usage: 50
+
+# 数据采集设置
+collection:
+  default_interval: 300  # 5分钟
+  max_retries: 3
+  retry_delay: 60
+  batch_size: 10
+
+# 数据处理设置
+processing:
+  content_min_length: 100
+  content_max_length: 100000
+  duplicate_threshold: 0.8
+
+# 缓存设置
+cache:
+  enabled: true
+  ttl: 3600  # 1小时
+  max_size: 1000

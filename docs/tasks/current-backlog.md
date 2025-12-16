@@ -50,30 +50,32 @@ reviewer: "用户"
 task_id: "TASK-001"
 title: "环境搭建与项目初始化"
 priority: "P0"
-status: "⏳ 计划中"
+status: "✅ 已完成"
 assigned_to: "Claude Sonnet"
 estimated_hours: 4
+actual_hours: 2
 due_date: "2025-01-20"
+completed_date: "2025-01-17"
 
 subtasks:
   - id: "TASK-001-1"
     title: "Python 3.13 + uv 环境配置"
-    status: "⏳ 计划中"
+    status: "✅ 已完成"
     files: ["pyproject.toml", ".env.example"]
 
   - id: "TASK-001-2"
     title: "项目目录结构创建"
-    status: "⏳ 计划中"
+    status: "✅ 已完成"
     files: ["src/", "data/", "config/", "logs/"]
 
   - id: "TASK-001-3"
     title: "基础配置管理"
-    status: "⏳ 计划中"
+    status: "✅ 已完成"
     files: ["src/core/config.py"]
 
   - id: "TASK-001-4"
     title: "日志系统初始化"
-    status: "⏳ 计划中"
+    status: "✅ 已完成"
     files: ["src/core/logging.py"]
 
 deliverables:
