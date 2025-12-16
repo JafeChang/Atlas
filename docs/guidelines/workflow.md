@@ -80,6 +80,7 @@ Claude 行为：
 - 运行方式
 - 回滚方式
 - 最小验证方法
+- **单元测试覆盖（如有新功能）**
 
 ---
 
@@ -133,8 +134,117 @@ Claude 行为：
 
 ---
 
-## 7. 核心原则
+## 7. 单元测试规范
+
+### 7.1 测试优先级
+
+**必须测试：**
+- 新增核心功能模块
+- 配置管理逻辑
+- 数据转换和验证
+- 错误处理路径
+- 关键业务逻辑
+
+**建议测试：**
+- 工具函数
+- 数据模型类
+- 接口层（CLI、API）
+
+**可选测试：**
+- 简单数据访问层
+- 第三方库包装器
+- 纯展示逻辑
+
+### 7.2 测试文件组织
+
+```
+tests/
+├── conftest.py              # pytest配置和共享fixtures
+├── unit/                    # 单元测试
+│   ├── test_config.py       # 配置系统测试
+│   ├── test_logging.py      # 日志系统测试
+│   ├── test_collectors.py   # 数据采集测试
+│   └── test_*.py           # 其他模块测试
+├── integration/             # 集成测试
+│   └── test_data_pipeline.py # 数据管道集成测试
+└── fixtures/               # 测试数据（如有）
+```
+
+### 7.3 测试编写标准
+
+**命名规范：**
+- 测试文件：`test_<module_name>.py`
+- 测试类：`Test<ClassName>`
+- 测试方法：`test_<specific_behavior>`
+
+**测试结构（AAA模式）：**
+```python
+def test_specific_behavior():
+    # Arrange - 准备测试数据和环境
+    config = Mock()
+    collector = Collector(config)
+
+    # Act - 执行被测试的行为
+    result = collector.collect(source_config)
+
+    # Assert - 验证结果
+    assert len(result) == expected_count
+    assert result[0]['title'] == expected_title
+```
+
+**Mock使用原则：**
+- 隔离外部依赖（网络、文件系统、数据库）
+- 测试边界条件（空值、异常、大数据量）
+- 验证交互行为（调用次数、参数）
+
+### 7.4 测试运行和CI
+
+**本地运行：**
+```bash
+# 运行所有测试
+pytest
+
+# 运行特定模块测试
+pytest tests/unit/test_config.py
+
+# 运行带覆盖率的测试
+pytest --cov=src/atlas --cov-report=html
+
+# 运行集成测试
+pytest -m integration
+```
+
+**测试标记：**
+- `@pytest.mark.unit`: 单元测试
+- `@pytest.mark.integration`: 集成测试
+- `@pytest.mark.slow`: 慢速测试
+
+### 7.5 Claude测试工作流
+
+1. **编写新功能时**：同步编写对应单元测试
+2. **修改现有功能时**：更新或增加相关测试
+3. **重构代码时**：确保测试覆盖重构路径
+4. **交付前检查**：运行相关测试确保通过
+
+### 7.6 测试质量标准
+
+**好的测试特征：**
+- 快速执行（单元测试 < 1秒）
+- 独立运行（不依赖执行顺序）
+- 明确断言（具体的期望值）
+- 覆盖边界（正常、异常、边界情况）
+
+**避免的测试反模式：**
+- 测试实现细节而非行为
+- 过度复杂的Mock设置
+- 依赖外部系统状态
+- 测试多个不相关的功能
+
+---
+
+## 8. 核心原则
 
 - 一次只推进一小步
 - 所有东西可回滚
 - 优先可运行，再优雅
+- **测试驱动，质量优先**

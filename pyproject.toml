@@ -1,0 +1,219 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "atlas"
+version = "0.1.0"
+description = "Atlas 个人信息聚合系统 - MVP版本"
+readme = "README.md"
+license = {file = "LICENSE"}
+requires-python = ">=3.13"
+authors = [
+    {name = "Atlas Team", email = "atlas@example.com"},
+]
+keywords = ["information-aggregation", "llm", "data-collection"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Internet :: WWW/HTTP :: Indexing/Search",
+]
+
+dependencies = [
+    # HTTP 客户端和网络请求
+    "requests>=2.31.0",
+    "httpx>=0.25.0",
+    # HTML 和 XML 解析
+    "beautifulsoup4>=4.12.0",
+    "lxml>=4.9.0",
+    # 数据处理和验证
+    "pydantic>=2.5.0",
+    "python-dateutil>=2.8.0",
+    # RSS/Atom 解析
+    "feedparser>=6.0.0",
+    # 配置管理
+    "pyyaml>=6.0.0",
+    "python-dotenv>=1.0.0",
+    # 日志和监控
+    "loguru>=0.7.0",
+    # 命令行工具
+    "click>=8.1.0",
+    "rich>=13.0.0",
+    # 任务调度
+    "schedule>=1.2.0",
+    # 数据库 (SQLite 标准库，但添加辅助工具)
+    "sqlite-utils>=3.35.0",
+    "pydantic-settings>=2.12.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    # 测试框架
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "pytest-cov>=4.0.0",
+    "pytest-mock>=3.12.0",
+
+    # 代码质量
+    "ruff>=0.1.0",
+    "mypy>=1.8.0",
+    "black>=23.0.0",
+    "isort>=5.13.0",
+
+    # 类型检查
+    "types-requests>=2.31.0",
+    "types-python-dateutil>=2.8.0",
+    "types-PyYAML>=6.0.0",
+]
+
+llm = [
+    # LLM 客户端
+    "openai>=1.5.0",
+    "anthropic>=0.8.0",
+]
+
+[project.scripts]
+atlas = "atlas.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/your-username/atlas"
+Repository = "https://github.com/your-username/atlas.git"
+Documentation = "https://github.com/your-username/atlas/docs"
+"Bug Tracker" = "https://github.com/your-username/atlas/issues"
+
+[tool.hatch.version]
+path = "src/atlas/__init__.py"
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/src",
+    "/config",
+    "/scripts",
+    "/tests",
+    "/docs",
+    "/README.md",
+    "/LICENSE",
+    "/pyproject.toml",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/atlas"]
+
+# Ruff 配置
+[tool.ruff]
+target-version = "py313"
+line-length = 88
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "B",   # flake8-bugbear
+    "C4",  # flake8-comprehensions
+    "UP",  # pyupgrade
+]
+ignore = [
+    "E501",  # line too long, handled by black
+    "B008",  # do not perform function calls in argument defaults
+    "C901",  # too complex
+]
+
+[tool.ruff.per-file-ignores]
+"__init__.py" = ["F401"]
+
+# Black 配置
+[tool.black]
+target-version = ['py313']
+line-length = 88
+include = '\.pyi?$'
+extend-exclude = '''
+/(
+  # directories
+  \.eggs
+  | \.git
+  | \.hg
+  | \.mypy_cache
+  | \.tox
+  | \.venv
+  | build
+  | dist
+)/
+'''
+
+# isort 配置
+[tool.isort]
+profile = "black"
+multi_line_output = 3
+line_length = 88
+known_first_party = ["atlas"]
+
+# MyPy 配置
+[tool.mypy]
+python_version = "3.13"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+disallow_untyped_decorators = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_no_return = true
+warn_unreachable = true
+strict_equality = true
+
+[[tool.mypy.overrides]]
+module = [
+    "feedparser.*",
+    "sqlite_utils.*",
+    "schedule.*",
+]
+ignore_missing_imports = true
+
+# Pytest 配置
+[tool.pytest.ini_options]
+minversion = "8.0"
+addopts = "-ra -q --strict-markers --strict-config"
+testpaths = ["tests"]
+python_files = ["test_*.py", "*_test.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "integration: marks tests as integration tests",
+    "unit: marks tests as unit tests",
+]
+
+# Coverage 配置
+[tool.coverage.run]
+source = ["src"]
+omit = [
+    "*/tests/*",
+    "*/test_*",
+    "*/__pycache__/*",
+    "*/.*",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "if self.debug:",
+    "if settings.DEBUG",
+    "raise AssertionError",
+    "raise NotImplementedError",
+    "if 0:",
+    "if __name__ == .__main__.:",
+    "class .*\\bProtocol\\):",
+    "@(abc\\.)?abstractmethod",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.2",
+]

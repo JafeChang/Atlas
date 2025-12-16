@@ -1,0 +1,293 @@
+# Atlas 数据源配置文件
+
+# AI 领域 RSS 信息采集源（高效、可信赖）
+sources:
+  # === OpenAI 官方博客（AI 研究与进展） ===
+  - name: "openai-blog"
+    type: "rss"
+    url: "https://openai.com/blog/rss/"
+    interval: 3600  # 1小时
+    enabled: true
+    tags: ["ai", "research", "openai", "llm"]
+    category: "official_research"
+    description: "OpenAI 官方博客，AI 研究与产品进展"
+    selectors:
+      title: "title"
+      link: "link"
+      description: "description"
+      pub_date: "pubDate"
+    user_agent: "atlas_custom"  # 指定使用的 User-Agent
+
+  # === Synced Review（业内趋势与产业新闻） ===
+  - name: "synced-review"
+    type: "rss"
+    url: "https://syncedreview.com/feed"
+    interval: 1800  # 30分钟
+    enabled: true
+    tags: ["ai", "industry", "news", "trends"]
+    category: "industry_news"
+    description: "AI 行业趋势与产业新闻"
+    selectors:
+      title: "title"
+      link: "link"
+      description: "description"
+      pub_date: "pubDate"
+
+  # === MarkTechPost（机器学习 & 数据科学新闻） ===
+  - name: "marktechpost"
+    type: "rss"
+    url: "https://www.marktechpost.com/feed"
+    interval: 1800  # 30分钟
+    enabled: true
+    tags: ["machine-learning", "data-science", "news"]
+    category: "tech_news"
+    description: "机器学习与数据科学新闻"
+    selectors:
+      title: "title"
+      link: "link"
+      description: "description"
+      pub_date: "pubDate"
+
+  # === Google AI Blog ===
+  - name: "google-ai-blog"
+    type: "rss"
+    url: "https://googleaiblog.blogspot.com/atom.xml"
+    interval: 3600  # 1小时
+    enabled: true
+    tags: ["ai", "research", "google", "deepmind"]
+    category: "official_research"
+    description: "Google AI 官方博客"
+    selectors:
+      title: "title"
+      link: "link"
+      description: "summary"
+      pub_date: "published"
+
+  # === KDnuggets（AI & 数据科学） ===
+  - name: "kdnuggets"
+    type: "rss"
+    url: "https://www.kdnuggets.com/feed"
+    interval: 3600  # 1小时
+    enabled: true
+    tags: ["data-science", "ai", "machine-learning", "analytics"]
+    category: "data_science"
+    description: "数据科学与 AI 资讯"
+    selectors:
+      title: "title"
+      link: "link"
+      description: "description"
+      pub_date: "pubDate"
+
+  # === arXiv 机器学习研究论文 ===
+  - name: "arxiv-machine-learning"
+    type: "rss"
+    url: "https://arxiv.org/rss/cs.LG"
+    interval: 7200  # 2小时
+    enabled: true
+    tags: ["research", "papers", "machine-learning", "arxiv"]
+    category: "academic_research"
+    description: "arXiv 机器学习最新论文"
+    selectors:
+      title: "title"
+      link: "link"
+      description: "description"
+      pub_date: "pubDate"
+
+  - name: "arxiv-computer-vision"
+    type: "rss"
+    url: "https://arxiv.org/rss/cs.CV"
+    interval: 7200  # 2小时
+    enabled: true
+    tags: ["research", "papers", "computer-vision", "arxiv"]
+    category: "academic_research"
+    description: "arXiv 计算机视觉最新论文"
+    selectors:
+      title: "title"
+      link: "link"
+      description: "description"
+      pub_date: "pubDate"
+
+  - name: "arxiv-natural-language"
+    type: "rss"
+    url: "https://arxiv.org/rss/cs.CL"
+    interval: 7200  # 2小时
+    enabled: true
+    tags: ["research", "papers", "nlp", "arxiv"]
+    category: "academic_research"
+    description: "arXiv 自然语言处理最新论文"
+    selectors:
+      title: "title"
+      link: "link"
+      description: "description"
+      pub_date: "pubDate"
+
+  - name: "arxiv-statistical-learning"
+    type: "rss"
+    url: "https://arxiv.org/rss/stat.ML"
+    interval: 7200  # 2小时
+    enabled: true
+    tags: ["research", "papers", "statistical-learning", "arxiv"]
+    category: "academic_research"
+    description: "arXiv 统计机器学习最新论文"
+    selectors:
+      title: "title"
+      link: "link"
+      description: "description"
+      pub_date: "pubDate"
+
+  # === AI-TechPark（AI 科技资讯） ===
+  - name: "ai-techpark"
+    type: "rss"
+    url: "https://ai-techpark.com/category/ai/feed/"
+    interval: 1800  # 30分钟
+    enabled: true
+    tags: ["ai", "technology", "news", "industry"]
+    category: "industry_news"
+    description: "AI 科技资讯与应用"
+    selectors:
+      title: "title"
+      link: "link"
+      description: "description"
+      pub_date: "pubDate"
+
+  # === 额外高质量源（根据需要启用） ===
+  - name: "ai-news-blog"
+    type: "rss"
+    url: "https://artificialintelligence-news.com/feed/"
+    interval: 3600  # 1小时
+    enabled: false  # 默认禁用，可根据需要启用
+    tags: ["ai", "news", "industry"]
+    category: "industry_news"
+    description: "AI 新闻博客"
+    selectors:
+      title: "title"
+      link: "link"
+      description: "description"
+      pub_date: "pubDate"
+
+  - name: "venturebeat-ai"
+    type: "rss"
+    url: "https://venturebeat.com/ai/feed/"
+    interval: 3600  # 1小时
+    enabled: false  # 默认禁用，可根据需要启用
+    tags: ["ai", "business", "venturebeat", "startup"]
+    category: "business_ai"
+    description: "VentureBeat AI 频道"
+    selectors:
+      title: "title"
+      link: "link"
+      description: "description"
+      pub_date: "pubDate"
+
+# 数据源分类配置
+categories:
+  official_research:
+    name: "官方研究"
+    description: "AI 公司官方研究博客"
+    priority: "high"
+
+  industry_news:
+    name: "行业新闻"
+    description: "AI 行业动态和新闻"
+    priority: "high"
+
+  academic_research:
+    name: "学术研究"
+    description: "最新学术论文发布"
+    priority: "medium"
+
+  tech_news:
+    name: "技术新闻"
+    description: "机器学习技术新闻"
+    priority: "medium"
+
+  data_science:
+    name: "数据科学"
+    description: "数据科学与分析相关"
+    priority: "medium"
+
+  business_ai:
+    name: "商业 AI"
+    description: "AI 商业应用和投资"
+    priority: "low"
+
+# 采集器配置
+collectors:
+  http:
+    timeout: 30
+    max_redirects: 5
+    verify_ssl: true
+    follow_redirects: true
+    headers:
+      "Accept": "application/rss+xml, application/xml, text/xml, text/html"
+      "Accept-Language": "en-US,en;q=0.9,zh-CN;q=0.8"
+      "Accept-Encoding": "gzip, deflate"
+      "Connection": "keep-alive"
+      "Cache-Control": "max-age=0"
+
+  # User-Agent 配置
+  user_agents:
+    default: "Atlas/0.1.0 (Information Aggregation System; +https://github.com/your-username/atlas)"
+
+    # 可用的 User-Agent 选项
+    options:
+      atlas_custom: "Atlas/0.1.0 (Information Aggregation System; +https://github.com/your-username/atlas)"
+      atlas_crawler: "Atlas-Crawler/0.1.0 (+https://github.com/your-username/atlas)"
+
+      # 现代浏览器
+      chrome_windows: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+      chrome_mac: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+      firefox_windows: "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0"
+      firefox_mac: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:121.0) Gecko/20100101 Firefox/121.0"
+      safari_mac: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15"
+      edge_windows: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0"
+
+      # 移动设备
+      iphone_safari: "Mozilla/5.0 (iPhone; CPU iPhone OS 17_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Mobile/15E148 Safari/604.1"
+      ipad_safari: "Mozilla/5.0 (iPad; CPU OS 17_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Mobile/15E148 Safari/604.1"
+
+      # 其他常用 User-Agent
+      curl: "curl/7.68.0"
+      wget: "Wget/1.20.3"
+      python_requests: "python-requests/2.31.0"
+
+  rss:
+    parser: "feedparser"
+    strip_html: true
+    content_length_limit: 1000000  # 1MB
+
+# 处理器配置
+processors:
+  content:
+    min_length: 100
+    max_length: 100000
+    clean_html: true
+    extract_links: true
+    normalize_whitespace: true
+    remove_duplicates: true
+
+  deduplication:
+    method: "hybrid"  # hash, content, llm, hybrid
+    threshold: 0.8
+    enabled: true
+    check_within_hours: 24  # 24小时内检查重复
+
+  classification:
+    auto_tag: true
+    confidence_threshold: 0.7
+    max_tags_per_item: 5
+
+# 存储配置
+storage:
+  raw_content: true
+  full_text: true
+  metadata: true
+  extract_images: false  # MVP 阶段暂不处理图片
+
+# 调度配置
+scheduling:
+  default_interval: 3600  # 默认1小时
+  max_concurrent_sources: 3
+  retry_attempts: 3
+  retry_delay: 300  # 5分钟
+  failure_backoff: 2.0  # 指数退避
