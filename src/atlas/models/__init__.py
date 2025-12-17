@@ -1,9 +1,39 @@
 """
-Atlas 数据模型
+Atlas 数据模型包
 
-定义系统中的数据结构和模型。
+包含系统中使用的所有数据结构定义
 """
 
+from .documents import (
+    # 枚举类型
+    DocumentType,
+    ProcessingStatus,
+    TaskStatus,
+    SourceType,
+
+    # 数据模型
+    BaseDocument,
+    RawDocument,
+    ProcessedDocument,
+    DataSource,
+    CollectionTask,
+    SystemMetrics,
+    DuplicateGroup,
+)
+
 __all__ = [
-    # 基础模型将在实现时添加
+    # 枚举类型
+    "DocumentType",
+    "ProcessingStatus",
+    "TaskStatus",
+    "SourceType",
+
+    # 数据模型
+    "BaseDocument",
+    "RawDocument",
+    "ProcessedDocument",
+    "DataSource",
+    "CollectionTask",
+    "SystemMetrics",
+    "DuplicateGroup",
 ]

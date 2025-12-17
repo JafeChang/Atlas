@@ -48,6 +48,8 @@ dependencies = [
     # 数据库 (SQLite 标准库，但添加辅助工具)
     "sqlite-utils>=3.35.0",
     "pydantic-settings>=2.12.0",
+    # 异步文件操作
+    "aiofiles>=23.0.0",
 ]
 
 [project.optional-dependencies]
@@ -216,4 +218,6 @@ exclude_lines = [
 [dependency-groups]
 dev = [
     "pytest>=9.0.2",
+    "pytest-asyncio>=1.3.0",
+    "pytest-cov>=7.0.0",
 ]
