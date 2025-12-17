@@ -51,7 +51,7 @@ class AtlasDatabase:
         self._local = threading.local()
 
         # 使用sqlite-utils进行高级操作
-        self._db: Optional[sqlite_utils.Database] = None
+        self._db: Optional[sqlite_utils.Database] = sqlite_utils.Database(str(self.db_path))
 
         # 立即初始化表结构
         self._initialize_tables()
@@ -63,7 +63,6 @@ class AtlasDatabase:
         """获取数据库连接"""
         if self._db is None:
             self._db = sqlite_utils.Database(str(self.db_path))
-            self._initialize_tables()
         return self._db
 
     @contextmanager
