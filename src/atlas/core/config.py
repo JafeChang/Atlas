@@ -223,7 +223,8 @@ class Config:
         # 加载数据源配置文件
         sources_config_file = self.config_dir / "sources.yaml"
         if sources_config_file.exists():
-            self._config_data['sources'] = yaml.safe_load(sources_config_file)
+            with open(sources_config_file, 'r', encoding='utf-8') as f:
+                self._config_data['sources'] = yaml.safe_load(f)
 
         # 加载环境特定配置文件（如果存在）
         env_config_file = self.config_dir / f"config.{self.env_name}.yaml"
