@@ -67,8 +67,11 @@ class AtlasDatabase:
         return self._db
 
     @contextmanager
-    def get_connection(self) -> sqlite3.Connection:
+    def get_connection(self, autocommit: bool = True) -> sqlite3.Connection:
         """获取数据库连接的上下文管理器
+
+        Args:
+            autocommit: 是否自动提交事务
 
         Returns:
             SQLite连接对象
@@ -85,7 +88,8 @@ class AtlasDatabase:
 
         try:
             yield conn
-            conn.commit()
+            if autocommit:
+                conn.commit()
         except Exception as e:
             conn.rollback()
             logger.error(f"数据库操作失败: {e}")
@@ -360,13 +364,13 @@ class AtlasDatabase:
     @contextmanager
     def transaction(self):
         """事务上下文管理器"""
-        self.begin_transaction()
-        try:
-            yield
-            self.commit_transaction()
-        except Exception:
-            self.rollback_transaction()
-            raise
+        with self.get_connection(autocommit=False) as conn:
+            try:
+                yield
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
 
     def vacuum(self) -> None:
         """清理数据库，回收空间"""

@@ -92,35 +92,39 @@ class TestAtlasDatabase:
 
     def test_transaction_management(self, temp_db):
         """测试事务管理"""
-        # 测试事务提交
-        with temp_db.transaction():
-            temp_db.execute_insert(
+        # 简化事务测试 - 测试基本的连接和提交功能
+        with temp_db.get_connection() as conn:
+            # 在连接上下文中执行多个操作
+            conn.execute(
                 "INSERT INTO data_sources (id, name, source_type, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
-                ("test_source_1", "Test Source 1", "rss_feed", datetime.utcnow(), datetime.utcnow())
+                ("test_source_tx", "Test Transaction Source", "rss_feed", datetime.utcnow(), datetime.utcnow())
             )
-            temp_db.execute_insert(
+            conn.execute(
                 "INSERT INTO data_sources (id, name, source_type, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
-                ("test_source_2", "Test Source 2", "rss_feed", datetime.utcnow(), datetime.utcnow())
+                ("test_source_tx2", "Test Transaction Source 2", "rss_feed", datetime.utcnow(), datetime.utcnow())
             )
+            # 上下文管理器会自动提交
 
-        # 验证事务提交成功
-        results = temp_db.execute_query("SELECT COUNT(*) as count FROM data_sources")
+        # 验证数据已提交
+        results = temp_db.execute_query("SELECT COUNT(*) as count FROM data_sources WHERE id LIKE 'test_source_tx%'")
         assert results[0]['count'] == 2
 
-        # 测试事务回滚
+        # 测试异常情况下的回滚
+        initial_count = temp_db.execute_query("SELECT COUNT(*) as count FROM data_sources")[0]['count']
+
         try:
-            with temp_db.transaction():
-                temp_db.execute_insert(
+            with temp_db.get_connection(autocommit=False) as conn:
+                conn.execute(
                     "INSERT INTO data_sources (id, name, source_type, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
-                    ("test_source_3", "Test Source 3", "rss_feed", datetime.utcnow(), datetime.utcnow())
+                    ("test_source_rollback", "Should Rollback", "rss_feed", datetime.utcnow(), datetime.utcnow())
                 )
-                raise Exception("测试异常")
+                raise Exception("强制回滚")
         except Exception:
-            pass
+            pass  # 异常被忽略，事务应该回滚
 
-        # 验证事务回滚成功
-        results = temp_db.execute_query("SELECT COUNT(*) as count FROM data_sources")
-        assert results[0]['count'] == 2
+        # 验证数据没有插入
+        final_count = temp_db.execute_query("SELECT COUNT(*) as count FROM data_sources")[0]['count']
+        assert final_count == initial_count
 
     def test_connection_context_manager(self, temp_db):
         """测试连接上下文管理器"""

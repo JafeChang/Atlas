@@ -4,6 +4,7 @@ pytest 配置文件
 提供测试夹具和测试环境配置。
 """
 
+import asyncio
 import os
 import sys
 import tempfile
@@ -212,6 +213,10 @@ def pytest_collection_modifyitems(config, items):
     """修改测试收集行为"""
     # 为集成测试添加标记
     for item in items:
+        # 为异步测试添加标记
+        if asyncio.iscoroutinefunction(item.function):
+            item.add_marker(pytest.mark.asyncio)
+
         # 根据文件路径和测试名称判断测试类型
         if "integration" in item.nodeid or "e2e" in item.nodeid:
             item.add_marker(pytest.mark.integration)
