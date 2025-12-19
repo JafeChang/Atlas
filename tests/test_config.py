@@ -10,49 +10,68 @@ from typing import Dict, Any
 class TestConfig:
     """测试配置类"""
 
-    # 测试URL配置
+    # 测试URL配置 - 使用真实RSS源
     TEST_URLS = {
-        "base_domain": "example.com",
-        "subdomain": "sub.test.com",
+        "base_domain": "rsshub.app",
+        "subdomain": "feeds.bbci.co.uk",
         "port_domain": "example.com:8080",
 
-        # RSS相关
-        "rss_feed": "https://example.com/rss.xml",
+        # RSS相关 - 真实可用RSS源
+        "rss_feed": "https://rsshub.app/python/python/topics",
         "rss_feed_with_auth": "https://secure.example.com/rss.xml",
 
         # API相关
         "api_base": "https://api.example.com",
         "api_endpoint": "https://api.example.com/v1/data",
 
-        # 采集器测试
-        "tech_rss": "https://feeds.example.com/tech",
-        "news_rss": "https://feeds.example.com/news",
-        "blog_site": "https://blog.example.com",
+        # 采集器测试 - 真实RSS源
+        "tech_rss": "https://rsshub.app/ithome/topics/hot",
+        "news_rss": "https://feeds.bbci.co.uk/news/world/rss.xml",
+        "blog_site": "https://rsshub.app/zhihu/daily-hot",
+        "github_python": "https://rsshub.app/github/trending/daily/python",
+        "infoq_tech": "https://www.infoq.cn/feed",
+        "stackoverflow_questions": "https://stackoverflow.com/feeds",
+        "v2ex_hot": "https://rsshub.app/v2ex/topics/hot",
+        "juejin_category": "https://rsshub.app/juejin/category/backend",
 
         # 错误测试
         "invalid_url": "https://invalid-url.com/rss.xml",
         "timeout_url": "https://slow.example.com",
     }
 
-    # 测试域名配置
+    # 测试域名配置 - 对应真实RSS源
     TEST_DOMAINS = {
-        "example": "example.com",
-        "subdomain": "sub.example.com",
+        "example": "rsshub.app",
+        "bbc": "feeds.bbci.co.uk",
+        "github": "rsshub.app",
+        "infoq": "www.infoq.cn",
+        "stackoverflow": "stackoverflow.com",
+        "v2ex": "rsshub.app",
+        "juejin": "rsshub.app",
         "restricted": "restricted.example.com",
         "test": "test.example.com",
     }
 
-    # 测试内容配置
+    # 测试内容配置 - 真实RSS可能的内容
     TEST_CONTENT = {
         "article_links": [
-            "https://example.com/article1",
-            "https://example.com/article2",
-            "https://example.com/article3",
+            "https://github.com/trending/python",
+            "https://www.infoq.cn/article/2024/01/tech-trends",
+            "https://stackoverflow.com/questions/12345678/python-help",
+            "https://www.v2ex.com/t/123456",
+            "https://juejin.cn/post/1234567890",
         ],
         "relative_paths": [
-            "/relative/path",
-            "/api/v1/data",
-            "/blog/test-article",
+            "/python/python/topics",
+            "/ithome/topics/hot",
+            "/github/trending/daily/python",
+            "/v2ex/topics/hot",
+            "/juejin/category/backend",
+        ],
+        "expected_tags": [
+            "python", "programming", "tech", "development",
+            "tutorial", "trending", "hot", "opensource",
+            "architecture", "enterprise", "startup", "discussion"
         ]
     }
 
@@ -76,33 +95,33 @@ class TestConfig:
 class TestRSSConfig:
     """RSS测试配置"""
 
-    # 标准RSS配置
+    # 标准RSS配置 - 使用Python主题RSS
     STANDARD_RSS_CONFIG = {
-        "name": "test-rss",
+        "name": "python-topics",
         "type": "rss",
         "url": TestConfig.get_url("rss_feed"),
         "enabled": True,
-        "tags": ["test", "rss"],
-        "category": "test"
+        "tags": ["python", "programming", "test"],
+        "category": "development"
     }
 
-    # 技术博客配置
+    # 技术博客配置 - 使用IT之家热门主题
     TECH_BLOG_CONFIG = {
-        "name": "tech-blog",
+        "name": "ithome-hot",
         "type": "rss",
         "url": TestConfig.get_url("tech_rss"),
         "enabled": True,
-        "tags": ["tech", "programming"],
+        "tags": ["tech", "programming", "hot"],
         "category": "technology"
     }
 
-    # 新闻站点配置
+    # 新闻站点配置 - 使用BBC世界新闻
     NEWS_SITE_CONFIG = {
-        "name": "news-site",
+        "name": "bbc-world-news",
         "type": "rss",
         "url": TestConfig.get_url("news_rss"),
         "enabled": False,
-        "tags": ["news", "general"],
+        "tags": ["news", "world", "general"],
         "category": "news"
     }
 
@@ -116,6 +135,56 @@ class TestRSSConfig:
         "category": "premium"
     }
 
+    # GitHub Python趋势配置
+    GITHUB_PYTHON_CONFIG = {
+        "name": "github-python-trending",
+        "type": "rss",
+        "url": TestConfig.get_url("github_python"),
+        "enabled": True,
+        "tags": ["github", "python", "trending", "opensource"],
+        "category": "development"
+    }
+
+    # InfoQ技术配置
+    INFOQ_TECH_CONFIG = {
+        "name": "infoq-tech",
+        "type": "rss",
+        "url": TestConfig.get_url("infoq_tech"),
+        "enabled": True,
+        "tags": ["infoq", "tech", "architecture", "enterprise"],
+        "category": "technology"
+    }
+
+    # Stack Overflow问答配置
+    STACKOVERFLOW_CONFIG = {
+        "name": "stackoverflow-questions",
+        "type": "rss",
+        "url": TestConfig.get_url("stackoverflow_questions"),
+        "enabled": True,
+        "tags": ["stackoverflow", "qa", "programming", "help"],
+        "category": "development"
+    }
+
+    # V2EX热门配置
+    V2EX_HOT_CONFIG = {
+        "name": "v2ex-hot",
+        "type": "rss",
+        "url": TestConfig.get_url("v2ex_hot"),
+        "enabled": True,
+        "tags": ["v2ex", "tech", "startup", "discussion"],
+        "category": "technology"
+    }
+
+    # 掘金后端分类配置
+    JUEJIN_BACKEND_CONFIG = {
+        "name": "juejin-backend",
+        "type": "rss",
+        "url": TestConfig.get_url("juejin_category"),
+        "enabled": True,
+        "tags": ["juejin", "backend", "programming", "tutorial"],
+        "category": "development"
+    }
+
     @classmethod
     def get_config(cls, config_type: str) -> Dict[str, Any]:
         """获取指定类型的RSS配置"""
@@ -124,6 +193,11 @@ class TestRSSConfig:
             "tech": cls.TECH_BLOG_CONFIG,
             "news": cls.NEWS_SITE_CONFIG,
             "auth": cls.AUTH_RSS_CONFIG,
+            "github": cls.GITHUB_PYTHON_CONFIG,
+            "infoq": cls.INFOQ_TECH_CONFIG,
+            "stackoverflow": cls.STACKOVERFLOW_CONFIG,
+            "v2ex": cls.V2EX_HOT_CONFIG,
+            "juejin": cls.JUEJIN_BACKEND_CONFIG,
         }
         return configs.get(config_type, cls.STANDARD_RSS_CONFIG)
 
