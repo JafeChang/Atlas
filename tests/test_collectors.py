@@ -18,6 +18,7 @@ from atlas.collectors.rate_limiter import (
 from atlas.collectors.base import BaseCollector
 from atlas.collectors.rss_collector import RSSCollector
 from tests.utils import create_sample_config, TestDataGenerator
+from tests.test_config import TEST_CONFIG, TEST_RSS_CONFIG
 
 
 class TestHTTPClient:
@@ -62,12 +63,12 @@ class TestHTTPClient:
         mock_response.text = "test content"
         mock_response.content = b"test content"
         mock_response.encoding = "utf-8"
-        mock_response.url = "https://example.com"
+        mock_response.url = TEST_CONFIG.get_url("rss_feed")
         mock_response.headers = {"Content-Type": "text/plain"}
         mock_request.return_value = mock_response
 
         client = HTTPClient(mock_config, request_config)
-        response = client.get("https://example.com")
+        response = client.get(TEST_CONFIG.get_url("rss_feed"))
 
         assert response is not None
         assert response.status_code == 200
@@ -81,7 +82,7 @@ class TestHTTPClient:
         mock_request.side_effect = requests.exceptions.Timeout()
 
         client = HTTPClient(mock_config, request_config)
-        response = client.get("https://example.com")
+        response = client.get(TEST_CONFIG.get_url("rss_feed"))
 
         assert response is None
         assert client.stats['failed_requests'] == 1
@@ -89,10 +90,11 @@ class TestHTTPClient:
     def test_cache_manager(self):
         """测试缓存管理器"""
         cache_manager = CacheManager()
+        test_url = TEST_CONFIG.get_url("rss_feed")
 
         # 测试缓存设置和获取
         response = Response(
-            url="https://example.com",
+            url=test_url,
             status_code=200,
             headers={"Content-Type": "text/plain"},
             content="test content".encode('utf-8'),
@@ -102,10 +104,10 @@ class TestHTTPClient:
         )
 
         # 设置缓存
-        cache_manager.set(response, "https://example.com")
+        cache_manager.set(response, test_url)
 
         # 获取缓存
-        cached_response = cache_manager.get("https://example.com")
+        cached_response = cache_manager.get(test_url)
         assert cached_response is not None
         assert cached_response.text == "test content"
         assert cached_response.from_cache is True
@@ -113,9 +115,10 @@ class TestHTTPClient:
     def test_cache_expiration(self):
         """测试缓存过期"""
         cache_manager = CacheManager()
+        test_url = TEST_CONFIG.get_url("rss_feed")
 
         response = Response(
-            url="https://example.com",
+            url=test_url,
             status_code=200,
             headers={},
             content="test content".encode('utf-8'),
@@ -125,17 +128,17 @@ class TestHTTPClient:
         )
 
         # 设置短缓存时间
-        cache_manager.set(response, "https://example.com", ttl=1)
+        cache_manager.set(response, test_url, ttl=1)
 
         # 立即获取应该成功
-        cached_response = cache_manager.get("https://example.com")
+        cached_response = cache_manager.get(test_url)
         assert cached_response is not None
 
         # 等待过期
         time.sleep(1.1)
 
         # 再次获取应该失败
-        cached_response = cache_manager.get("https://example.com")
+        cached_response = cache_manager.get(test_url)
         assert cached_response is None
 
 
@@ -261,8 +264,8 @@ class TestBaseCollector:
 
         collector = TestCollector(config)
 
-        assert collector.get_domain_from_url("https://example.com/path") == "example.com"
-        assert collector.get_domain_from_url("http://sub.test.com/path") == "sub.test.com"
+        assert collector.get_domain_from_url(f"https://{TEST_CONFIG.get_domain('example')}/path") == TEST_CONFIG.get_domain('example')
+        assert collector.get_domain_from_url(f"http://{TEST_CONFIG.get_domain('subdomain')}/path") == TEST_CONFIG.get_domain('subdomain')
 
 
 class TestRSSCollector:
@@ -277,14 +280,7 @@ class TestRSSCollector:
     @pytest.fixture
     def sample_rss_config(self):
         """示例 RSS 配置"""
-        return {
-            "name": "test-rss",
-            "type": "rss",
-            "url": "https://example.com/rss.xml",
-            "enabled": True,
-            "tags": ["test", "rss"],
-            "category": "test"
-        }
+        return TEST_RSS_CONFIG.get_config("standard")
 
     def test_rss_collector_init(self, mock_config):
         """测试 RSS 采集器初始化"""
@@ -321,19 +317,20 @@ class TestRSSCollector:
     def test_extract_entry(self, mock_config):
         """测试 RSS 条目提取"""
         collector = RSSCollector(mock_config)
+        base_url = TEST_CONFIG.get_full_url("example", "/")
 
         # 模拟 feedparser 条目
         mock_entry = Mock()
         mock_entry.title = "Test Article"
-        mock_entry.link = "https://example.com/article"
+        mock_entry.link = "/article"
         mock_entry.description = "Test description"
         mock_entry.published_parsed = time.struct_time((2024, 1, 1, 12, 0, 0, 0, 1, 0))
         mock_entry.id = "article-123"
 
-        item = collector._extract_entry(mock_entry, "https://example.com/")
+        item = collector._extract_entry(mock_entry, base_url)
 
         assert item['title'] == "Test Article"
-        assert item['link'] == "https://example.com/article"
+        assert item['link'] == TEST_CONFIG.get_full_url("example", "/article")
         assert item['description'] == "Test description"
         assert item['pub_date'] == "2024-01-01 12:00:00"
         assert item['id'] == "article-123"
@@ -345,7 +342,7 @@ class TestRSSCollector:
         # 有效条目
         valid_entry = {
             'title': 'Test Article',
-            'link': 'https://example.com/article',
+            'link': TEST_CONFIG.get_full_url("example", "/article"),
             'content': 'Test content with enough length'
         }
         assert collector.validate_rss_entry(valid_entry) is True
@@ -366,15 +363,16 @@ class TestRSSCollector:
     def test_relative_link_handling(self, mock_config):
         """测试相对链接处理"""
         collector = RSSCollector(mock_config)
+        base_url = TEST_CONFIG.get_full_url("example", "/")
 
         mock_entry = Mock()
         mock_entry.title = "Test Article"
         mock_entry.link = "/relative/path"
         mock_entry.description = "Test description"
 
-        item = collector._extract_entry(mock_entry, "https://example.com/")
+        item = collector._extract_entry(mock_entry, base_url)
 
-        assert item['link'] == "https://example.com/relative/path"
+        assert item['link'] == TEST_CONFIG.get_full_url("example", "/relative/path")
 
 
 class TestCollectorIntegration:
@@ -395,7 +393,7 @@ class TestCollectorIntegration:
         source_config = {
             "name": "async-test",
             "type": "test",
-            "url": "https://example.com"
+            "url": TEST_CONFIG.get_url("rss_feed")
         }
 
         items = await collector.collect_async(source_config)
@@ -415,7 +413,7 @@ class TestCollectorIntegration:
         source_config = {
             "name": "stats-test",
             "type": "test",
-            "url": "https://example.com"
+            "url": TEST_CONFIG.get_url("rss_feed")
         }
 
         # 测试带统计的采集

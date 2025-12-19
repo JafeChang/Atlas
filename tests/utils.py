@@ -17,6 +17,9 @@ import pytest
 import yaml
 from httpx import Response as HttpxResponse
 
+# 导入测试配置
+from .test_config import TEST_CONFIG
+
 
 class TempFileManager:
     """临时文件管理器"""
@@ -149,7 +152,7 @@ def create_sample_sources(sources_dir: Path) -> Dict:
             {
                 "name": "tech-rss",
                 "type": "rss",
-                "url": "https://feeds.example.com/tech",
+                "url": TEST_CONFIG.get_url("tech_rss"),
                 "interval": 3600,
                 "enabled": True,
                 "tags": ["tech", "programming"],
@@ -158,7 +161,7 @@ def create_sample_sources(sources_dir: Path) -> Dict:
             {
                 "name": "news-rss",
                 "type": "rss",
-                "url": "https://feeds.example.com/news",
+                "url": TEST_CONFIG.get_url("news_rss"),
                 "interval": 1800,
                 "enabled": False,
                 "tags": ["news", "general"],
@@ -167,7 +170,7 @@ def create_sample_sources(sources_dir: Path) -> Dict:
             {
                 "name": "blog-site",
                 "type": "web",
-                "url": "https://blog.example.com",
+                "url": TEST_CONFIG.get_url("blog_site"),
                 "interval": 7200,
                 "enabled": True,
                 "tags": ["blog", "personal"],
@@ -343,15 +346,16 @@ class TestDataGenerator:
     @staticmethod
     def generate_rss_feed(count: int = 5) -> str:
         """生成 RSS 订阅内容"""
+        base_url = TEST_CONFIG.get_full_url("example", "/")
         items = []
         for i in range(count):
             items.append(f"""
             <item>
               <title>Test Article {i + 1}</title>
               <description>This is test article {i + 1} description</description>
-              <link>https://example.com/article{i + 1}</link>
+              <link>{base_url}article{i + 1}</link>
               <pubDate>Mon, 0{i + 1} Jan 2024 12:00:00 GMT</pubDate>
-              <guid>https://example.com/article{i + 1}</guid>
+              <guid>{base_url}article{i + 1}</guid>
             </item>""")
 
         return f"""<?xml version="1.0" encoding="UTF-8"?>
@@ -359,7 +363,7 @@ class TestDataGenerator:
   <channel>
     <title>Test RSS Feed</title>
     <description>A test RSS feed for testing</description>
-    <link>https://example.com</link>
+    <link>{base_url}</link>
     <language>en-us</language>
     <pubDate>Mon, 01 Jan 2024 12:00:00 GMT</pubDate>
     {''.join(items)}
