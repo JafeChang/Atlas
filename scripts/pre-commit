@@ -1,0 +1,134 @@
+#!/bin/bash
+# Git pre-commit hook for Atlas project
+
+set -e
+
+# 颜色定义
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
+
+echo "🔍 Running pre-commit checks..."
+
+# 检查是否有 Python 文件被修改
+python_files_changed=$(git diff --cached --name-only --diff-filter=ACM | grep '\.py$' || true)
+
+if [ -z "$python_files_changed" ]; then
+    echo "✅ No Python files changed, skipping Python checks"
+    exit 0
+fi
+
+# 确保 uv 可用
+if ! command -v uv &> /dev/null; then
+    if command -v python &> /dev/null && [ -d ".venv" ]; then
+        source .venv/bin/activate
+        PYTHON_CMD="python"
+    else
+        echo -e "${RED}❌ uv not found and no virtual environment activated${NC}"
+        exit 1
+    fi
+else
+    PYTHON_CMD="uv run python"
+fi
+
+echo "📝 Python files changed:"
+echo "$python_files_changed"
+echo ""
+
+# 运行代码格式化检查
+echo "🎨 Checking code formatting..."
+if command -v black &> /dev/null; then
+    if ! black --check $python_files_changed; then
+        echo -e "${YELLOW}⚠️ Code formatting issues found. Run 'black .' to fix.${NC}"
+        exit 1
+    fi
+else
+    echo -e "${YELLOW}⚠️ Black not found, skipping format check${NC}"
+fi
+
+# 运行导入排序检查
+echo "📚 Checking import sorting..."
+if command -v isort &> /dev/null; then
+    if ! isort --check-only $python_files_changed; then
+        echo -e "${YELLOW}⚠️ Import sorting issues found. Run 'isort .' to fix.${NC}"
+        exit 1
+    fi
+else
+    echo -e "${YELLOW}⚠️ isort not found, skipping import sort check${NC}"
+fi
+
+# 运行 linting
+echo "🔍 Running linter..."
+if command -v ruff &> /dev/null; then
+    if ! ruff check $python_files_changed; then
+        echo -e "${RED}❌ Linting errors found${NC}"
+        exit 1
+    fi
+else
+    echo -e "${YELLOW}⚠️ Ruff not found, skipping linting${NC}"
+fi
+
+# 运行类型检查
+echo "🏷️ Running type checker..."
+if command -v mypy &> /dev/null; then
+    # 只检查修改的文件
+    if ! mypy $python_files_changed; then
+        echo -e "${RED}❌ Type checking errors found${NC}"
+        exit 1
+    fi
+else
+    echo -e "${YELLOW}⚠️ MyPy not found, skipping type checking${NC}"
+fi
+
+# 运行测试
+echo "🧪 Running tests..."
+if command -v pytest &> /dev/null; then
+    # 只运行与修改文件相关的测试
+    test_files=""
+    for file in $python_files_changed; do
+        # 将 src/atlas/file.py 转换为 tests/test_file.py
+        test_file=$(echo "$file" | sed 's|src/atlas/|tests/test_|' | sed 's|\.py$|_test.py|')
+        if [ -f "$test_file" ]; then
+            test_files="$test_files $test_file"
+        fi
+    done
+
+    if [ -n "$test_files" ]; then
+        echo "Running tests for: $test_files"
+        if ! pytest $test_files -v; then
+            echo -e "${RED}❌ Tests failed${NC}"
+            exit 1
+        fi
+    else
+        echo "No specific tests found for changed files"
+    fi
+else
+    echo -e "${YELLOW}⚠️ pytest not found, skipping tests${NC}"
+fi
+
+# 检查文档字符串
+echo "📖 Checking docstrings..."
+for file in $python_files_changed; do
+    # 检查是否有新函数缺少文档字符串
+    new_functions=$(git diff --cached "$file" | grep '^+' | grep -E '^\+def ' | wc -l)
+    if [ "$new_functions" -gt 0 ]; then
+        echo -e "${YELLOW}⚠️ New functions found in $file. Please ensure they have proper docstrings.${NC}"
+    fi
+done
+
+# 检查配置文件语法
+echo "⚙️ Checking configuration files..."
+config_files_changed=$(git diff --cached --name-only --diff-filter=ACM | grep -E '\.(yaml|yml)$' || true)
+
+for file in $config_files_changed; do
+    if command -v python &> /dev/null; then
+        if ! python -c "import yaml; yaml.safe_load(open('$file'))" 2>/dev/null; then
+            echo -e "${RED}❌ YAML syntax error in $file${NC}"
+            exit 1
+        fi
+    fi
+done
+
+echo -e "${GREEN}✅ All pre-commit checks passed!${NC}"
+exit 0

@@ -18,6 +18,9 @@ import yaml
 # 添加 src 目录到 Python 路径
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
+# 导入测试配置
+from tests.test_config import TEST_CONFIG
+
 
 @pytest.fixture(scope="session")
 def test_config_dir():
@@ -49,7 +52,7 @@ def test_config_dir():
             {
                 "name": "test-rss",
                 "type": "rss",
-                "url": "https://example.com/rss.xml",
+                "url": TEST_CONFIG.get_url("rss_feed"),
                 "interval": 3600,
                 "enabled": True,
                 "tags": ["test", "rss"],
@@ -101,27 +104,28 @@ def mock_env_vars():
 @pytest.fixture
 def sample_rss_content():
     """示例 RSS 内容"""
-    return """<?xml version="1.0" encoding="UTF-8"?>
+    base_url = TEST_CONFIG.get_full_url("example", "/")
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
 <rss version="2.0">
   <channel>
     <title>Test RSS Feed</title>
     <description>A test RSS feed for testing</description>
-    <link>https://example.com</link>
+    <link>{base_url}</link>
     <language>en-us</language>
     <pubDate>Mon, 01 Jan 2024 12:00:00 GMT</pubDate>
     <item>
       <title>Test Article 1</title>
       <description>This is a test article description</description>
-      <link>https://example.com/article1</link>
+      <link>{base_url}article1</link>
       <pubDate>Mon, 01 Jan 2024 10:00:00 GMT</pubDate>
-      <guid>https://example.com/article1</guid>
+      <guid>{base_url}article1</guid>
     </item>
     <item>
       <title>Test Article 2</title>
       <description>Another test article description</description>
-      <link>https://example.com/article2</link>
+      <link>{base_url}article2</link>
       <pubDate>Mon, 01 Jan 2024 11:00:00 GMT</pubDate>
-      <guid>https://example.com/article2</guid>
+      <guid>{base_url}article2</guid>
     </item>
   </channel>
 </rss>"""
@@ -130,17 +134,20 @@ def sample_rss_content():
 @pytest.fixture
 def sample_html_content():
     """示例 HTML 内容"""
-    return """
+    base_url = TEST_CONFIG.get_full_url("example", "/")
+    return f"""
 <!DOCTYPE html>
 <html>
 <head>
     <title>Test HTML Page</title>
     <meta name="description" content="A test HTML page">
     <meta name="author" content="Test Author">
+    <link rel="canonical" href="{base_url}">
 </head>
 <body>
     <header>
         <h1>Test Page Title</h1>
+        <nav><a href="{base_url}">Home</a> | <a href="{base_url}/about">About</a></nav>
     </header>
     <main>
         <article class="post">
@@ -148,11 +155,15 @@ def sample_html_content():
             <div class="content">
                 <p>This is the article content with multiple paragraphs.</p>
                 <p>Second paragraph with more content.</p>
+                <p>Link to <a href="{base_url}/external">external site</a>.</p>
             </div>
             <time datetime="2024-01-01T10:00:00Z">January 1, 2024</time>
             <div class="author">By Test Author</div>
         </article>
     </main>
+    <footer>
+        <p>&copy; 2024 <a href="{base_url}">Example Company</a></p>
+    </footer>
 </body>
 </html>
 """
@@ -167,8 +178,8 @@ def mock_requests_response():
         "content-type": "application/xml",
         "content-length": "1000"
     }
-    response.text = sample_rss_content()
-    response.content = sample_rss_content().encode('utf-8')
+    response.text = TestDataGenerator.generate_rss_feed(3)
+    response.content = TestDataGenerator.generate_rss_feed(3).encode('utf-8')
     return response
 
 
@@ -189,7 +200,7 @@ def mock_config():
     config.llm = Mock(spec=LLMConfig)
     config.llm.provider = "local"
     config.llm.model = "qwen2.5:7b"
-    config.llm.base_url = "http://localhost:11434"
+    config.llm.base_url = TEST_CONFIG.get_url("rss_feed")  # 使用测试URL代替硬编码
 
     return config
 

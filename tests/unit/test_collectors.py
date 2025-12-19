@@ -11,6 +11,7 @@ from atlas.collectors.base import BaseCollector, CollectorFactory
 from atlas.collectors.rss_collector import RSSCollector
 from atlas.collectors.web_collector import WebCollector
 from atlas.core.config import CollectionConfig
+from tests.test_config import TEST_CONFIG
 
 
 class TestBaseCollector:
@@ -40,9 +41,10 @@ class TestBaseCollector:
 
     def test_get_domain_from_url(self):
         """测试从 URL 提取域名"""
-        assert self.collector.get_domain_from_url("https://example.com/path") == "example.com"
-        assert self.collector.get_domain_from_url("http://sub.example.org/path") == "sub.example.org"
-        assert self.collector.get_domain_from_url("https://example.com:8080") == "example.com"
+        test_domain = TEST_CONFIG.get_domain("example")
+        assert self.collector.get_domain_from_url(f"https://{test_domain}/path") == test_domain
+        assert self.collector.get_domain_from_url(f"http://sub.{test_domain}/path") == f"sub.{test_domain}"
+        assert self.collector.get_domain_from_url(f"https://{test_domain}:8080") == test_domain
 
     def test_set_user_agent(self):
         """测试设置 User-Agent"""
@@ -73,17 +75,19 @@ class TestBaseCollector:
             mock_response.raise_for_status = Mock()
             mock_request.return_value = mock_response
 
-            response = self.collector.make_request("https://example.com")
+            test_url = TEST_CONFIG.get_url("rss_feed")
+            response = self.collector.make_request(test_url)
 
             assert response is not None
-            mock_request.assert_called_once_with("GET", "https://example.com")
+            mock_request.assert_called_once_with("GET", test_url)
 
     def test_make_request_failure(self):
         """测试失败的 HTTP 请求"""
         with patch.object(self.collector.session, 'request') as mock_request:
             mock_request.side_effect = Exception("Network error")
 
-            response = self.collector.make_request("https://example.com")
+            test_url = TEST_CONFIG.get_url("rss_feed")
+            response = self.collector.make_request(test_url)
 
             assert response is None
 

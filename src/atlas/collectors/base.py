@@ -6,6 +6,7 @@ Atlas 数据采集器基础类
 
 import time
 import random
+import asyncio
 from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional, Union
 from pathlib import Path
@@ -16,22 +17,56 @@ from bs4 import BeautifulSoup
 
 from ..core.config import CollectionConfig
 from ..core.logging import get_logger
+from .http_client import HTTPClient, RequestConfig, Response
+from .rate_limiter import RateLimiter, RateLimitConfig, RateLimitStrategy, AdaptiveRateLimiter
 
 
 class BaseCollector(ABC):
     """数据采集器基础类"""
 
-    def __init__(self, config: CollectionConfig):
+    def __init__(self, config: CollectionConfig, use_rate_limiter: bool = True):
         """初始化采集器
 
         Args:
             config: 采集配置
+            use_rate_limiter: 是否使用频率限制
         """
         self.config = config
         self.logger = get_logger()
-        self.session = requests.Session()
+        self.use_rate_limiter = use_rate_limiter
 
-        # 设置会话默认配置
+        # 设置 HTTP 客户端
+        request_config = RequestConfig(
+            timeout=config.request_timeout,
+            max_retries=3,
+            use_cache=True,
+            cache_ttl=3600,
+            verify_ssl=True
+        )
+        self.http_client = HTTPClient(config, request_config)
+
+        # 设置频率限制器
+        if use_rate_limiter:
+            rate_limit_config = RateLimitConfig(
+                requests_per_second=1.0 / config.rate_limit_delay,
+                strategy=RateLimitStrategy.SLIDING_WINDOW,
+                burst_size=5
+            )
+            self.rate_limiter = AdaptiveRateLimiter(rate_limit_config)
+        else:
+            self.rate_limiter = None
+
+        # 统计信息
+        self.stats = {
+            'total_collections': 0,
+            'successful_collections': 0,
+            'failed_collections': 0,
+            'total_items': 0,
+            'start_time': time.time()
+        }
+
+        # 兼容性：保留旧版 session 接口
+        self.session = self.http_client.session if self.http_client.session else requests.Session()
         self._setup_session()
 
     def _setup_session(self) -> None:
@@ -130,7 +165,79 @@ class BaseCollector(ABC):
         """
         pass
 
-    def make_request(self, url: str, method: str = 'GET', **kwargs) -> Optional[requests.Response]:
+    async def collect_async(self, source_config: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """异步采集数据的抽象方法
+
+        Args:
+            source_config: 数据源配置
+
+        Returns:
+            采集到的数据列表
+        """
+        # 默认实现：同步转异步
+        return await asyncio.get_event_loop().run_in_executor(
+            None, self.collect, source_config
+        )
+
+    def collect_with_stats(self, source_config: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """带统计信息的采集
+
+        Args:
+            source_config: 数据源配置
+
+        Returns:
+            采集到的数据列表
+        """
+        self.stats['total_collections'] += 1
+        source_name = source_config.get('name', 'unknown')
+
+        try:
+            start_time = time.time()
+            items = self.collect(source_config)
+            elapsed_time = time.time() - start_time
+
+            self.stats['successful_collections'] += 1
+            self.stats['total_items'] += len(items)
+
+            self.logger.info(f"采集完成", source=source_name, items=len(items),
+                            elapsed_time=f"{elapsed_time:.3f}s")
+            return items
+
+        except Exception as e:
+            self.stats['failed_collections'] += 1
+            self.logger.exception(f"采集失败", source=source_name, error=str(e))
+            return []
+
+    async def collect_async_with_stats(self, source_config: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """异步带统计信息的采集
+
+        Args:
+            source_config: 数据源配置
+
+        Returns:
+            采集到的数据列表
+        """
+        self.stats['total_collections'] += 1
+        source_name = source_config.get('name', 'unknown')
+
+        try:
+            start_time = time.time()
+            items = await self.collect_async(source_config)
+            elapsed_time = time.time() - start_time
+
+            self.stats['successful_collections'] += 1
+            self.stats['total_items'] += len(items)
+
+            self.logger.info(f"异步采集完成", source=source_name, items=len(items),
+                            elapsed_time=f"{elapsed_time:.3f}s")
+            return items
+
+        except Exception as e:
+            self.stats['failed_collections'] += 1
+            self.logger.exception(f"异步采集失败", source=source_name, error=str(e))
+            return []
+
+    def make_request(self, url: str, method: str = 'GET', **kwargs) -> Optional[Response]:
         """发送 HTTP 请求
 
         Args:
@@ -141,26 +248,64 @@ class BaseCollector(ABC):
         Returns:
             HTTP 响应对象，失败时返回 None
         """
+        domain = self.get_domain_from_url(url)
+
+        # 频率限制检查
+        if self.rate_limiter and not self.rate_limiter.acquire(domain, block=True, timeout=30):
+            self.logger.warning(f"频率限制超时", url=url, domain=domain)
+            return None
+
         try:
-            self.logger.log_request(method, url)
+            self.logger.debug(f"发送请求", url=url, method=method, domain=domain)
 
-            response = self.session.request(method, url, **kwargs)
-            response.raise_for_status()
+            response = self.http_client.request(method, url, **kwargs)
 
-            self.logger.log_request(method, url, response.status_code)
+            if response:
+                self.logger.debug(f"请求成功", url=url, status_code=response.status_code,
+                                from_cache=response.from_cache, elapsed_time=f"{response.elapsed_time:.3f}s")
+            else:
+                self.logger.warning(f"请求失败", url=url, method=method)
+
             return response
 
-        except requests.exceptions.Timeout:
-            self.logger.warning(f"请求超时", url=url, method=method, timeout=self.config.request_timeout)
-            return None
-        except requests.exceptions.ConnectionError:
-            self.logger.warning(f"连接错误", url=url, method=method)
-            return None
-        except requests.exceptions.HTTPError as e:
-            self.logger.warning(f"HTTP 错误", url=url, method=method, status_code=e.response.status_code, error=str(e))
-            return None
         except Exception as e:
             self.logger.exception(f"请求异常", url=url, method=method, error=str(e))
+            return None
+
+    async def make_request_async(self, url: str, method: str = 'GET', **kwargs) -> Optional[Response]:
+        """发送异步 HTTP 请求
+
+        Args:
+            url: 请求 URL
+            method: HTTP 方法
+            **kwargs: 其他请求参数
+
+        Returns:
+            HTTP 响应对象，失败时返回 None
+        """
+        domain = self.get_domain_from_url(url)
+
+        # 频率限制检查
+        if self.rate_limiter:
+            if not await self.rate_limiter.acquire_async(domain, block=True, timeout=30):
+                self.logger.warning(f"异步频率限制超时", url=url, domain=domain)
+                return None
+
+        try:
+            self.logger.debug(f"发送异步请求", url=url, method=method, domain=domain)
+
+            response = await self.http_client.arequest(method, url, **kwargs)
+
+            if response:
+                self.logger.debug(f"异步请求成功", url=url, status_code=response.status_code,
+                                elapsed_time=f"{response.elapsed_time:.3f}s")
+            else:
+                self.logger.warning(f"异步请求失败", url=url, method=method)
+
+            return response
+
+        except Exception as e:
+            self.logger.exception(f"异步请求异常", url=url, method=method, error=str(e))
             return None
 
     def parse_html(self, html_content: str, parser: str = 'html.parser') -> BeautifulSoup:
@@ -318,7 +463,64 @@ class BaseCollector(ABC):
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         """上下文管理器出口"""
-        self.session.close()
+        self.close()
+
+    def get_stats(self) -> Dict[str, Any]:
+        """获取采集器统计信息"""
+        stats = self.stats.copy()
+
+        # 计算运行时间
+        if 'start_time' in stats:
+            stats['runtime'] = time.time() - stats['start_time']
+
+        # 计算成功率
+        if stats['total_collections'] > 0:
+            stats['success_rate'] = stats['successful_collections'] / stats['total_collections']
+        else:
+            stats['success_rate'] = 0.0
+
+        # 添加 HTTP 客户端统计
+        if self.http_client:
+            stats['http_stats'] = self.http_client.get_stats()
+
+        # 添加频率限制器统计
+        if self.rate_limiter:
+            stats['rate_limiter_stats'] = self.rate_limiter.get_stats()
+
+        return stats
+
+    def reset_stats(self) -> None:
+        """重置统计信息"""
+        self.stats = {
+            'total_collections': 0,
+            'successful_collections': 0,
+            'failed_collections': 0,
+            'total_items': 0,
+            'start_time': time.time()
+        }
+
+        if self.http_client:
+            self.http_client.reset_stats()
+
+        if self.rate_limiter:
+            self.rate_limiter.reset_history()
+
+    def close(self) -> None:
+        """关闭采集器，释放资源"""
+        try:
+            if self.http_client:
+                # HTTP 客户端会在 __exit__ 中自动关闭
+                pass
+        except Exception as e:
+            self.logger.warning(f"关闭 HTTP 客户端时出错", error=str(e))
+
+    async def aclose(self) -> None:
+        """异步关闭采集器"""
+        try:
+            if self.http_client:
+                await self.http_client.aclose()
+        except Exception as e:
+            self.logger.warning(f"异步关闭 HTTP 客户端时出错", error=str(e))
 
 
 class CollectorFactory:
