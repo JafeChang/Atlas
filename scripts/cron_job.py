@@ -27,8 +27,8 @@ sys.path.insert(0, str(project_root / "src"))
 
 from atlas.core.config import get_config
 from atlas.core.logging import init_logger, get_logger
-from atlas.core.database import init_database
-from atlas.core.storage import init_storage
+from atlas.core.database import get_database
+from atlas.core.storage import get_storage_manager
 from atlas.scheduler import TaskQueue, CronManager, StatusManager
 from atlas.collectors.rss_collector import RSSCollector
 from atlas.collectors.web_collector import WebCollector
@@ -67,8 +67,8 @@ class AtlasCronScheduler:
         """初始化所有组件"""
         try:
             # 初始化数据库和存储
-            await init_database()
-            await init_storage()
+            await get_database()
+            await get_storage_manager()
 
             # 初始化状态管理器
             status_file = self.config.data_dir / "task_status.json"

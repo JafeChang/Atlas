@@ -5,12 +5,14 @@ Atlas 任务调度模块
 支持 cron 表达式、异步任务执行、任务状态监控等。
 """
 
-from .cron_manager import CronManager
+from .cron_manager import CronManager, CronExpression, CronJob
 from .queue import TaskQueue, Task, TaskPriority, TaskStatus
 from .status import StatusManager, TaskState, TaskMetrics
 
 __all__ = [
     "CronManager",
+    "CronExpression",
+    "CronJob",
     "TaskQueue",
     "Task",
     "TaskPriority",

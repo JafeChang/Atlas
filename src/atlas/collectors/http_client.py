@@ -418,7 +418,7 @@ class HTTPClient:
                 status_code=response.status_code,
                 headers=dict(response.headers),
                 content=response.content,
-                content=response.text,
+                text=response.text,
                 encoding=response.encoding or 'utf-8',
                 elapsed_time=elapsed_time,
                 from_cache=False,
