@@ -22,7 +22,7 @@ project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root / "src"))
 
 from atlas.core.config import get_config
-from atlas.core.database import DatabaseManager
+from atlas.core.database import AtlasDatabase
 from atlas.core.storage import StorageManager
 from atlas.core.error_handler import ErrorHandler, get_global_error_handler, set_global_error_handler
 from atlas.core.resource_manager import ResourceLimits, SystemResourceManager, get_global_resource_manager, set_global_resource_manager
@@ -58,8 +58,7 @@ class SystemIntegrationDemo:
         self.config.ensure_directories()
 
         # 初始化数据库
-        db_manager = DatabaseManager(self.config.database.url)
-        await db_manager.initialize()
+        db_manager = AtlasDatabase(self.config.data_dir / "atlas.db")
         self.components["db_manager"] = db_manager
 
         # 初始化存储
@@ -620,7 +619,7 @@ class SystemIntegrationDemo:
             await self.components["http_client"].close()
 
         if "db_manager" in self.components:
-            await self.components["db_manager"].close()
+            self.components["db_manager"].close()
 
         logger.info("系统资源清理完成")
 

@@ -13,7 +13,7 @@ from datetime import datetime
 from typing import Dict, Any
 
 from atlas.core.config import get_config
-from atlas.core.database import DatabaseManager
+from atlas.core.database import AtlasDatabase
 from atlas.core.storage import StorageManager
 from atlas.core.error_handler import ErrorHandler
 from atlas.core.resource_manager import ResourceLimits, SystemResourceManager
@@ -66,8 +66,7 @@ class TestStressAndResilience:
         )
 
         # 初始化组件
-        db_manager = DatabaseManager(config.database.url)
-        await db_manager.initialize()
+        db_manager = AtlasDatabase(data_dir / "test.db")
 
         storage_manager = StorageManager(data_dir)
 
@@ -116,7 +115,7 @@ class TestStressAndResilience:
         await task_queue.stop()
         await performance_monitor.stop()
         await resource_manager.stop()
-        await db_manager.close()
+        db_manager.close()
 
     @pytest.mark.asyncio
     async def test_high_load_scenario(self, resilient_system):

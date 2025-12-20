@@ -12,7 +12,7 @@ from datetime import datetime
 from typing import List, Dict, Any
 
 from atlas.core.config import get_config
-from atlas.core.database import DatabaseManager
+from atlas.core.database import AtlasDatabase
 from atlas.core.storage import StorageManager
 from atlas.collectors.rss_collector import RSSCollector
 from atlas.collectors.http_client import HTTPClient
@@ -56,8 +56,7 @@ class TestCompleteDataPipeline:
     async def test_components(self, test_config):
         """初始化所有测试组件"""
         # 数据库和存储
-        db_manager = DatabaseManager(test_config.database.url)
-        await db_manager.initialize()
+        db_manager = AtlasDatabase(test_config.data_dir / "test.db")
 
         storage_manager = StorageManager(test_config.data_dir)
 
@@ -119,7 +118,7 @@ class TestCompleteDataPipeline:
         }
 
         # 清理资源
-        await db_manager.close()
+        db_manager.close()
         await http_client.close()
         if llm_client:
             await llm_client.close()
