@@ -35,3 +35,57 @@ cache:
   enabled: true
   ttl: 3600  # 1小时
   max_size: 1000
+
+# LLM 集成设置
+llm:
+  # Ollama 服务配置
+  base_url: "http://localhost:11434"
+  default_model: "llama2"
+  timeout: 30.0
+  max_concurrent: 5
+
+  # 去重配置
+  dedup_strategy: "hybrid"  # hash_only, semantic_only, hybrid
+  similarity_threshold: 0.85  # 相似度阈值 (0.75-0.95)
+  max_content_length: 2000  # 用于语义分析的内容长度
+  batch_size: 5
+  cache_enabled: true
+  cache_ttl: 3600
+  min_content_length: 50
+  enable_tfidf_fallback: true
+  ignore_urls: true
+  normalize_text: true
+
+  # 队列管理配置
+  queue:
+    max_concurrent_tasks: 5
+    max_queue_size: 1000
+    result_ttl: 3600
+
+  # 自适应控制配置
+  controller:
+    enabled: true
+    monitoring_interval: 5.0
+    min_concurrent_tasks: 1
+    max_concurrent_tasks: 10
+    base_request_rate: 1.0
+    enable_auto_scaling: true
+    enable_predictive_control: false
+    cooldown_period: 30.0
+    emergency_stop_enabled: true
+    circuit_breaker_enabled: true
+
+  # 阈值配置
+  thresholds:
+    cpu_warning: 70.0
+    cpu_critical: 80.0
+    cpu_emergency: 90.0
+    memory_warning: 75.0
+    memory_critical: 85.0
+    memory_emergency: 95.0
+    error_rate_warning: 5.0
+    error_rate_critical: 10.0
+    error_rate_emergency: 20.0
+    response_time_warning: 5.0
+    response_time_critical: 10.0
+    response_time_emergency: 30.0

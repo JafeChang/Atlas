@@ -49,11 +49,12 @@ class CollectionConfig(BaseSettings):
 class LLMConfig(BaseSettings):
     """LLM配置"""
 
+    # Ollama 服务配置
     provider: str = Field(default="local", description="LLM提供商: local, openai, anthropic")
-    model: str = Field(default="qwen2.5:7b", description="模型名称")
+    model: str = Field(default="llama2", description="模型名称")
     base_url: str = Field(default="http://localhost:11434", description="API基础URL")
-    timeout: int = Field(default=60, description="请求超时时间(秒)")
-    max_workers: int = Field(default=1, description="最大工作线程数")
+    timeout: float = Field(default=30.0, description="请求超时时间(秒)")
+    max_concurrent: int = Field(default=5, description="最大并发数")
 
     # OpenAI 配置
     openai_api_key: Optional[str] = Field(default=None, description="OpenAI API密钥")
@@ -64,11 +65,67 @@ class LLMConfig(BaseSettings):
     anthropic_api_key: Optional[str] = Field(default=None, description="Anthropic API密钥")
     anthropic_model: str = Field(default="claude-3-sonnet-20240229", description="Anthropic模型名称")
 
+    # 去重配置
+    dedup_strategy: str = Field(default="hybrid", description="去重策略: hash_only, semantic_only, hybrid")
+    similarity_threshold: float = Field(default=0.85, description="相似度阈值")
+    max_content_length: int = Field(default=2000, description="语义分析内容长度")
+    batch_size: int = Field(default=5, description="批处理大小")
+    cache_enabled: bool = Field(default=True, description="启用缓存")
+    cache_ttl: int = Field(default=3600, description="缓存TTL(秒)")
+    min_content_length: int = Field(default=50, description="最小内容长度")
+    enable_tfidf_fallback: bool = Field(default=True, description="启用TF-IDF后备")
+    ignore_urls: bool = Field(default=True, description="忽略URL比较")
+    normalize_text: bool = Field(default=True, description="标准化文本")
+
+    # 队列管理配置
+    queue_max_concurrent_tasks: int = Field(default=5, description="队列最大并发任务数")
+    queue_max_queue_size: int = Field(default=1000, description="队列最大大小")
+    queue_result_ttl: int = Field(default=3600, description="结果缓存TTL(秒)")
+
+    # 自适应控制配置
+    controller_enabled: bool = Field(default=True, description="启用自适应控制")
+    controller_monitoring_interval: float = Field(default=5.0, description="监控间隔(秒)")
+    controller_min_concurrent_tasks: int = Field(default=1, description="最小并发任务数")
+    controller_max_concurrent_tasks: int = Field(default=10, description="最大并发任务数")
+    controller_base_request_rate: float = Field(default=1.0, description="基础请求率")
+    controller_enable_auto_scaling: bool = Field(default=True, description="启用自动扩缩容")
+    controller_cooldown_period: float = Field(default=30.0, description="冷却期(秒)")
+    controller_emergency_stop_enabled: bool = Field(default=True, description="启用紧急停止")
+    controller_circuit_breaker_enabled: bool = Field(default=True, description="启用熔断器")
+
+    # 阈值配置
+    cpu_warning_threshold: float = Field(default=70.0, description="CPU警告阈值")
+    cpu_critical_threshold: float = Field(default=80.0, description="CPU严重阈值")
+    cpu_emergency_threshold: float = Field(default=90.0, description="CPU紧急阈值")
+    memory_warning_threshold: float = Field(default=75.0, description="内存警告阈值")
+    memory_critical_threshold: float = Field(default=85.0, description="内存严重阈值")
+    memory_emergency_threshold: float = Field(default=95.0, description="内存紧急阈值")
+    error_rate_warning_threshold: float = Field(default=5.0, description="错误率警告阈值")
+    error_rate_critical_threshold: float = Field(default=10.0, description="错误率严重阈值")
+    error_rate_emergency_threshold: float = Field(default=20.0, description="错误率紧急阈值")
+    response_time_warning_threshold: float = Field(default=5.0, description="响应时间警告阈值(ms)")
+    response_time_critical_threshold: float = Field(default=10.0, description="响应时间严重阈值(ms)")
+    response_time_emergency_threshold: float = Field(default=30.0, description="响应时间紧急阈值(ms)")
+
     @validator('provider')
     def validate_provider(cls, v):
         """验证LLM提供商"""
         if v not in ['local', 'openai', 'anthropic']:
             raise ValueError(f"不支持的LLM提供商: {v}")
+        return v
+
+    @validator('dedup_strategy')
+    def validate_dedup_strategy(cls, v):
+        """验证去重策略"""
+        if v not in ['hash_only', 'semantic_only', 'hybrid']:
+            raise ValueError(f"不支持的去重策略: {v}")
+        return v
+
+    @validator('similarity_threshold')
+    def validate_similarity_threshold(cls, v):
+        """验证相似度阈值"""
+        if not (0.75 <= v <= 0.95):
+            raise ValueError("相似度阈值必须在0.75-0.95之间")
         return v
 
     class Config:
