@@ -23,7 +23,7 @@ sys.path.insert(0, str(project_root / "src"))
 
 from atlas.core.config import get_config
 from atlas.core.database import AtlasDatabase
-from atlas.core.storage import StorageManager
+from atlas.core.storage import FileStorageManager
 from atlas.core.error_handler import ErrorHandler, get_global_error_handler, set_global_error_handler
 from atlas.core.resource_manager import ResourceLimits, SystemResourceManager, get_global_resource_manager, set_global_resource_manager
 from atlas.monitoring.performance import PerformanceMonitor, get_global_monitor, set_global_monitor
@@ -62,7 +62,7 @@ class SystemIntegrationDemo:
         self.components["db_manager"] = db_manager
 
         # 初始化存储
-        storage_manager = StorageManager(self.config.data_dir)
+        storage_manager = FileStorageManager(self.config.data_dir)
         self.components["storage_manager"] = storage_manager
 
         # 初始化错误处理器

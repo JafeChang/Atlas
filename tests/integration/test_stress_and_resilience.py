@@ -14,7 +14,7 @@ from typing import Dict, Any
 
 from atlas.core.config import get_config
 from atlas.core.database import AtlasDatabase
-from atlas.core.storage import StorageManager
+from atlas.core.storage import FileStorageManager
 from atlas.core.error_handler import ErrorHandler
 from atlas.core.resource_manager import ResourceLimits, SystemResourceManager
 from atlas.monitoring.performance import PerformanceMonitor
@@ -68,7 +68,7 @@ class TestStressAndResilience:
         # 初始化组件
         db_manager = AtlasDatabase(data_dir / "test.db")
 
-        storage_manager = StorageManager(data_dir)
+        storage_manager = FileStorageManager(data_dir)
 
         error_handler = ErrorHandler(
             error_log_file=data_dir / "errors.log",

@@ -13,7 +13,7 @@ from typing import Dict, Any
 
 from atlas.core.config import get_config
 from atlas.core.database import AtlasDatabase
-from atlas.core.storage import StorageManager
+from atlas.core.storage import FileStorageManager
 from atlas.core.error_handler import ErrorHandler, ErrorCategory, ErrorSeverity
 from atlas.core.resource_manager import ResourceLimits, SystemResourceManager
 from atlas.monitoring.performance import PerformanceMonitor, get_global_monitor, set_global_monitor
@@ -61,7 +61,7 @@ class TestSystemIntegration:
         db_manager = AtlasDatabase(data_dir / "test.db")
 
         # 存储管理器
-        storage_manager = StorageManager(data_dir)
+        storage_manager = FileStorageManager(data_dir)
 
         # 错误处理器
         error_handler = ErrorHandler(

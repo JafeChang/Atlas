@@ -13,7 +13,7 @@ from typing import List, Dict, Any
 
 from atlas.core.config import get_config
 from atlas.core.database import AtlasDatabase
-from atlas.core.storage import StorageManager
+from atlas.core.storage import FileStorageManager
 from atlas.collectors.rss_collector import RSSCollector
 from atlas.collectors.http_client import HTTPClient
 from atlas.processors.parser import HTMLParser
@@ -58,7 +58,7 @@ class TestCompleteDataPipeline:
         # 数据库和存储
         db_manager = AtlasDatabase(test_config.data_dir / "test.db")
 
-        storage_manager = StorageManager(test_config.data_dir)
+        storage_manager = FileStorageManager(test_config.data_dir)
 
         # HTTP客户端和采集器
         http_client = HTTPClient(
