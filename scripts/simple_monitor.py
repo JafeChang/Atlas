@@ -115,7 +115,8 @@ def show_collected_files():
     print()
 
     for i, json_file in enumerate(json_files[:10], 1):  # 只显示前10个
-        rel_path = json_file.relative_to(Path.cwd())
+        # 使用绝对路径显示，避免相对路径问题
+        file_path = str(json_file)
         file_size = json_file.stat().st_size
 
         # 尝试读取文件内容
@@ -126,7 +127,7 @@ def show_collected_files():
             if 'items' in data:
                 item_count = len(data['items'])
                 source_name = data.get('source_name', 'Unknown')
-                print(f"{i:2d}. 📄 {rel_path}")
+                print(f"{i:2d}. 📄 {file_path}")
                 print(f"     📊 数据源: {source_name}")
                 print(f"     📝 项目数: {item_count}")
                 print(f"     📏 文件大小: {file_size} bytes")
@@ -135,7 +136,7 @@ def show_collected_files():
                     print(f"     📋 最新项目: {data['items'][0].get('title', 'No Title')[:50]}...")
 
         except Exception as e:
-            print(f"❌ 读取失败 {rel_path}: {e}")
+            print(f"❌ 读取失败 {file_path}: {e}")
 
         print()
 
