@@ -505,7 +505,7 @@ class BaseCollector(ABC):
         if self.rate_limiter:
             self.rate_limiter.reset_history()
 
-    def save_results(self, result, output_dir: str) -> None:
+    def save_results(self, result, output_dir: str, source_name: str = None) -> None:
         """保存采集结果到文件系统
 
         Args:
@@ -516,7 +516,8 @@ class BaseCollector(ABC):
         import asyncio
         from pathlib import Path
         from datetime import datetime
-        from ..core.storage import FileStorageManager, RawDocument, DocumentType, SourceType
+        from ..core.storage import FileStorageManager, RawDocument, DocumentType
+        from ..models.documents import SourceType, ProcessingStatus
 
         # 创建输出目录
         output_path = Path(output_dir)
@@ -526,21 +527,43 @@ class BaseCollector(ABC):
         storage = FileStorageManager(output_path.parent)
 
         try:
-            if result and hasattr(result, 'items') and result.items:
-                self.logger.info(f"开始保存采集结果", items_count=len(result.items), output_dir=str(output_path))
+            # 检查是否有数据 - 支持list类型和对象类型
+            self.logger.info(f"保存结果输入: result类型={type(result)}, result长度={len(result) if isinstance(result, list) else 'N/A'}")
+
+            items_list = []
+            if result and isinstance(result, list):
+                items_list = result
+                self.logger.info(f"检测到list类型数据，项目数: {len(items_list)}")
+            elif result and hasattr(result, 'items') and result.items:
+                items_list = result.items
+                self.logger.info(f"检测到对象类型数据，项目数: {len(items_list)}")
+            else:
+                self.logger.warning(f"未识别的数据类型: {type(result)}, result={result}")
+
+            if items_list:
+                self.logger.info(f"开始保存采集结果", items_count=len(items_list), output_dir=str(output_path))
 
                 saved_count = 0
 
                 # 遍历所有采集到的项目
-                for item in result.items:
+                for idx, item in enumerate(items_list):
                     try:
+                        item_keys = list(item.keys()) if isinstance(item, dict) else type(item)
+                        description_length = len(item.get('description', '')) if isinstance(item, dict) and item.get('description') else 0
+                        self.logger.debug(f"处理第{idx+1}个项目",
+                                       item_keys=item_keys,
+                                       description_length=description_length,
+                                       has_text_content='text_content' in item)
+
                         # 创建原始文档对象
+                        actual_source_name = source_name if source_name else getattr(result, 'source_name', 'unknown')
                         document = RawDocument(
-                            source_id=getattr(result, 'source_name', 'unknown'),
+                            source_id=actual_source_name,
                             source_url=item.get('link'),
-                            source_type=SourceType.RSS if hasattr(result, 'source_type') else SourceType.WEB,
-                            document_type=DocumentType.ARTICLE,
-                            raw_content=item.get('content', item.get('description', '')),
+                            source_type=SourceType.RSS_FEED,
+                            document_type=DocumentType.RSS,
+                            processing_status=ProcessingStatus.COMPLETED,
+                            raw_content=item.get('text_content', item.get('description', item.get('content', ''))),
                             raw_metadata={
                                 'title': item.get('title', ''),
                                 'link': item.get('link', ''),
@@ -554,14 +577,110 @@ class BaseCollector(ABC):
                             collector_version="1.0.0"
                         )
 
-                        # 异步保存文档
-                        file_path = asyncio.run(storage.store_raw_document(document))
-                        saved_count += 1
+                        # 同时保存为JSON文件和数据库记录
+                        try:
+                            import json
+                            import uuid
+                            import sqlite3
+                            from pathlib import Path
 
-                        self.logger.debug(f"保存文档成功", title=item.get('title', 'no-title'), file_path=str(file_path))
+                            # 直接保存为JSON文件，避免async问题
+                            doc_id = str(uuid.uuid4())
+                            file_path = output_path / f"{doc_id}.json"
+
+                            # 准备文档数据
+                            doc_data = {
+                                "id": doc_id,
+                                "source_id": document.source_id,
+                                "source_url": str(document.source_url) if document.source_url else None,
+                                "source_type": document.source_type.value,
+                                "document_type": document.document_type.value,
+                                "raw_content": document.raw_content,
+                                "raw_metadata": document.raw_metadata,
+                                "collected_at": document.collected_at.isoformat(),
+                                "collector_version": document.collector_version,
+                                "processing_status": document.processing_status.value,
+                                "title": document.title,
+                                "author": document.author,
+                                "published_at": document.published_at.isoformat() if document.published_at else None,
+                                "language": document.language,
+                                "created_at": document.created_at.isoformat(),
+                                "updated_at": document.updated_at.isoformat(),
+                                "stored_at": datetime.utcnow().isoformat(),
+                            }
+
+                            # 写入JSON文件
+                            with open(file_path, 'w', encoding='utf-8') as f:
+                                json.dump(doc_data, f, ensure_ascii=False, indent=2)
+
+                            # 保存到数据库
+                            db_path = Path.cwd() / "data" / "atlas.db"
+                            conn = sqlite3.connect(str(db_path))
+                            cursor = conn.cursor()
+
+                            cursor.execute('''
+                                INSERT INTO raw_documents (
+                                    id, source_id, source_url, source_type, document_type,
+                                    raw_content, raw_metadata, collected_at, collector_version,
+                                    processing_status, processing_error, processing_attempts,
+                                    content_hash, title, author, published_at, language,
+                                    created_at, updated_at
+                                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            ''', (
+                                doc_id,
+                                document.source_id,
+                                str(document.source_url) if document.source_url else None,
+                                document.source_type.value,
+                                document.document_type.value,
+                                document.raw_content,
+                                json.dumps(document.raw_metadata, ensure_ascii=False),
+                                document.collected_at,
+                                document.collector_version,
+                                document.processing_status.value,
+                                document.processing_error,
+                                document.processing_attempts,
+                                document.content_hash,
+                                document.title,
+                                document.author,
+                                document.published_at,
+                                document.language,
+                                document.created_at,
+                                document.updated_at
+                            ))
+
+                            conn.commit()
+                            conn.close()
+
+                            self.logger.debug(f"文档保存成功", file_path=str(file_path), database_id=doc_id)
+                            saved_count += 1
+
+                        except Exception as save_error:
+                            import traceback
+                            title = item.get('title', 'unknown')
+                            error_msg = f"直接保存文档失败: title={title}, error={str(save_error)}"
+                            self.logger.error(error_msg,
+                                           title=title,
+                                           error=str(save_error),
+                                           traceback=traceback.format_exc())
+                            # 也直接输出到stderr，确保在web日志中看到
+                            import sys
+                            print(f"ERROR: {error_msg}", file=sys.stderr)
+                            print(f"ERROR: 详细traceback: {traceback.format_exc()}", file=sys.stderr)
+                            continue
 
                     except Exception as e:
-                        self.logger.error(f"保存单个文档失败", title=item.get('title', 'unknown'), error=str(e))
+                        import traceback
+                        title = item.get('title', 'unknown')
+                        error_msg = f"保存单个文档失败: title={title}, error={str(e)}, type={type(e).__name__}"
+                        self.logger.error(error_msg,
+                                       title=item.get('title', 'unknown'),
+                                       error=str(e),
+                                       error_type=type(e).__name__,
+                                       traceback=traceback.format_exc())
+                        # 也直接输出到stderr，确保在web日志中看到
+                        import sys
+                        print(f"ERROR: {error_msg}", file=sys.stderr)
+                        print(f"ERROR: 详细traceback: {traceback.format_exc()}", file=sys.stderr)
                         continue
 
                 # 同时保存一个简化的JSON汇总文件
@@ -569,14 +688,14 @@ class BaseCollector(ABC):
                 summary_data = {
                     'source_name': getattr(result, 'source_name', 'unknown'),
                     'source_url': getattr(result, 'url', ''),
-                    'items_count': len(result.items),
+                    'items_count': len(items_list),
                     'saved_count': saved_count,
                     'collected_at': datetime.now().isoformat(),
                     'items': []
                 }
 
                 # 添加项目摘要（不包含完整内容）
-                for item in result.items:
+                for item in items_list:
                     summary_data['items'].append({
                         'title': item.get('title', ''),
                         'link': item.get('link', ''),
@@ -589,7 +708,7 @@ class BaseCollector(ABC):
                     json.dump(summary_data, f, ensure_ascii=False, indent=2)
 
                 self.logger.info(f"采集结果保存完成",
-                               total_items=len(result.items),
+                               total_items=len(items_list),
                                saved_items=saved_count,
                                summary_file=str(summary_file),
                                output_dir=str(output_path))
@@ -652,6 +771,7 @@ class CollectorFactory:
 
         collectors = {
             'rss': RSSCollector,
+            'rss_feed': RSSCollector,  # RSS Feed 类型
             'atom': RSSCollector,  # Atom 和 RSS 使用相同的采集器
             'web': WebCollector,
             'html': WebCollector,

@@ -163,30 +163,44 @@ class RSSCollector(BaseCollector):
         else:
             item['link'] = raw_link
 
-        # 内容处理 - 增强的内容提取逻辑
+        # 内容处理 - 改进的内容提取逻辑
         content = ''
         content_type = 'text'
 
-        # 优先级: content > description > summary > title
+        # 优先级: content:encoded > content > description > summary > title
         if hasattr(entry, 'content') and entry.content:
             for content_item in entry.content:
-                if content_item.get('type') in ['text/html', 'application/xhtml+xml']:
-                    content = content_item.get('value', '')
-                    content_type = 'html'
+                if hasattr(content_item, 'value'):
+                    content = content_item.value
+                    content_type = 'html' if '<' in content else 'text'
+                    self.logger.debug(f"从content字段提取内容", length=len(content), type=content_type)
                     break
-                elif content_item.get('type') in ['text/plain']:
-                    content = content_item.get('value', '')
-                    content_type = 'text'
-        elif hasattr(entry, 'description'):
+
+        # 如果content为空，尝试description字段
+        if not content and hasattr(entry, 'description'):
             content = entry.description
             content_type = 'html' if '<' in content else 'text'
-        elif hasattr(entry, 'summary'):
+            self.logger.debug(f"从description字段提取内容", length=len(content), type=content_type)
+
+        # 如果仍然为空，尝试summary字段
+        if not content and hasattr(entry, 'summary'):
             content = entry.summary
             content_type = 'html' if '<' in content else 'text'
+            self.logger.debug(f"从summary字段提取内容", length=len(content), type=content_type)
 
-        item['content'] = content
+        # 清理HTML标签，保留文本内容用于raw_content
+        import re
+        text_content = content
+        if content_type == 'html':
+            # 移除HTML标签但保留文本
+            text_content = re.sub(r'<[^>]+>', '', content)
+            # 清理多余的空白字符
+            text_content = re.sub(r'\s+', ' ', text_content).strip()
+
+        item['content'] = content  # 原始内容（可能包含HTML）
+        item['text_content'] = text_content  # 纯文本内容
         item['content_type'] = content_type
-        item['description'] = content  # 为了兼容性
+        item['description'] = text_content  # 为了兼容性，使用纯文本作为description
 
         # 时间信息 - 增强的时间处理
         pub_date = None
@@ -319,9 +333,9 @@ class RSSCollector(BaseCollector):
         if not entry.get('title') and not entry.get('link'):
             return False
 
-        # 内容不能为空
-        content = entry.get('content', '') or entry.get('description', '')
-        if not content or len(content.strip()) < 10:
+        # 内容不能为空，但允许较短的描述
+        content = entry.get('text_content', '') or entry.get('content', '') or entry.get('description', '')
+        if not content or len(content.strip()) < 5:
             return False
 
         # 链接格式检查
