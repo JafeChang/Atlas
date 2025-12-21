@@ -381,7 +381,7 @@ class LLMQueueManager:
 
         return False
 
-    def get_task_status(self, task_id: str) -> Optional[LLMTask]:
+    async def get_task_status(self, task_id: str) -> Optional[LLMTask]:
         """获取任务状态
 
         Args:
@@ -408,7 +408,7 @@ class LLMQueueManager:
 
         return None
 
-    def get_queue_status(self) -> Dict[str, Any]:
+    async def get_queue_status(self) -> Dict[str, Any]:
         """获取队列状态"""
         async with self._queue_lock, self._running_lock:
             return {

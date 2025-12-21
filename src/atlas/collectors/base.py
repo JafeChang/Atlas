@@ -505,6 +505,116 @@ class BaseCollector(ABC):
         if self.rate_limiter:
             self.rate_limiter.reset_history()
 
+    def save_results(self, result, output_dir: str) -> None:
+        """保存采集结果到文件系统
+
+        Args:
+            result: 采集结果对象
+            output_dir: 输出目录路径
+        """
+        import json
+        import asyncio
+        from pathlib import Path
+        from datetime import datetime
+        from ..core.storage import FileStorageManager, RawDocument, DocumentType, SourceType
+
+        # 创建输出目录
+        output_path = Path(output_dir)
+        output_path.mkdir(parents=True, exist_ok=True)
+
+        # 初始化存储管理器
+        storage = FileStorageManager(output_path.parent)
+
+        try:
+            if result and hasattr(result, 'items') and result.items:
+                self.logger.info(f"开始保存采集结果", items_count=len(result.items), output_dir=str(output_path))
+
+                saved_count = 0
+
+                # 遍历所有采集到的项目
+                for item in result.items:
+                    try:
+                        # 创建原始文档对象
+                        document = RawDocument(
+                            source_id=getattr(result, 'source_name', 'unknown'),
+                            source_url=item.get('link'),
+                            source_type=SourceType.RSS if hasattr(result, 'source_type') else SourceType.WEB,
+                            document_type=DocumentType.ARTICLE,
+                            raw_content=item.get('content', item.get('description', '')),
+                            raw_metadata={
+                                'title': item.get('title', ''),
+                                'link': item.get('link', ''),
+                                'pub_date': item.get('pub_date'),
+                                'author': item.get('author', ''),
+                                'tags': item.get('tags', []),
+                                'source_config': getattr(result, 'source_config', {}),
+                                'collected_at': datetime.now().isoformat()
+                            },
+                            title=item.get('title', ''),
+                            collector_version="1.0.0"
+                        )
+
+                        # 异步保存文档
+                        file_path = asyncio.run(storage.store_raw_document(document))
+                        saved_count += 1
+
+                        self.logger.debug(f"保存文档成功", title=item.get('title', 'no-title'), file_path=str(file_path))
+
+                    except Exception as e:
+                        self.logger.error(f"保存单个文档失败", title=item.get('title', 'unknown'), error=str(e))
+                        continue
+
+                # 同时保存一个简化的JSON汇总文件
+                summary_file = output_path / f"summary_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+                summary_data = {
+                    'source_name': getattr(result, 'source_name', 'unknown'),
+                    'source_url': getattr(result, 'url', ''),
+                    'items_count': len(result.items),
+                    'saved_count': saved_count,
+                    'collected_at': datetime.now().isoformat(),
+                    'items': []
+                }
+
+                # 添加项目摘要（不包含完整内容）
+                for item in result.items:
+                    summary_data['items'].append({
+                        'title': item.get('title', ''),
+                        'link': item.get('link', ''),
+                        'pub_date': item.get('pub_date', ''),
+                        'description': item.get('description', '')[:200] + '...' if item.get('description') else ''
+                    })
+
+                # 保存汇总文件
+                with open(summary_file, 'w', encoding='utf-8') as f:
+                    json.dump(summary_data, f, ensure_ascii=False, indent=2)
+
+                self.logger.info(f"采集结果保存完成",
+                               total_items=len(result.items),
+                               saved_items=saved_count,
+                               summary_file=str(summary_file),
+                               output_dir=str(output_path))
+
+            else:
+                # 没有数据的情况
+                self.logger.warning(f"没有采集到数据，跳过保存", output_dir=str(output_path))
+
+                # 创建空的汇总文件
+                summary_file = output_path / f"empty_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+                empty_data = {
+                    'source_name': getattr(result, 'source_name', 'unknown'),
+                    'source_url': getattr(result, 'url', ''),
+                    'items_count': 0,
+                    'collected_at': datetime.now().isoformat(),
+                    'message': 'No data collected'
+                }
+
+                with open(summary_file, 'w', encoding='utf-8') as f:
+                    json.dump(empty_data, f, ensure_ascii=False, indent=2)
+
+        except Exception as e:
+            self.logger.error(f"保存采集结果失败", output_dir=str(output_path), error=str(e))
+            raise
+
     def close(self) -> None:
         """关闭采集器，释放资源"""
         try:

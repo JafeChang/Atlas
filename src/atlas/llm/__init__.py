@@ -9,8 +9,15 @@ from .local_client import LocalLLMClient, ModelConfig, GenerationConfig
 from .queue_manager import LLMQueueManager, LLMTask, LLMTaskPriority
 from .adaptive_controller import AdaptiveController, ControllerConfig, ControlAction
 from .semantic_dedup import SemanticDeduplicator, SemanticConfig
+from .factory import LLMProviderFactory, LLMConfig, BaseLLMProvider, create_llm_provider
 
 __all__ = [
+    # Factory
+    "LLMProviderFactory",
+    "LLMConfig",
+    "BaseLLMProvider",
+    "create_llm_provider",
+
     # Local Client
     "LocalLLMClient",
     "ModelConfig",

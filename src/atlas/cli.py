@@ -461,19 +461,122 @@ def config_validate(ctx: click.Context) -> None:
 
 @main.command()
 @click.option('--source', '-s', help='指定数据源名称')
+@click.option('--dry-run', is_flag=True, help='预览模式，不实际采集数据')
 @click.pass_context
-def collect(ctx: click.Context, source: Optional[str]) -> None:
+def collect(ctx: click.Context, source: Optional[str], dry_run: bool) -> None:
     """执行数据采集任务"""
+    import asyncio
+    from atlas.collectors import CollectorFactory
+    from atlas.core.config import CollectionConfig
+
     config = ctx.obj['config']
     logger = ctx.obj['logger']
 
     click.echo("🔄 执行数据采集任务...")
 
-    # 这里后续会实现具体的数据采集逻辑
-    click.echo(f"📡 数据源: {source or '所有启用的数据源'}")
-    click.echo("⚠️  数据采集功能正在开发中...")
+    try:
+        # 加载数据源配置
+        sources_data = config.sources.get('sources', [])
 
-    logger.info("数据采集任务触发", source=source)
+        # 将列表转换为字典格式，便于查找
+        sources_dict = {}
+        for source_item in sources_data:
+            sources_dict[source_item['name']] = source_item
+
+        if source:
+            # 采集指定数据源
+            if source not in sources_dict:
+                click.echo(f"❌ 数据源 '{source}' 不存在")
+                return
+
+            sources_to_collect = {source: sources_dict[source]}
+        else:
+            # 采集所有启用的数据源
+            sources_to_collect = {
+                name: cfg for name, cfg in sources_dict.items()
+                if cfg.get('enabled', True)
+            }
+
+        if not sources_to_collect:
+            click.echo("❌ 没有找到启用的数据源")
+            return
+
+        click.echo(f"📡 数据源: {', '.join(sources_to_collect.keys())}")
+
+        if dry_run:
+            click.echo("🔍 预览模式 - 将显示要采集的数据源信息")
+            for name, cfg in sources_to_collect.items():
+                click.echo(f"  📋 {name}: {cfg['type']} - {cfg['url']}")
+            return
+
+        # 创建采集配置
+        collection_config = CollectionConfig()
+
+        # 创建采集器工厂
+        factory = CollectorFactory()
+
+        # 执行采集
+        total_items = 0
+        successful_sources = 0
+
+        click.echo("⚙️  正在初始化采集器...")
+
+        for source_name, source_config in sources_to_collect.items():
+            try:
+                click.echo(f"🔍 正在采集: {source_name}")
+
+                # 创建采集器
+                collector = factory.create_collector_with_config(
+                    source_config=source_config,
+                    collection_config=collection_config
+                )
+
+                # 执行采集
+                if hasattr(collector, 'collect_async'):
+                    # 异步采集器
+                    result = asyncio.run(collector.collect_async(source_config))
+                else:
+                    # 同步采集器
+                    result = collector.collect(source_config)
+
+                if result and result.items:
+                    item_count = len(result.items)
+                    total_items += item_count
+                    successful_sources += 1
+                    click.echo(f"✅ {source_name}: 采集到 {item_count} 条数据")
+
+                    # 保存数据到文件系统
+                    collector.save_results(result, f"data/raw/{source_name}")
+
+                else:
+                    click.echo(f"⚠️  {source_name}: 未采集到数据")
+
+            except Exception as e:
+                click.echo(f"❌ {source_name}: 采集失败 - {str(e)}")
+                logger.error(f"数据采集失败", source=source_name, error=str(e))
+
+        # 显示采集结果
+        click.echo("\n" + "="*60)
+        click.echo("📊 采集结果统计")
+        click.echo(f"📡 处理数据源: {len(sources_to_collect)}")
+        click.echo(f"✅ 成功采集: {successful_sources}")
+        click.echo(f"📝 总数据条目: {total_items}")
+        click.echo(f"💾 保存位置: data/raw/")
+
+        if total_items > 0:
+            click.echo("🎉 数据采集任务完成！")
+        else:
+            click.echo("⚠️  未采集到任何数据")
+
+        logger.info("数据采集任务完成",
+                   sources_total=len(sources_to_collect),
+                   sources_successful=successful_sources,
+                   items_collected=total_items)
+
+    except Exception as e:
+        click.echo(f"❌ 数据采集失败: {str(e)}")
+        logger.error("数据采集任务失败", error=str(e))
+        raise
 
 
 @main.command()
@@ -497,6 +600,229 @@ def logs(ctx: click.Context) -> None:
                 click.echo(f"  {line.strip()}")
     else:
         click.echo("  应用日志文件不存在")
+
+
+@main.group()
+def audit():
+    """数据审计和分析命令"""
+    pass
+
+
+@audit.command()
+@click.option('--db-path', default='data/atlas.db', help='数据库文件路径')
+def overview(db_path: str):
+    """数据库概览"""
+    import sqlite3
+    from pathlib import Path
+    from rich.console import Console
+    from rich.table import Table
+    from rich.progress import Progress, SpinnerColumn, TextColumn
+
+    def get_db_connection(db_path: str):
+        """获取数据库连接"""
+        if not Path(db_path).exists():
+            raise click.ClickException(f"数据库文件不存在: {db_path}")
+        return sqlite3.connect(db_path)
+
+    def format_size(size_bytes: int) -> str:
+        """格式化文件大小"""
+        for unit in ['B', 'KB', 'MB', 'GB']:
+            if size_bytes < 1024:
+                return f"{size_bytes:.1f} {unit}"
+            size_bytes /= 1024
+        return f"{size_bytes:.1f} TB"
+
+    console = Console()
+
+    try:
+        conn = get_db_connection(db_path)
+        cursor = conn.cursor()
+
+        # 数据库文件信息
+        from pathlib import Path
+        db_file = Path(db_path)
+        file_size = db_file.stat().st_size
+
+        console.print(f"[bold blue]📊 数据库概览[/bold blue]")
+        console.print(f"📍 文件路径: {db_file.absolute()}")
+        console.print(f"📏 文件大小: {format_size(file_size)}")
+        console.print()
+
+        # 表统计
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        tables = [row[0] for row in cursor.fetchall()]
+
+        table_stats = []
+        total_records = 0
+
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            console=console,
+            transient=True
+        ) as progress:
+            task = progress.add_task("正在统计表数据...", total=len(tables))
+
+            for table in tables:
+                cursor.execute(f"SELECT COUNT(*) FROM {table}")
+                count = cursor.fetchone()[0]
+                total_records += count
+
+                cursor.execute(f"PRAGMA table_info({table})")
+                columns = cursor.fetchall()
+
+                table_stats.append((table, count, len(columns)))
+                progress.advance(task)
+
+        # 显示表统计
+        table = Table(title="数据表统计", box=None)
+        table.add_column("表名", style="cyan")
+        table.add_column("记录数", justify="right", style="green")
+        table.add_column("列数", justify="right", style="blue")
+        table.add_column("状态", justify="center")
+
+        for table_name, count, cols in table_stats:
+            if count > 0:
+                status = "✅ 有数据"
+            else:
+                status = "⚪ 空"
+            table.add_row(table_name, f"{count:,}", str(cols), status)
+
+        console.print(table)
+        console.print(f"\n📊 总记录数: {total_records:,}")
+        console.print(f"📋 总表数: {len(tables)}")
+
+        conn.close()
+
+    except Exception as e:
+        console.print(f"[red]❌ 错误: {e}[/red]")
+
+
+@audit.command()
+@click.option('--db-path', default='data/atlas.db', help='数据库文件路径')
+@click.option('--source', help='指定数据源名称')
+@click.option('--status', type=click.Choice(['enabled', 'disabled', 'all']), default='all', help='过滤状态')
+def sources(db_path: str, source: Optional[str], status: str):
+    """数据源审计"""
+    import sqlite3
+    from pathlib import Path
+    from datetime import datetime
+    from rich.console import Console
+    from rich.table import Table
+
+    def get_db_connection(db_path: str):
+        """获取数据库连接"""
+        if not Path(db_path).exists():
+            raise click.ClickException(f"数据库文件不存在: {db_path}")
+        return sqlite3.connect(db_path)
+
+    def format_timestamp(timestamp_str: Optional[str]) -> str:
+        """格式化时间戳"""
+        if not timestamp_str:
+            return "N/A"
+        try:
+            dt = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
+            return dt.strftime("%Y-%m-%d %H:%M:%S")
+        except:
+            return timestamp_str
+
+    console = Console()
+
+    try:
+        conn = get_db_connection(db_path)
+        cursor = conn.cursor()
+
+        where_clause = ""
+        params = []
+
+        if source:
+            where_clause = "AND name = ?"
+            params.append(source)
+
+        if status == 'enabled':
+            where_clause += " AND enabled = 1"
+        elif status == 'disabled':
+            where_clause += " AND enabled = 0"
+
+        cursor.execute(f'''
+            SELECT name, description, source_type, url, enabled, collection_interval,
+                   created_at, updated_at, last_collected_at, last_success_at,
+                   collection_count, success_count, error_count, last_error
+            FROM data_sources
+            WHERE 1=1 {where_clause}
+            ORDER BY created_at
+        ''', params)
+
+        sources_data = cursor.fetchall()
+
+        if not sources_data:
+            console.print("[yellow]⚠️  没有找到匹配的数据源[/yellow]")
+            return
+
+        # 统计信息
+        total_sources = len(sources_data)
+        enabled_count = len([s for s in sources_data if s[4]])
+        total_collections = sum(s[10] for s in sources_data)
+        total_successes = sum(s[11] for s in sources_data)
+        total_errors = sum(s[12] for s in sources_data)
+
+        # 显示统计
+        console.print(f"[bold blue]📡 数据源审计报告[/bold blue]")
+        console.print(f"📊 数据源总数: {total_sources}")
+        console.print(f"✅ 启用数量: {enabled_count}")
+        console.print(f"❌ 禁用数量: {total_sources - enabled_count}")
+        console.print(f"🔄 总采集次数: {total_collections}")
+        console.print(f"✅ 总成功次数: {total_successes}")
+        console.print(f"❌ 总失败次数: {total_errors}")
+
+        if total_collections > 0:
+            success_rate = (total_successes / total_collections) * 100
+            console.print(f"📈 成功率: {success_rate:.1f}%")
+
+        console.print()
+
+        # 详细信息表
+        table = Table(title="数据源详情", box=None)
+        table.add_column("名称", style="cyan")
+        table.add_column("类型", style="green")
+        table.add_column("状态", justify="center")
+        table.add_column("采集次数", justify="right")
+        table.add_column("成功率", justify="right")
+        table.add_column("最后成功")
+        table.add_column("最后错误", style="red")
+
+        for source_data in sources_data:
+            (name, description, source_type, url, enabled, interval, created_at, updated_at,
+             last_collected_at, last_success_at, collection_count, success_count,
+             error_count, last_error) = source_data
+
+            status_icon = "✅ 启用" if enabled else "❌ 禁用"
+
+            if collection_count > 0:
+                success_rate = (success_count / collection_count) * 100
+                rate_str = f"{success_rate:.1f}%"
+            else:
+                rate_str = "N/A"
+
+            last_success = format_timestamp(last_success_at)
+            error_summary = (last_error or "")[:20] + "..." if last_error and len(last_error) > 20 else (last_error or "")
+
+            table.add_row(
+                name,
+                source_type,
+                status_icon,
+                str(collection_count),
+                rate_str,
+                last_success,
+                error_summary
+            )
+
+        console.print(table)
+
+        conn.close()
+
+    except Exception as e:
+        console.print(f"[red]❌ 错误: {e}[/red]")
 
 
 if __name__ == '__main__':

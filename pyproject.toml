@@ -52,6 +52,10 @@ dependencies = [
     "aiofiles>=23.0.0",
     # 系统监控
     "psutil>=5.9.0",
+    "aiohttp>=3.13.2",
+    "numpy>=2.3.5",
+    "scikit-learn>=1.8.0",
+    "openai>=2.12.0",
 ]
 
 [project.optional-dependencies]

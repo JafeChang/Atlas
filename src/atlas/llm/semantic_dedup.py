@@ -33,9 +33,9 @@ class SimilarityThreshold(Enum):
     """相似度阈值"""
     VERY_STRICT = 0.95    # 极严格
     STRICT = 0.90          # 严格
-    NORMAL = 0.85          // 正常（推荐）
-    LOOSE = 0.80           // 宽松
-    VERY_LOOSE = 0.75      // 极宽松
+    NORMAL = 0.85          # 正常（推荐）
+    LOOSE = 0.80           # 宽松
+    VERY_LOOSE = 0.75      # 极宽松
 
 
 @dataclass
