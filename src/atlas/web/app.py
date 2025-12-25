@@ -19,6 +19,16 @@ import time
 # 导入调度器
 from .scheduler import TaskScheduler
 
+# 导入统一存储接口
+try:
+    from ..core.unified_storage import get_unified_storage
+    from ..core.config import get_config
+    UNIFIED_STORAGE_AVAILABLE = True
+except ImportError:
+    UNIFIED_STORAGE_AVAILABLE = False
+    logger = logging.getLogger(__name__)
+    logger.warning("统一存储接口不可用")
+
 # 设置日志
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
@@ -117,7 +127,7 @@ class AtlasAPI:
                 storage_files = len(json_files)
                 storage_size = sum(f.stat().st_size for f in json_files)
 
-            return {
+            result = {
                 "timestamp": datetime.now().isoformat(),
                 "database_size": db_size,
                 "storage_files": storage_files,
@@ -138,6 +148,36 @@ class AtlasAPI:
                     "today": today_docs
                 }
             }
+
+            # 添加统一存储统计信息
+            if UNIFIED_STORAGE_AVAILABLE:
+                try:
+                    import asyncio
+                    storage = get_unified_storage()
+                    result["storage_info"] = storage.get_storage_info()
+                    result["storage_type"] = storage.get_storage_type()
+
+                    # 获取存储统计
+                    try:
+                        loop = asyncio.get_event_loop()
+                        if loop.is_running():
+                            # 如果在运行中的事件循环中，创建新线程运行
+                            import concurrent.futures
+                            with concurrent.futures.ThreadPoolExecutor() as executor:
+                                storage_stats = executor.submit(asyncio.run, storage.get_storage_stats()).result()
+                                result["storage_stats"] = storage_stats
+                        else:
+                            storage_stats = loop.run_until_complete(storage.get_storage_stats())
+                            result["storage_stats"] = storage_stats
+                    except Exception as stats_error:
+                        logger.warning(f"获取存储统计失败: {stats_error}")
+                        result["storage_stats"] = {"error": str(stats_error)}
+
+                except Exception as storage_error:
+                    logger.warning(f"获取存储信息失败: {storage_error}")
+                    result["storage_info"] = {"error": str(storage_error)}
+
+            return result
 
         except Exception as e:
             logger.error(f"获取系统概览失败: {e}")
@@ -824,6 +864,35 @@ INDEX_TEMPLATE = """
                 </table>
             </div>
         </div>
+
+        <!-- 存储管理 -->
+        <div class="section">
+            <h2>
+                💾 存储管理
+                <button class="btn" onclick="refreshStorageStats()">🔄 刷新</button>
+            </h2>
+            <div id="storage-loading" class="loading">
+                <div>🔄 加载存储信息...</div>
+            </div>
+            <div id="storage-content" style="display: none;">
+                <div class="dashboard">
+                    <div class="card">
+                        <h3>📊 存储类型</h3>
+                        <div class="stat-value" id="storage-type">-</div>
+                        <div class="stat-label">当前存储后端</div>
+                    </div>
+                    <div class="card">
+                        <h3>📦 存储桶/目录</h3>
+                        <div class="stat-value" id="storage-bucket" style="font-size: 0.9rem;">-</div>
+                        <div class="stat-label">存储位置</div>
+                    </div>
+                </div>
+                <div id="storage-stats-content" style="margin-top: 1.5rem;">
+                    <h3>存储统计详情</h3>
+                    <pre id="storage-stats-json" style="background: #f5f5f5; padding: 1rem; border-radius: 4px; overflow-x: auto;"></pre>
+                </div>
+            </div>
+        </div>
     </div>
 
     <script>
@@ -837,6 +906,7 @@ INDEX_TEMPLATE = """
             loadCollections();
             loadData();
             loadFiles();
+            loadStorageStats();
             loadSchedulerStatus();
             loadSchedulerTasks();
 
@@ -1084,6 +1154,58 @@ INDEX_TEMPLATE = """
             document.getElementById('files-loading').style.display = 'block';
             document.getElementById('files-content').style.display = 'none';
             loadFiles();
+        }
+
+        // 加载存储统计
+        async function loadStorageStats() {
+            try {
+                const response = await fetch('/api/storage/stats');
+                const data = await response.json();
+
+                document.getElementById('storage-loading').style.display = 'none';
+                document.getElementById('storage-content').style.display = 'block';
+
+                if (data.status === 'success') {
+                    // 更新存储类型
+                    const storageTypeMap = {
+                        'filesystem': '文件系统',
+                        'minio': 'MinIO对象存储'
+                    };
+                    document.getElementById('storage-type').textContent =
+                        storageTypeMap[data.storage_type] || data.storage_type;
+
+                    // 更新存储桶/目录信息
+                    if (data.storage_type === 'minio') {
+                        document.getElementById('storage-bucket').textContent =
+                            data.storage_info.bucket_name || 'N/A';
+                    } else {
+                        document.getElementById('storage-bucket').textContent =
+                            data.storage_info.base_dir || 'N/A';
+                    }
+
+                    // 显示存储统计详情
+                    document.getElementById('storage-stats-json').textContent =
+                        JSON.stringify(data.storage_stats, null, 2);
+                } else {
+                    document.getElementById('storage-type').textContent = '加载失败';
+                    document.getElementById('storage-stats-json').textContent =
+                        data.message || '无法加载存储信息';
+                }
+
+            } catch (error) {
+                console.error('加载存储统计失败:', error);
+                document.getElementById('storage-loading').style.display = 'none';
+                document.getElementById('storage-content').style.display = 'block';
+                document.getElementById('storage-type').textContent = '错误';
+                document.getElementById('storage-stats-json').textContent =
+                    '加载失败: ' + error.message;
+            }
+        }
+
+        function refreshStorageStats() {
+            document.getElementById('storage-loading').style.display = 'block';
+            document.getElementById('storage-content').style.display = 'none';
+            loadStorageStats();
         }
 
         // 开始采集
@@ -1456,6 +1578,51 @@ def api_collect_source(source_name):
 def api_export():
     """导出数据"""
     return jsonify(atlas_api.export_data())
+
+
+@app.route('/api/storage/stats')
+def api_storage_stats():
+    """获取存储统计信息"""
+    if not UNIFIED_STORAGE_AVAILABLE:
+        return jsonify({
+            "status": "error",
+            "message": "统一存储接口不可用"
+        }), 501
+
+    try:
+        import asyncio
+        storage = get_unified_storage()
+
+        # 获取存储信息
+        storage_info = storage.get_storage_info()
+        storage_type = storage.get_storage_type()
+
+        # 获取存储统计
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor() as executor:
+                    storage_stats = executor.submit(asyncio.run, storage.get_storage_stats()).result()
+            else:
+                storage_stats = loop.run_until_complete(storage.get_storage_stats())
+        except Exception as stats_error:
+            logger.warning(f"获取存储统计失败: {stats_error}")
+            storage_stats = {"error": str(stats_error)}
+
+        return jsonify({
+            "status": "success",
+            "storage_type": storage_type,
+            "storage_info": storage_info,
+            "storage_stats": storage_stats
+        })
+
+    except Exception as e:
+        logger.error(f"获取存储统计失败: {e}")
+        return jsonify({
+            "status": "error",
+            "message": str(e)
+        }), 500
 
 
 # 调度器管理API

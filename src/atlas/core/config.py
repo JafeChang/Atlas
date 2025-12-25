@@ -154,6 +154,35 @@ class MonitoringConfig(BaseSettings):
         env_prefix = "ATLAS_MONITORING_"
 
 
+class StorageConfig(BaseSettings):
+    """存储配置"""
+
+    # 存储类型: filesystem, minio
+    type: str = Field(default="filesystem", description="存储类型")
+
+    # 文件系统存储配置
+    filesystem_base_dir: str = Field(default="data/raw", description="文件系统存储基础目录")
+    filesystem_compression: bool = Field(default=True, description="是否启用文件压缩")
+
+    # MinIO存储配置
+    minio_endpoint: str = Field(default="localhost:9000", description="MinIO服务端点")
+    minio_access_key: str = Field(default="minioadmin", description="MinIO访问密钥")
+    minio_secret_key: str = Field(default="minioadmin123456", description="MinIO密钥")
+    minio_bucket_name: str = Field(default="atlas-raw-data", description="MinIO存储桶名称")
+    minio_secure: bool = Field(default=False, description="是否使用HTTPS")
+    minio_prefix: str = Field(default="atlas-documents", description="MinIO对象前缀")
+
+    @validator('type')
+    def validate_type(cls, v):
+        """验证存储类型"""
+        if v not in ['filesystem', 'minio']:
+            raise ValueError(f"不支持的存储类型: {v}")
+        return v
+
+    class Config:
+        env_prefix = "ATLAS_STORAGE_"
+
+
 class LocalEnvLoader:
     """本地环境变量加载器"""
 
@@ -254,6 +283,7 @@ class Config:
         self._llm: Optional[LLMConfig] = None
         self._scheduler: Optional[SchedulerConfig] = None
         self._monitoring: Optional[MonitoringConfig] = None
+        self._storage: Optional[StorageConfig] = None
 
         # 初始化环境变量加载器
         self._env_loader = LocalEnvLoader(self.config_dir, env_name)
@@ -367,6 +397,13 @@ class Config:
         return self._monitoring
 
     @property
+    def storage(self) -> StorageConfig:
+        """存储配置"""
+        if self._storage is None:
+            self._storage = StorageConfig()
+        return self._storage
+
+    @property
     def sources(self) -> Dict[str, Any]:
         """数据源配置"""
         return self._config_data.get("sources", {})
@@ -426,6 +463,7 @@ class Config:
         self._llm = None
         self._scheduler = None
         self._monitoring = None
+        self._storage = None
 
         # 重新初始化环境变量加载器
         self._env_loader = LocalEnvLoader(self.config_dir, self.env_name)

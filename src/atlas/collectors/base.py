@@ -506,25 +506,28 @@ class BaseCollector(ABC):
             self.rate_limiter.reset_history()
 
     def save_results(self, result, output_dir: str, source_name: str = None) -> None:
-        """保存采集结果到文件系统
+        """保存采集结果到存储系统
+
+        支持文件系统和MinIO对象存储，通过配置自动选择。
 
         Args:
             result: 采集结果对象
-            output_dir: 输出目录路径
+            output_dir: 输出目录路径（兼容文件系统存储）
         """
         import json
         import asyncio
         from pathlib import Path
         from datetime import datetime
-        from ..core.storage import FileStorageManager, RawDocument, DocumentType
+        from ..core.storage import RawDocument, DocumentType
+        from ..core.unified_storage import get_unified_storage
         from ..models.documents import SourceType, ProcessingStatus
 
-        # 创建输出目录
+        # 创建输出目录（兼容文件系统存储）
         output_path = Path(output_dir)
         output_path.mkdir(parents=True, exist_ok=True)
 
-        # 初始化存储管理器
-        storage = FileStorageManager(output_path.parent)
+        # 使用统一存储接口
+        storage = get_unified_storage()
 
         try:
             # 检查是否有数据 - 支持list类型和对象类型
@@ -577,18 +580,17 @@ class BaseCollector(ABC):
                             collector_version="1.0.0"
                         )
 
-                        # 同时保存为JSON文件和数据库记录
+                        # 保存到存储系统（支持文件系统和MinIO）
                         try:
                             import json
                             import uuid
                             import sqlite3
                             from pathlib import Path
 
-                            # 直接保存为JSON文件，避免async问题
-                            doc_id = str(uuid.uuid4())
-                            file_path = output_path / f"{doc_id}.json"
-
                             # 准备文档数据
+                            doc_id = str(uuid.uuid4())
+
+                            # 准备统一存储格式的数据
                             doc_data = {
                                 "id": doc_id,
                                 "source_id": document.source_id,
@@ -609,9 +611,27 @@ class BaseCollector(ABC):
                                 "stored_at": datetime.utcnow().isoformat(),
                             }
 
-                            # 写入JSON文件
-                            with open(file_path, 'w', encoding='utf-8') as f:
-                                json.dump(doc_data, f, ensure_ascii=False, indent=2)
+                            # 使用统一存储接口保存
+                            try:
+                                # 尝试异步保存
+                                import asyncio
+                                try:
+                                    loop = asyncio.get_event_loop()
+                                except RuntimeError:
+                                    loop = asyncio.new_event_loop()
+                                    asyncio.set_event_loop(loop)
+
+                                storage_path = loop.run_until_complete(
+                                    storage.store_raw_document(doc_data)
+                                )
+                                self.logger.debug(f"文档已保存到统一存储", storage_path=storage_path, doc_id=doc_id)
+                            except Exception as async_error:
+                                self.logger.warning(f"异步保存失败，尝试同步保存", error=str(async_error))
+                                # 如果异步保存失败，尝试直接保存到文件系统
+                                file_path = output_path / f"{doc_id}.json"
+                                with open(file_path, 'w', encoding='utf-8') as f:
+                                    json.dump(doc_data, f, ensure_ascii=False, indent=2)
+                                self.logger.debug(f"文档已保存到文件系统", file_path=str(file_path))
 
                             # 保存到数据库
                             db_path = Path.cwd() / "data" / "atlas.db"
@@ -651,7 +671,7 @@ class BaseCollector(ABC):
                             conn.commit()
                             conn.close()
 
-                            self.logger.debug(f"文档保存成功", file_path=str(file_path), database_id=doc_id)
+                            self.logger.debug(f"文档保存成功", doc_id=doc_id)
                             saved_count += 1
 
                         except Exception as save_error:
