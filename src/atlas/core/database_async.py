@@ -101,13 +101,12 @@ class AsyncDatabaseManager:
                 connect_args={"check_same_thread": False}
             )
         else:
-            # PostgreSQL使用连接池
+            # PostgreSQL使用连接池（异步引擎使用默认的AsyncAdaptedQueuePool）
             self.engine = create_async_engine(
                 self.database_url,
                 echo=False,
                 pool_size=10,
-                max_overflow=20,
-                poolclass=QueuePool
+                max_overflow=20
             )
 
         # 创建会话工厂

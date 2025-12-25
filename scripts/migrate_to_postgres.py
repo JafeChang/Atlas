@@ -19,6 +19,7 @@ Atlas 数据库迁移脚本 - SQLite到PostgreSQL
 """
 
 import asyncio
+import json
 import sqlite3
 import sys
 from datetime import datetime
@@ -68,6 +69,83 @@ class DatabaseMigration:
 
         # 配置日志
         self._setup_logging()
+
+    def _parse_datetime(self, value: Optional[str]) -> Optional[datetime]:
+        """解析datetime字符串
+
+        Args:
+            value: datetime字符串或None
+
+        Returns:
+            datetime对象或None
+        """
+        if not value:
+            return None
+
+        # 如果已经是datetime对象，直接返回
+        if isinstance(value, datetime):
+            return value
+
+        # 尝试解析字符串
+        if isinstance(value, str):
+            try:
+                # ISO 8601格式
+                if 'T' in value:
+                    return datetime.fromisoformat(value.replace('Z', '+00:00'))
+                # 其他格式
+                return datetime.fromisoformat(value)
+            except (ValueError, AttributeError):
+                pass
+
+        return None
+
+    def _parse_json(self, value: Optional[str]) -> Optional[dict]:
+        """解析JSON字符串
+
+        Args:
+            value: JSON字符串或None
+
+        Returns:
+            解析后的字典或None
+        """
+        if not value:
+            return None
+
+        if isinstance(value, dict):
+            return value
+
+        if isinstance(value, str):
+            try:
+                return json.loads(value)
+            except (json.JSONDecodeError, ValueError):
+                pass
+
+        return None
+
+    def _parse_json_array(self, value: Optional[str]) -> Optional[list]:
+        """解析JSON数组字符串
+
+        Args:
+            value: JSON数组字符串或None
+
+        Returns:
+            解析后的列表或None
+        """
+        if not value:
+            return None
+
+        if isinstance(value, list):
+            return value
+
+        if isinstance(value, str):
+            try:
+                result = json.loads(value)
+                if isinstance(result, list):
+                    return result
+            except (json.JSONDecodeError, ValueError):
+                pass
+
+        return None
 
     def _setup_logging(self):
         """配置日志"""
@@ -121,14 +199,14 @@ class DatabaseMigration:
 
         for old_source in old_sources:
             try:
-                # 创建新对象
+                # 创建新对象（使用辅助函数转换字段）
                 new_source = DataSource(
                     name=old_source['name'],
                     source_type=old_source['source_type'],
                     url=old_source.get('url'),
                     enabled=bool(old_source['enabled']),
-                    config=old_source.get('config'),
-                    tags=old_source.get('tags'),
+                    config=self._parse_json(old_source.get('config')),
+                    tags=self._parse_json_array(old_source.get('tags')),
                     category=old_source.get('category'),
                     language=old_source.get('language', 'zh-CN'),
                     collection_interval=old_source.get('collection_interval', 3600),
@@ -138,8 +216,8 @@ class DatabaseMigration:
                     collection_count=old_source.get('collection_count', 0),
                     success_count=old_source.get('success_count', 0),
                     error_count=old_source.get('error_count', 0),
-                    last_collected_at=old_source.get('last_collected_at'),
-                    last_success_at=old_source.get('last_success_at'),
+                    last_collected_at=self._parse_datetime(old_source.get('last_collected_at')),
+                    last_success_at=self._parse_datetime(old_source.get('last_success_at')),
                     last_error=old_source.get('last_error'),
                 )
 
@@ -155,6 +233,8 @@ class DatabaseMigration:
                 logger.error(f"迁移数据源失败 {old_source.get('name')}: {e}")
                 self.failures.append(('data_sources', old_source.get('name'), str(e)))
                 self.stats['data_sources']['failed'] += 1
+                # 回滚以清理Session状态
+                await new_session.rollback()
 
         self.stats['data_sources']['migrated'] = migrated_count
         logger.info(f"数据源迁移完成: {migrated_count}/{len(old_sources)}")
@@ -200,7 +280,7 @@ class DatabaseMigration:
                 else:
                     doc_id = uuid4()
 
-                # 创建新对象
+                # 创建新对象（使用辅助函数转换字段）
                 new_doc = RawDocument(
                     id=doc_id,
                     source_id=old_doc.get('source_id', ''),
@@ -208,8 +288,8 @@ class DatabaseMigration:
                     source_type=old_doc.get('source_type'),
                     document_type=old_doc.get('document_type'),
                     raw_content=old_doc.get('raw_content'),
-                    raw_metadata=old_doc.get('raw_metadata'),
-                    collected_at=old_doc.get('collected_at'),
+                    raw_metadata=self._parse_json(old_doc.get('raw_metadata')),
+                    collected_at=self._parse_datetime(old_doc.get('collected_at')),
                     collector_version=old_doc.get('collector_version'),
                     processing_status=old_doc.get('processing_status', 'pending'),
                     processing_error=old_doc.get('processing_error'),
@@ -217,7 +297,7 @@ class DatabaseMigration:
                     content_hash=old_doc.get('content_hash'),
                     title=old_doc.get('title'),
                     author=old_doc.get('author'),
-                    published_at=old_doc.get('published_at'),
+                    published_at=self._parse_datetime(old_doc.get('published_at')),
                     language=old_doc.get('language'),
                 )
 
@@ -235,6 +315,8 @@ class DatabaseMigration:
                 logger.error(f"迁移文档失败 {old_doc.get('id')}: {e}")
                 self.failures.append(('raw_documents', old_doc.get('id'), str(e)))
                 self.stats['raw_documents']['failed'] += 1
+                # 回滚以清理Session状态
+                await new_session.rollback()
 
         self.stats['raw_documents']['migrated'] = migrated_count
         logger.info(f"原始文档迁移完成: {migrated_count}/{len(old_docs)}")
@@ -289,19 +371,19 @@ class DatabaseMigration:
                 else:
                     raw_doc_id = uuid4()
 
-                # 创建新对象
+                # 创建新对象（使用辅助函数转换字段）
                 new_doc = ProcessedDocument(
                     id=doc_id,
                     raw_document_id=raw_doc_id,
                     title=old_doc.get('title', ''),
                     summary=old_doc.get('summary'),
                     content=old_doc.get('content'),
-                    structured_content=old_doc.get('structured_content'),
-                    extracted_metadata=old_doc.get('extracted_metadata'),
-                    entities=old_doc.get('entities'),
-                    keywords=old_doc.get('keywords'),
-                    categories=old_doc.get('categories'),
-                    processed_at=old_doc.get('processed_at'),
+                    structured_content=self._parse_json(old_doc.get('structured_content')),
+                    extracted_metadata=self._parse_json(old_doc.get('extracted_metadata')),
+                    entities=self._parse_json(old_doc.get('entities')),
+                    keywords=self._parse_json_array(old_doc.get('keywords')),
+                    categories=self._parse_json_array(old_doc.get('categories')),
+                    processed_at=self._parse_datetime(old_doc.get('processed_at')),
                     processor_version=old_doc.get('processor_version'),
                     processing_time_ms=old_doc.get('processing_time_ms'),
                     content_hash=old_doc.get('content_hash'),
@@ -326,6 +408,8 @@ class DatabaseMigration:
                 logger.error(f"迁移处理后文档失败 {old_doc.get('id')}: {e}")
                 self.failures.append(('processed_documents', old_doc.get('id'), str(e)))
                 self.stats['processed_documents']['failed'] += 1
+                # 回滚以清理Session状态
+                await new_session.rollback()
 
         self.stats['processed_documents']['migrated'] = migrated_count
         logger.info(f"处理后文档迁移完成: {migrated_count}/{len(old_docs)}")
@@ -364,9 +448,9 @@ class DatabaseMigration:
                     source_id=old_task.get('source_id', ''),
                     task_type=old_task.get('task_type', 'manual'),
                     status=old_task.get('status', 'pending'),
-                    created_at=old_task.get('created_at'),
-                    started_at=old_task.get('started_at'),
-                    completed_at=old_task.get('completed_at'),
+                    created_at=self._parse_datetime(old_task.get('created_at')),
+                    started_at=self._parse_datetime(old_task.get('started_at')),
+                    completed_at=self._parse_datetime(old_task.get('completed_at')),
                     items_collected=old_task.get('items_collected', 0),
                     items_processed=old_task.get('items_processed', 0),
                     items_failed=old_task.get('items_failed', 0),
@@ -384,6 +468,8 @@ class DatabaseMigration:
                 logger.error(f"迁移任务失败 {old_task.get('id')}: {e}")
                 self.failures.append(('collection_tasks', str(old_task.get('id')), str(e)))
                 self.stats['collection_tasks']['failed'] += 1
+                # 回滚以清理Session状态
+                await new_session.rollback()
 
         self.stats['collection_tasks']['migrated'] = migrated_count
         logger.info(f"采集任务迁移完成: {migrated_count}/{len(old_tasks)}")
@@ -507,10 +593,11 @@ class DatabaseMigration:
 @click.option('--verbose', '-v', is_flag=True, help='详细日志')
 @click.option('--table', multiple=True, help='仅迁移指定表')
 @click.option('--limit', type=int, help='限制每个表迁移的记录数')
-def main(dry_run: bool, verbose: bool, table: tuple, limit: int):
+@click.option('--force', '-f', is_flag=True, help='强制执行，跳过确认')
+def main(dry_run: bool, verbose: bool, table: tuple, limit: int, force: bool):
     """Atlas数据库迁移工具"""
 
-    if not dry_run:
+    if not dry_run and not force:
         print("\n⚠️  即将开始数据库迁移！")
         print("⚠️  建议先备份SQLite数据库！")
         print("\n建议先使用 --dry-run 预演模式测试\n")
@@ -519,6 +606,8 @@ def main(dry_run: bool, verbose: bool, table: tuple, limit: int):
         if response.lower() not in ['yes', 'y']:
             print("迁移已取消")
             return
+    elif not dry_run and force:
+        print("\n⚠️  强制模式执行迁移！")
 
     # 执行迁移
     migration = DatabaseMigration(
