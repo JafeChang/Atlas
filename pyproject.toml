@@ -47,6 +47,11 @@ dependencies = [
     "schedule>=1.2.0",
     # 数据库 (SQLite 标准库，但添加辅助工具)
     "sqlite-utils>=3.35.0",
+    # PostgreSQL 和异步数据库支持 (TASK-002)
+    "sqlalchemy>=2.0.23",
+    "asyncpg>=0.29.0; sys_platform != 'win32'",
+    "aiosqlite>=0.19.0",
+    "psycopg2-binary>=2.9.9; sys_platform != 'win32'",
     "pydantic-settings>=2.12.0",
     # 异步文件操作
     "aiofiles>=23.0.0",
