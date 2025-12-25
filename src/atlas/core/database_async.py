@@ -19,8 +19,12 @@ from sqlalchemy.ext.asyncio import (
 from sqlalchemy.pool import NullPool, QueuePool
 from sqlalchemy import select, update, delete, func
 
-from ..config import get_config
-from ..models.schema import Base, DataSource, RawDocument, ProcessedDocument, CollectionTask
+try:
+    from ..config import get_config
+    from ..models.schema import Base, DataSource, RawDocument, ProcessedDocument, CollectionTask
+except ImportError:
+    from atlas.core.config import get_config
+    from atlas.models.schema import Base, DataSource, RawDocument, ProcessedDocument, CollectionTask
 
 
 class AsyncDatabaseManager:
