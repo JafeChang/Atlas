@@ -19,6 +19,7 @@ Atlas 数据库迁移脚本 - SQLite到PostgreSQL
 """
 
 import asyncio
+import sqlite3
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -33,29 +34,24 @@ from sqlalchemy.ext.asyncio import AsyncSession
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
-from atlas.core.database import AtlasDatabase
 from atlas.core.database_async import AsyncDatabaseManager, get_async_session
 from atlas.models.schema import DataSource, RawDocument, ProcessedDocument, CollectionTask
-from atlas.models.documents import (
-    DataSource as OldDataSource,
-    RawDocument as OldRawDocument,
-    ProcessedDocument as OldProcessedDocument,
-    CollectionTask as OldCollectionTask,
-)
 
 
 class DatabaseMigration:
     """数据库迁移管理器"""
 
-    def __init__(self, dry_run: bool = False, verbose: bool = False):
+    def __init__(self, dry_run: bool = False, verbose: bool = False, db_path: str = "data/atlas.db"):
         """初始化迁移管理器
 
         Args:
             dry_run: 预演模式，不实际迁移
             verbose: 详细日志
+            db_path: SQLite数据库路径
         """
         self.dry_run = dry_run
         self.verbose = verbose
+        self.db_path = db_path
 
         # 统计信息
         self.stats = {
@@ -85,15 +81,30 @@ class DatabaseMigration:
             encoding="utf-8"
         )
 
-    async def migrate_data_sources(
-        self,
-        old_db: AtlasDatabase,
-        new_session: AsyncSession
-    ) -> int:
+    def _query_sqlite(self, query: str) -> List[Dict]:
+        """直接查询SQLite数据库
+
+        Args:
+            query: SQL查询语句
+
+        Returns:
+            查询结果列表
+        """
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+
+        try:
+            cursor.execute(query)
+            rows = cursor.fetchall()
+            return [dict(row) for row in rows]
+        finally:
+            conn.close()
+
+    async def migrate_data_sources(self, new_session: AsyncSession) -> int:
         """迁移数据源表
 
         Args:
-            old_db: 旧数据库实例
             new_session: 新数据库会话
 
         Returns:
@@ -101,9 +112,9 @@ class DatabaseMigration:
         """
         logger.info("开始迁移数据源表...")
 
-        # 从SQLite读取（使用SQL查询）
+        # 从SQLite读取
         query = "SELECT * FROM data_sources"
-        old_sources = old_db.execute_query(query)
+        old_sources = self._query_sqlite(query)
         self.stats['data_sources']['total'] = len(old_sources)
 
         migrated_count = 0
@@ -150,12 +161,7 @@ class DatabaseMigration:
 
         return migrated_count
 
-    async def migrate_raw_documents(
-        self,
-        old_db: AtlasDatabase,
-        new_session: AsyncSession,
-        limit: Optional[int] = None
-    ) -> int:
+    async def migrate_raw_documents(self, new_session: AsyncSession, limit: Optional[int] = None) -> int:
         """迁移原始文档表
 
         Args:
@@ -168,33 +174,51 @@ class DatabaseMigration:
         """
         logger.info("开始迁移原始文档表...")
 
-        # 从SQLite读取
-        old_docs = old_db.get_all_raw_documents(limit=limit)
-        self.stats['raw_documents']['total'] = len(old_docs)
+        # 从SQLite读取（使用SQL查询）
+        limit_clause = f"LIMIT {limit}" if limit else ""
+        query = f"SELECT * FROM raw_documents ORDER BY collected_at DESC {limit_clause}"
+
+        try:
+            old_docs = self._query_sqlite(query)
+            self.stats['raw_documents']['total'] = len(old_docs)
+        except Exception as e:
+            logger.error(f"查询原始文档失败: {e}")
+            old_docs = []
+            self.stats['raw_documents']['total'] = 0
 
         migrated_count = 0
 
         for old_doc in old_docs:
             try:
+                # 处理UUID
+                doc_id = old_doc.get('id')
+                if doc_id:
+                    try:
+                        doc_id = UUID(doc_id)
+                    except ValueError:
+                        doc_id = uuid4()
+                else:
+                    doc_id = uuid4()
+
                 # 创建新对象
                 new_doc = RawDocument(
-                    id=UUID(str(old_doc.id)) if old_doc.id else uuid4(),
-                    source_id=old_doc.source_id,
-                    source_url=str(old_doc.source_url) if old_doc.source_url else None,
-                    source_type=old_doc.source_type.value if old_doc.source_type else None,
-                    document_type=old_doc.document_type.value if old_doc.document_type else None,
-                    raw_content=old_doc.raw_content,
-                    raw_metadata=old_doc.raw_metadata,
-                    collected_at=old_doc.collected_at,
-                    collector_version=old_doc.collector_version,
-                    processing_status=old_doc.processing_status.value,
-                    processing_error=old_doc.processing_error,
-                    processing_attempts=old_doc.processing_attempts,
-                    content_hash=old_doc.content_hash,
-                    title=old_doc.title,
-                    author=old_doc.author,
-                    published_at=old_doc.published_at,
-                    language=old_doc.language,
+                    id=doc_id,
+                    source_id=old_doc.get('source_id', ''),
+                    source_url=old_doc.get('source_url'),
+                    source_type=old_doc.get('source_type'),
+                    document_type=old_doc.get('document_type'),
+                    raw_content=old_doc.get('raw_content'),
+                    raw_metadata=old_doc.get('raw_metadata'),
+                    collected_at=old_doc.get('collected_at'),
+                    collector_version=old_doc.get('collector_version'),
+                    processing_status=old_doc.get('processing_status', 'pending'),
+                    processing_error=old_doc.get('processing_error'),
+                    processing_attempts=old_doc.get('processing_attempts', 0),
+                    content_hash=old_doc.get('content_hash'),
+                    title=old_doc.get('title'),
+                    author=old_doc.get('author'),
+                    published_at=old_doc.get('published_at'),
+                    language=old_doc.get('language'),
                 )
 
                 if self.dry_run:
@@ -208,8 +232,8 @@ class DatabaseMigration:
                 migrated_count += 1
 
             except Exception as e:
-                logger.error(f"迁移文档失败 {old_doc.id}: {e}")
-                self.failures.append(('raw_documents', str(old_doc.id), str(e)))
+                logger.error(f"迁移文档失败 {old_doc.get('id')}: {e}")
+                self.failures.append(('raw_documents', old_doc.get('id'), str(e)))
                 self.stats['raw_documents']['failed'] += 1
 
         self.stats['raw_documents']['migrated'] = migrated_count
@@ -217,12 +241,7 @@ class DatabaseMigration:
 
         return migrated_count
 
-    async def migrate_processed_documents(
-        self,
-        old_db: AtlasDatabase,
-        new_session: AsyncSession,
-        limit: Optional[int] = None
-    ) -> int:
+    async def migrate_processed_documents(self, new_session: AsyncSession, limit: Optional[int] = None) -> int:
         """迁移处理后文档表
 
         Args:
@@ -235,35 +254,62 @@ class DatabaseMigration:
         """
         logger.info("开始迁移处理后文档表...")
 
-        # 从SQLite读取
-        old_docs = old_db.get_all_processed_documents(limit=limit)
-        self.stats['processed_documents']['total'] = len(old_docs)
+        # 从SQLite读取（使用SQL查询）
+        limit_clause = f"LIMIT {limit}" if limit else ""
+        query = f"SELECT * FROM processed_documents ORDER BY processed_at DESC {limit_clause}"
+
+        try:
+            old_docs = self._query_sqlite(query)
+            self.stats['processed_documents']['total'] = len(old_docs)
+        except Exception as e:
+            logger.error(f"查询处理后文档失败: {e}")
+            old_docs = []
+            self.stats['processed_documents']['total'] = 0
 
         migrated_count = 0
 
         for old_doc in old_docs:
             try:
+                # 处理UUID
+                doc_id = old_doc.get('id')
+                if doc_id:
+                    try:
+                        doc_id = UUID(doc_id)
+                    except ValueError:
+                        doc_id = uuid4()
+                else:
+                    doc_id = uuid4()
+
+                raw_doc_id = old_doc.get('raw_document_id')
+                if raw_doc_id:
+                    try:
+                        raw_doc_id = UUID(raw_doc_id)
+                    except ValueError:
+                        raw_doc_id = uuid4()
+                else:
+                    raw_doc_id = uuid4()
+
                 # 创建新对象
                 new_doc = ProcessedDocument(
-                    id=UUID(str(old_doc.id)) if old_doc.id else uuid4(),
-                    raw_document_id=UUID(str(old_doc.raw_document_id)) if old_doc.raw_document_id else uuid4(),
-                    title=old_doc.title,
-                    summary=old_doc.summary,
-                    content=old_doc.content,
-                    structured_content=old_doc.structured_content,
-                    extracted_metadata=old_doc.extracted_metadata,
-                    entities=old_doc.entities,
-                    keywords=old_doc.keywords,
-                    categories=old_doc.categories,
-                    processed_at=old_doc.processed_at,
-                    processor_version=old_doc.processor_version,
-                    processing_time_ms=old_doc.processing_time_ms,
-                    content_hash=old_doc.content_hash,
-                    similarity_group_id=UUID(str(old_doc.similarity_group_id)) if old_doc.similarity_group_id else None,
-                    similarity_score=old_doc.similarity_score,
-                    is_duplicate=old_doc.is_duplicate,
-                    quality_score=old_doc.quality_score,
-                    relevance_score=old_doc.relevance_score,
+                    id=doc_id,
+                    raw_document_id=raw_doc_id,
+                    title=old_doc.get('title', ''),
+                    summary=old_doc.get('summary'),
+                    content=old_doc.get('content'),
+                    structured_content=old_doc.get('structured_content'),
+                    extracted_metadata=old_doc.get('extracted_metadata'),
+                    entities=old_doc.get('entities'),
+                    keywords=old_doc.get('keywords'),
+                    categories=old_doc.get('categories'),
+                    processed_at=old_doc.get('processed_at'),
+                    processor_version=old_doc.get('processor_version'),
+                    processing_time_ms=old_doc.get('processing_time_ms'),
+                    content_hash=old_doc.get('content_hash'),
+                    similarity_group_id=UUID(old_doc['similarity_group_id']) if old_doc.get('similarity_group_id') else None,
+                    similarity_score=old_doc.get('similarity_score'),
+                    is_duplicate=bool(old_doc.get('is_duplicate', False)),
+                    quality_score=old_doc.get('quality_score'),
+                    relevance_score=old_doc.get('relevance_score'),
                 )
 
                 if self.dry_run:
@@ -277,8 +323,8 @@ class DatabaseMigration:
                 migrated_count += 1
 
             except Exception as e:
-                logger.error(f"迁移处理后文档失败 {old_doc.id}: {e}")
-                self.failures.append(('processed_documents', str(old_doc.id), str(e)))
+                logger.error(f"迁移处理后文档失败 {old_doc.get('id')}: {e}")
+                self.failures.append(('processed_documents', old_doc.get('id'), str(e)))
                 self.stats['processed_documents']['failed'] += 1
 
         self.stats['processed_documents']['migrated'] = migrated_count
@@ -286,11 +332,7 @@ class DatabaseMigration:
 
         return migrated_count
 
-    async def migrate_collection_tasks(
-        self,
-        old_db: AtlasDatabase,
-        new_session: AsyncSession
-    ) -> int:
+    async def migrate_collection_tasks(self, new_session: AsyncSession) -> int:
         """迁移采集任务表
 
         Args:
@@ -302,9 +344,16 @@ class DatabaseMigration:
         """
         logger.info("开始迁移采集任务表...")
 
-        # 从SQLite读取
-        old_tasks = old_db.get_all_collection_tasks()
-        self.stats['collection_tasks']['total'] = len(old_tasks)
+        # 从SQLite读取（使用SQL查询）
+        query = "SELECT * FROM collection_tasks ORDER BY created_at DESC"
+
+        try:
+            old_tasks = self._query_sqlite(query)
+            self.stats['collection_tasks']['total'] = len(old_tasks)
+        except Exception as e:
+            logger.error(f"查询采集任务失败: {e}")
+            old_tasks = []
+            self.stats['collection_tasks']['total'] = 0
 
         migrated_count = 0
 
@@ -312,16 +361,16 @@ class DatabaseMigration:
             try:
                 # 创建新对象
                 new_task = CollectionTask(
-                    source_id=old_task.source_id,
-                    task_type=old_task.task_type.value,
-                    status=old_task.status.value,
-                    created_at=old_task.created_at,
-                    started_at=old_task.started_at,
-                    completed_at=old_task.completed_at,
-                    items_collected=old_task.items_collected,
-                    items_processed=old_task.items_processed,
-                    items_failed=old_task.items_failed,
-                    error_message=old_task.error_message,
+                    source_id=old_task.get('source_id', ''),
+                    task_type=old_task.get('task_type', 'manual'),
+                    status=old_task.get('status', 'pending'),
+                    created_at=old_task.get('created_at'),
+                    started_at=old_task.get('started_at'),
+                    completed_at=old_task.get('completed_at'),
+                    items_collected=old_task.get('items_collected', 0),
+                    items_processed=old_task.get('items_processed', 0),
+                    items_failed=old_task.get('items_failed', 0),
+                    error_message=old_task.get('error_message'),
                 )
 
                 if self.dry_run:
@@ -332,8 +381,8 @@ class DatabaseMigration:
                 migrated_count += 1
 
             except Exception as e:
-                logger.error(f"迁移任务失败 {old_task.id}: {e}")
-                self.failures.append(('collection_tasks', str(old_task.id), str(e)))
+                logger.error(f"迁移任务失败 {old_task.get('id')}: {e}")
+                self.failures.append(('collection_tasks', str(old_task.get('id')), str(e)))
                 self.stats['collection_tasks']['failed'] += 1
 
         self.stats['collection_tasks']['migrated'] = migrated_count
@@ -360,28 +409,27 @@ class DatabaseMigration:
         # 初始化数据库连接
         logger.info("\n初始化数据库连接...")
 
-        # SQLite数据库（旧）
-        old_db = AtlasDatabase("data/atlas.db")
-        logger.info(f"SQLite数据库: {old_db.db_path}")
+        # SQLite数据库路径
+        logger.info(f"SQLite数据库: {self.db_path}")
 
         # PostgreSQL数据库（新）
         new_db = AsyncDatabaseManager()
         await new_db.initialize()
-        logger.info(f"PostgreSQL数据库: {new_db._get_database_type()}")
+        logger.info(f"目标数据库: {new_db._get_database_type()}")
 
         # 执行迁移
         async with get_async_session() as session:
             if tables is None or 'data_sources' in tables:
-                await self.migrate_data_sources(old_db, session)
+                await self.migrate_data_sources(session)
 
             if tables is None or 'raw_documents' in tables:
-                await self.migrate_raw_documents(old_db, session, limit)
+                await self.migrate_raw_documents(session, limit)
 
             if tables is None or 'processed_documents' in tables:
-                await self.migrate_processed_documents(old_db, session, limit)
+                await self.migrate_processed_documents(session, limit)
 
             if tables is None or 'collection_tasks' in tables:
-                await self.migrate_collection_tasks(old_db, session)
+                await self.migrate_collection_tasks(session)
 
             if not self.dry_run:
                 await session.commit()
