@@ -1,0 +1,242 @@
+# Claude Code 配置文件
+# Atlas 项目文档规范和开发规则
+
+[project]
+name = "Atlas"
+description = "个人信息聚合与分析系统"
+version = "0.2.0"  # Growth阶段
+stage = "Growth"    # 当前阶段: MVP | Growth | Scale
+
+[documentation]
+# 文档强制规范
+
+# 任务完成后必须创建的文档
+required_docs = [
+    "测试报告: docs/testing/TASK-{task_id}-test-report.md",
+    "任务总结: 更新 docs/tasks/current-backlog.md",
+    "技术文档: 如有新功能，更新对应文档"
+]
+
+# 文档更新检查点
+doc_update_checkpoints = [
+    "任务开始前: 确认文档类型和位置",
+    "开发过程中: 记录关键决策",
+    "任务完成后: 创建测试报告和总结"
+]
+
+# 文档分类和目录映射
+[documentation.directories]
+# 只增文档（历史记录，只追加）
+"docs/tech/" = "accumulative"           # 技术架构
+"docs/guidelines/" = "accumulative"     # 合规准则
+
+# 可变更文档（当前状态，可更新）
+"docs/usage/" = "mutable"               # 使用文档
+"docs/tasks/" = "mutable"               # 任务管理
+"docs/project/" = "mutable"            # 项目状态
+"docs/roadmap/" = "mutable"            # 发展规划
+
+# 开发日志（按时间记录）
+"docs/dev/" = "development-log"         # 开发日志
+"docs/testing/" = "development-log"     # 测试报告
+
+# 归档文档（历史参考）
+"docs/archive/" = "archive"             # 历史归档
+
+[documentation.rules]
+# 文档操作强制规则
+
+# 1. 任务完成后的文档操作
+task_completion = [
+    "创建测试报告: docs/testing/TASK-{id}-{name}-test-report.md",
+    "更新任务状态: docs/tasks/current-backlog.md",
+    "更新当前进度: docs/project/milestones/current-sprint.md (如需要)",
+    "更新文档索引: docs/README.md (如有新增)"
+]
+
+# 2. 阶段转换时的文档操作
+stage_transition = [
+    "归档旧阶段任务: docs/tasks/{old_stage}-backlog-archive.md",
+    "创建新阶段任务: docs/tasks/current-backlog.md",
+    "归档项目计划: docs/archive/{old_stage}-project-plan.md",
+    "更新当前进度: docs/project/milestones/current-sprint.md"
+]
+
+# 3. 文档创建前的检查
+pre_creation_checks = [
+    "确认文档类型: accumulative | mutable | development-log",
+    "选择正确目录: 参考目录映射",
+    "使用对应模板: docs/templates/",
+    "检查是否重复: 搜索已有文档"
+]
+
+# 4. 文档更新时的检查
+pre_update_checks = [
+    "确认更新权限: mutable可更新，accumulative仅追加",
+    "更新版本号: version字段",
+    "记录变更: changelog部分",
+    "检查引用: 更新相关链接"
+]
+
+# 5. 禁止操作
+forbidden_operations = [
+    "不要在 docs/tech/ 和 docs/guidelines/ 修改历史内容",
+    "不要创建与 current-backlog.md 重复的任务文档",
+    "不要在未归档的情况下删除项目计划文档",
+    "不要在不同目录创建同类型文档"
+]
+
+[documentation.templates]
+# 文档模板路径
+
+accumulative_template = "docs/templates/accumulative-template.md"
+mutable_template = "docs/templates/mutable-template.md"
+devlog_template = "docs/templates/dev-log-template.md"
+test_report_template = "docs/testing/"  # 参考现有测试报告格式
+
+[workflow]
+# 开发工作流规范
+
+# 任务开始前
+before_task = [
+    "阅读 docs/tasks/current-backlog.md 确认任务",
+    "查看相关技术文档: docs/tech/",
+    "检查文档模板: docs/templates/"
+]
+
+# 任务进行中
+during_task = [
+    "记录关键决策到开发日志",
+    "保持代码和文档同步",
+    "及时更新风险和问题"
+]
+
+# 任务完成后
+after_task = [
+    "创建测试报告到 docs/testing/",
+    "更新 current-backlog.md 任务状态",
+    "更新 current-sprint.md (如需要)",
+    "提交代码时包含文档更新"
+]
+
+[gates]
+# 决策门禁（必须询问的情况）
+
+decision_gates = [
+    "数据来源: 登录/验证码/付费墙",
+    "新基础设施: 新存储/索引/服务",
+    "LLM调用: 频率或成本变化",
+    "运行方式: 本地→云/服务化",
+    "工程约束: Python版本/uv/OS变更"
+]
+
+[quality]
+# 质量标准
+
+code_quality = [
+    "类型提示: 完整的类型注解",
+    "文档字符串: 公共函数必须有docstring",
+    "错误处理: 完整的异常处理",
+    "日志记录: 关键操作有日志"
+]
+
+doc_quality = [
+    "元信息完整: version, last_updated, updated_by",
+    "链接有效: 检查所有相对链接",
+    "格式统一: 遵循Markdown规范",
+    "中文友好: 使用中文标点"
+]
+
+[commit]
+# Git提交规范
+
+commit_message_format = """\
+{type}: {subject}
+
+{body}
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+Co-Authored-By: Claude Sonnet 4.5 <noreply@anthropic.com>
+"""
+
+commit_types = [
+    "feat: 新功能",
+    "fix: 修复bug",
+    "docs: 文档更新",
+    "refactor: 重构",
+    "test: 测试相关",
+    "chore: 构建/工具"
+]
+
+# 提交前检查
+pre_commit_checks = [
+    "文档是否更新: 任务完成必须有文档",
+    "测试是否通过: 新功能必须有测试",
+    "链接是否有效: 检查文档中的链接",
+    "状态是否更新: current-backlog.md"
+]
+
+[current_state]
+# 当前项目状态
+
+stage = "Growth"
+phase = "Phase 1: 核心基础设施"
+current_tasks = [
+    "TASK-001: MinIO集成 (已完成)",
+    "TASK-002: PostgreSQL迁移 (进行中 67%)"
+]
+next_tasks = [
+    "TASK-003: Celery任务队列",
+    "TASK-004: FastAPI异步API"
+]
+
+blocked_by = [
+    "PostgreSQL环境未就绪"
+]
+
+[aliases]
+# 常用命令别名
+
+# 查看当前任务
+current_task = "查看 docs/tasks/current-backlog.md"
+
+# 查看当前进度
+current_progress = "查看 docs/project/milestones/current-sprint.md"
+
+# 查看文档索引
+doc_index = "查看 docs/README.md"
+
+# 查看技术架构
+tech_arch = "查看 docs/tech/tech-architecture.md"
+
+# 查看开发计划
+dev_plan = "查看 docs/roadmap/growth-development-plan.md"
+
+[reminders]
+# 开发提醒
+
+# 文档提醒
+doc_reminders = [
+    "✅ 任务完成: 创建测试报告",
+    "✅ 状态更新: 更新 current-backlog.md",
+    "✅ 阶段转换: 归档旧文档，创建新文档",
+    "⚠️  禁止重复: 检查是否已有类似文档",
+    "⚠️  链接检查: 更新相关引用"
+]
+
+# 代码提醒
+code_reminders = [
+    "✅ 类型提示: 使用完整的类型注解",
+    "✅ 错误处理: 添加异常处理",
+    "✅ 文档字符串: 公共函数添加docstring",
+    "✅ 测试覆盖: 新功能必须有测试"
+]
+
+# Git提醒
+git_reminders = [
+    "✅ 提交信息: 包含任务编号",
+    "✅ 文档提交: 代码和文档一起提交",
+    "✅ 变更描述: 清晰说明变更内容",
+    "⚠️  检查链接: 提交前检查文档链接"
+]
