@@ -15,7 +15,11 @@ from typing import Any, Dict, List, Optional, Union
 from uuid import UUID
 from pathlib import Path
 
-from ..config import get_config
+try:
+    from ..config import get_config
+except ImportError:
+    # 支持直接运行脚本
+    from atlas.core.config import get_config
 
 logger = logging.getLogger(__name__)
 
@@ -43,7 +47,10 @@ class UnifiedStorageInterface:
 
         if storage_type == 'filesystem':
             # 使用文件系统存储
-            from .storage import FileStorageManager
+            try:
+                from .storage import FileStorageManager
+            except ImportError:
+                from atlas.core.storage import FileStorageManager
             return FileStorageManager(
                 base_dir=self.storage_config.filesystem_base_dir,
                 enable_compression=self.storage_config.filesystem_compression
@@ -51,7 +58,10 @@ class UnifiedStorageInterface:
 
         elif storage_type == 'minio':
             # 使用MinIO存储
-            from .minio_adapter import MinIOStorageAdapter
+            try:
+                from .minio_adapter import MinIOStorageAdapter
+            except ImportError:
+                from atlas.core.minio_adapter import MinIOStorageAdapter
             return MinIOStorageAdapter(
                 endpoint=self.storage_config.minio_endpoint,
                 access_key=self.storage_config.minio_access_key,
