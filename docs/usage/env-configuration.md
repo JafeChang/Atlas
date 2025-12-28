@@ -93,6 +93,32 @@ echo 'dotenv .env.local' > .envrc
 # 应用会自动从.env.local加载
 ```
 
+### 6. 验证Redis配置
+
+```bash
+# 运行Redis环境检查脚本
+python3 scripts/check_redis_env.py
+
+# 使用redis-cli测试
+redis-cli ping
+
+# 使用Python测试
+python3 -c "from redis import Redis; r = Redis(); print(r.ping())"
+```
+
+### 7. 启动Celery
+
+```bash
+# 启动Celery Worker
+celery -A atlas.scheduler.celery_app worker --loglevel=info
+
+# 启动Celery Beat (定时任务调度器)
+celery -A atlas.scheduler.celery_app beat --loglevel=info
+
+# 启动Flower (监控界面)
+celery -A atlas.scheduler.celery_app flower --port=5555
+```
+
 ## 环境变量完整列表
 
 ### 数据库配置
@@ -126,6 +152,30 @@ echo 'dotenv .env.local' > .envrc
 | `ATLAS_STORAGE_MINIO_SECRET_KEY` | MinIO秘密密钥 | - | 是* |
 
 *仅在使用MinIO时必填
+
+### Redis配置 (TASK-003)
+
+| 变量名 | 说明 | 默认值 | 必填 |
+|--------|------|--------|------|
+| `ATLAS_REDIS_HOST` | Redis主机 | localhost | 否 |
+| `ATLAS_REDIS_PORT` | Redis端口 | 6379 | 否 |
+| `ATLAS_REDIS_DB` | Redis数据库编号 | 0 | 否 |
+| `ATLAS_REDIS_PASSWORD` | Redis密码 | - | 否* |
+| `ATLAS_REDIS_MAX_CONNECTIONS` | 最大连接数 | 10 | 否 |
+
+*生产环境推荐设置密码
+
+### Celery配置 (TASK-003)
+
+| 变量名 | 说明 | 默认值 | 必填 |
+|--------|------|--------|------|
+| `ATLAS_CELERY_BROKER_URL` | Celery代理URL | redis://localhost:6379/0 | 否 |
+| `ATLAS_CELERY_RESULT_BACKEND` | Celery结果后端 | redis://localhost:6379/1 | 否 |
+| `ATLAS_CELERY_TASK_TRACK_STARTED` | 追踪任务开始状态 | true | 否 |
+| `ATLAS_CELERY_TASK_TIME_LIMIT` | 任务硬时间限制(秒) | 3600 | 否 |
+| `ATLAS_CELERY_TASK_SOFT_TIME_LIMIT` | 任务软时间限制(秒) | 3000 | 否 |
+| `ATLAS_CELERY_WORKER_PREFETCH_MULTIPLIER` | Worker预取倍数 | 4 | 否 |
+| `ATLAS_CELERY_WORKER_MAX_TASKS_PER_CHILD` | Worker最大任务数 | 1000 | 否 |
 
 ## 安全建议
 

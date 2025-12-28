@@ -43,7 +43,11 @@ dependencies = [
     # 命令行工具
     "click>=8.1.0",
     "rich>=13.0.0",
-    # 任务调度
+    # 任务调度 (TASK-003: Celery + Redis)
+    "celery>=5.3.0",
+    "redis>=5.0.0",
+    "flower>=2.0.0",
+    # 备用轻量级调度器 (开发环境)
     "schedule>=1.2.0",
     # 数据库 (SQLite 标准库，但添加辅助工具)
     "sqlite-utils>=3.35.0",

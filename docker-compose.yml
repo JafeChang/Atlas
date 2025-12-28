@@ -1,32 +1,207 @@
 # Docker Compose配置文件
-# 用于PostgreSQL开发和测试环境
-
-version: '3.8'
+# Atlas完整开发环境 - 一键启动所有服务
+#
+# 用法:
+#   docker-compose up -d          # 启动所有服务
+#   docker-compose up -d postgres redis  # 仅启动基础服务
+#   docker-compose logs -f worker  # 查看worker日志
+#   docker-compose down            # 停止所有服务
+#   docker-compose down -v         # 停止并删除数据卷
 
 services:
+  # =============================================================================
+  # 基础设施服务
+  # =============================================================================
+
   postgres:
     image: postgres:16-alpine
     container_name: atlas-postgres
     restart: unless-stopped
     environment:
-      POSTGRES_DB: atlas_db
-      POSTGRES_USER: atlas_user
-      POSTGRES_PASSWORD: atlas_password
+      POSTGRES_DB: ${ATLAS_DATABASE_NAME:-atlas_db}
+      POSTGRES_USER: ${ATLAS_DATABASE_USER:-atlas_user}
+      POSTGRES_PASSWORD: ${ATLAS_DATABASE_PASSWORD:-atlas_password}
       POSTGRES_INITDB_ARGS: "-E UTF8 --locale=C"
     ports:
-      - "5432:5432"
+      - "5433:5432"  # 使用5433避免与本地PostgreSQL冲突
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U atlas_user -d atlas_db"]
+      test: ["CMD-SHELL", "pg_isready -U ${ATLAS_DATABASE_USER:-atlas_user} -d ${ATLAS_DATABASE_NAME:-atlas_db}"]
       interval: 10s
       timeout: 5s
       retries: 5
     networks:
       - atlas-network
 
+  redis:
+    image: redis:7-alpine
+    container_name: atlas-redis
+    restart: unless-stopped
+    command: >
+      sh -c '
+        if [ -n "$$REDIS_PASSWORD" ]; then
+          redis-server --requirepass $$REDIS_PASSWORD --maxmemory 256mb --maxmemory-policy allkeys-lru
+        else
+          redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru
+        fi
+      '
+    environment:
+      REDIS_PASSWORD: ${ATLAS_REDIS_PASSWORD:-}
+    ports:
+      - "${ATLAS_REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - atlas-network
+
+  minio:
+    image: minio/minio:latest
+    container_name: atlas-minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${ATLAS_STORAGE_MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${ATLAS_STORAGE_MINIO_SECRET_KEY:-minioadmin}
+    ports:
+      - "${ATLAS_STORAGE_MINIO_ENDPOINT_PORT:-9000}:9000"
+      - "${ATLAS_STORAGE_MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - atlas-network
+
+  # =============================================================================
+  # Celery任务队列
+  # =============================================================================
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: atlas-worker
+    restart: unless-stopped
+    command: >
+      sh -c '
+        echo "等待基础设施服务启动..." &&
+        sleep 10 &&
+        echo "启动Celery Worker..." &&
+        celery -A atlas.scheduler.celery_app worker --loglevel=info --concurrency=4
+      '
+    environment:
+      # 数据库配置
+      ATLAS_DATABASE_TYPE: postgresql
+      ATLAS_DATABASE_HOST: postgres
+      ATLAS_DATABASE_PORT: 5432
+      ATLAS_DATABASE_NAME: ${ATLAS_DATABASE_NAME:-atlas_db}
+      ATLAS_DATABASE_USER: ${ATLAS_DATABASE_USER:-atlas_user}
+      ATLAS_DATABASE_PASSWORD: ${ATLAS_DATABASE_PASSWORD:-atlas_password}
+
+      # Redis配置
+      ATLAS_REDIS_HOST: redis
+      ATLAS_REDIS_PORT: 6379
+      ATLAS_REDIS_DB: 0
+      ATLAS_REDIS_PASSWORD: ${ATLAS_REDIS_PASSWORD:-}
+
+      # MinIO配置
+      ATLAS_STORAGE_TYPE: minio
+      ATLAS_STORAGE_MINIO_ENDPOINT: minio:9000
+      ATLAS_STORAGE_MINIO_ACCESS_KEY: ${ATLAS_STORAGE_MINIO_ACCESS_KEY:-minioadmin}
+      ATLAS_STORAGE_MINIO_SECRET_KEY: ${ATLAS_STORAGE_MINIO_SECRET_KEY:-minioadmin}
+
+      # Celery配置
+      ATLAS_CELERY_BROKER_URL: redis://:${ATLAS_REDIS_PASSWORD:-}@redis:6379/0
+      ATLAS_CELERY_RESULT_BACKEND: redis://:${ATLAS_REDIS_PASSWORD:-}@redis:6379/1
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - atlas-network
+
+  beat:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: atlas-beat
+    restart: unless-stopped
+    command: >
+      sh -c '
+        echo "等待基础设施服务启动..." &&
+        sleep 10 &&
+        echo "启动Celery Beat..." &&
+        celery -A atlas.scheduler.celery_app beat --loglevel=info
+      '
+    environment:
+      # 数据库配置
+      ATLAS_DATABASE_TYPE: postgresql
+      ATLAS_DATABASE_HOST: postgres
+      ATLAS_DATABASE_PORT: 5432
+      ATLAS_DATABASE_NAME: ${ATLAS_DATABASE_NAME:-atlas_db}
+      ATLAS_DATABASE_USER: ${ATLAS_DATABASE_USER:-atlas_user}
+      ATLAS_DATABASE_PASSWORD: ${ATLAS_DATABASE_PASSWORD:-atlas_password}
+
+      # Redis配置
+      ATLAS_REDIS_HOST: redis
+      ATLAS_REDIS_PORT: 6379
+      ATLAS_REDIS_DB: 0
+      ATLAS_REDIS_PASSWORD: ${ATLAS_REDIS_PASSWORD:-}
+
+      # MinIO配置
+      ATLAS_STORAGE_TYPE: minio
+      ATLAS_STORAGE_MINIO_ENDPOINT: minio:9000
+      ATLAS_STORAGE_MINIO_ACCESS_KEY: ${ATLAS_STORAGE_MINIO_ACCESS_KEY:-minioadmin}
+      ATLAS_STORAGE_MINIO_SECRET_KEY: ${ATLAS_STORAGE_MINIO_SECRET_KEY:-minioadmin}
+
+      # Celery配置
+      ATLAS_CELERY_BROKER_URL: redis://:${ATLAS_REDIS_PASSWORD:-}@redis:6379/0
+      ATLAS_CELERY_RESULT_BACKEND: redis://:${ATLAS_REDIS_PASSWORD:-}@redis:6379/1
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - atlas-network
+
+  flower:
+    image: mher/flower:latest
+    container_name: atlas-flower
+    restart: unless-stopped
+    command: >
+      celery --broker=redis://:${ATLAS_REDIS_PASSWORD:-}@redis:6379/0 flower --port=5555
+    environment:
+      ATLAS_REDIS_PASSWORD: ${ATLAS_REDIS_PASSWORD:-}
+    ports:
+      - "5555:5555"
+    depends_on:
+      - redis
+    networks:
+      - atlas-network
+
 volumes:
   postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  minio_data:
     driver: local
 
 networks:
