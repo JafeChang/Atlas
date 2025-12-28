@@ -60,6 +60,13 @@ class DataSource(Base):
         "CollectionTask", back_populates="source", cascade="all, delete-orphan"
     )
 
+    @property
+    def tags_list(self) -> List[str]:
+        """获取标签列表"""
+        if self.tags:
+            return self.tags.split(",")
+        return []
+
     def __repr__(self) -> str:
         return f"<DataSource(id={self.id}, name='{self.name}', type='{self.source_type}')>"
 

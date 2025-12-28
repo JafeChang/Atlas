@@ -26,6 +26,7 @@ from .middleware.error_handler import (
 )
 from .utils.response import success_response
 from .api.v1 import auth as auth_api
+from .api.v1 import sources as sources_api
 
 
 # 配置日志
@@ -210,8 +211,10 @@ async def overview():
 # 认证API
 app.include_router(auth_api.router, prefix="/api/v1")
 
+# 数据源API
+app.include_router(sources_api.router, prefix="/api/v1")
+
 # 这里将在后续阶段添加：
-# - /api/v1/sources - 数据源管理
 # - /api/v1/collections - 采集任务
 # - /api/v1/documents - 文档管理
 # - /api/v1/storage - 存储管理
