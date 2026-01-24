@@ -28,6 +28,9 @@ from .utils.response import success_response
 from .api.v1 import auth as auth_api
 from .api.v1 import sources as sources_api
 from .api.v1 import collections as collections_api
+from .api.v1 import documents as documents_api
+from .api.v1 import system as system_api
+from .api.v1 import monitoring as monitoring_api
 
 
 # 配置日志
@@ -218,11 +221,18 @@ app.include_router(sources_api.router, prefix="/api/v1")
 # 采集任务API
 app.include_router(collections_api.router, prefix="/api/v1")
 
+# 文档管理API
+app.include_router(documents_api.router, prefix="/api/v1")
+
+# 系统监控API
+app.include_router(system_api.router, prefix="/api/v1")
+
+# 监控仪表板API
+app.include_router(monitoring_api.router, prefix="/api/v1")
+
 # 这里将在后续阶段添加：
-# - /api/v1/documents - 文档管理
 # - /api/v1/storage - 存储管理
 # - /api/v1/scheduler - 调度器管理
-# - /api/v1/system - 系统监控
 
 
 # =============================================================================
