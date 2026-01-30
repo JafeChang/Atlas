@@ -141,7 +141,7 @@ except Exception as e:
 @app.get("/", response_class=HTMLResponse)
 async def root(request: Request):
     """
-    主页 - 管理后台界面
+    主页 - 引导到数据管理界面
     """
     if templates:
         return templates.TemplateResponse(
@@ -163,6 +163,20 @@ async def root(request: Request):
             version=settings.app_version,
             docs_url=settings.docs_url
         ))
+
+
+@app.get("/dashboard", response_class=HTMLResponse)
+async def dashboard(request: Request):
+    """
+    数据管理界面 - 查看数据源、文档、任务
+    """
+    if templates:
+        return templates.TemplateResponse(
+            "dashboard.html",
+            {"request": request, "app_name": settings.app_name}
+        )
+    else:
+        return HTMLResponse("<html><body><h1>模板未配置</h1></body></html>")
 
 
 @app.get("/health")
