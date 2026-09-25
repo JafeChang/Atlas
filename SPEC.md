@@ -276,6 +276,7 @@ C8 的配置来自前端 / API，不依赖手工编辑文件。
 | `label_space` | T-101 | 每版本的启用行业集合（= 标签空间，§2.5） |
 | `registry_label_refs` / `registry_label_ref_snapshots` | T-101 | **标签引用索引**（§2.9 规则 1：被引用 id 不得改删）——**不是标签本身** |
 | `raw_records` | T-103 | 原文元数据（字节本体在文件系统） |
+| `catalog_health` | T-111 | 渠道健康状态（探测结果 + 时间；**只增不改**，最新一条为当前状态） |
 | `proposed_claims` | T-105 | 机器提议（可覆写，保留版本链） |
 | `confirmed_labels` | T-108 | 人工标签（**Confirmed，只增不改**） |
 | `evidence_spans` | T-107 | 证据锚点索引（如需；真值仍在 `raw` 偏移上） |
