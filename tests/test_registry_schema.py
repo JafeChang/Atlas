@@ -42,6 +42,7 @@ def rss_channel(**overrides: object) -> Channel:
         "endpoint": "https://openai.com/blog/rss.xml",
         "fetch_spec": FetchSpec(type="rss"),
         "interval_seconds": 3600,
+        "enabled": True,
     }
     payload.update(overrides)
     return Channel(**payload)

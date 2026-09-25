@@ -49,6 +49,7 @@ def make_channel(channel_id: str = "openai-blog", **overrides: object) -> Channe
         "endpoint": f"https://example.com/{channel_id}.xml",
         "fetch_spec": FetchSpec(type="rss"),
         "interval_seconds": 3600,
+        "enabled": True,
     }
     payload.update(overrides)
     return Channel(**payload)

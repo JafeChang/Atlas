@@ -51,6 +51,7 @@ def rich_registry() -> tuple[tuple[Industry, ...], tuple[Channel, ...]]:
             rate_limit_seconds=5,
             user_agent="atlas-bot",
             tags=("research", "vendor"),
+            enabled=True,
         ),
         Channel(
             id="arxiv-new",
@@ -82,6 +83,7 @@ def rich_registry() -> tuple[tuple[Industry, ...], tuple[Channel, ...]]:
             ),
             interval_seconds=86400,
             rate_limit_seconds=30,
+            enabled=True,
         ),
     )
     return industries, channels
@@ -170,6 +172,7 @@ def test_import_does_not_overwrite_existing_configuration() -> None:
             endpoint="https://openai.com/blog/rss.xml",
             fetch_spec=FetchSpec(type="rss"),
             interval_seconds=7200,
+            enabled=True,
         )
     )
     with pytest.raises(InvalidContractStateError, match="导入不覆盖既有配置"):
