@@ -289,6 +289,28 @@ C8 的配置来自前端 / API，不依赖手工编辑文件。
 
 ## 4. DAG（22 个任务）
 
+### 4.0 包布局约定（避免多子代理互相踩）
+
+| 包 | 归属 | 职责 |
+|---|---|---|
+| `src/atlas/contracts/` | T-002 ✅ | 三态契约、锚点、任务规范、ID 策略 |
+| `src/atlas/collectors/` | 保留资产 | 现有采集器（RSS / 网页 / HTTP / 限速） |
+| `src/atlas/core/` | 保留资产 | 配置、日志、存储 |
+| `src/atlas/models/` | 保留资产 | 文档模型 |
+| `src/atlas/registry/` | T-004 ✅ / T-101 | 配置契约与源注册表 |
+| `src/atlas/runner/` | T-110 ✅ | 任务运行器（DAG 执行） |
+| `src/atlas/collect/` | T-102 | 采集执行器（幂等 / 限速 / robots） |
+| `src/atlas/archive/` | T-103 | 不可变原文归档 |
+| `src/atlas/normalize/` | T-104 | 归一化文本层 + 偏移映射 |
+| `src/atlas/catalog/` | T-111 | 目录聚合与保鲜 |
+| `src/atlas/cognition/` | T-105 | 机器分类与提议（PI） |
+| `src/atlas/evidence/` | T-107 | 证据校验与高亮 |
+| `src/atlas/feed/` | T-106 | Feed 查询 API |
+| `src/atlas/labels/` | T-108 | 人工打标存储（Confirmed） |
+| `src/atlas/webui/` | T-109 | 打标前端 |
+
+**规则**：一个包只由一个任务负责；**跨包只允许依赖 `atlas.contracts` 与 `atlas.registry.schema`（类型）**，不得互相 import 实现。这让同一波次的子代理可以安全并行。
+
 ### 4.1 L0 地基
 
 | ID | 任务 | 规模 | 依赖 | 产出 |
