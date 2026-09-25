@@ -16,11 +16,20 @@
 | 数据源 | 仅公开可访问数据；不绕过反爬、登录、验证码 |
 | 优先级 | 工程可持续性 > 可迁移性 > 可审计性 > 性能 |
 
-## 三条硬规则（来自归档基线的失败教训）
+## 四条硬规则（来自归档基线的失败教训）
 
 1. **"完成"必须能用跑通的数据流证明**——不得用"有文件 / 有字段 / 有测试报告"证明。
 2. **不允许用 `except` 掩盖接线错误**；未实现的部分必须响亮失败（`NotImplementedError`），不得返回编造的结果。
 3. **只保留单一事实来源的文档**，不再建立平行的文档体系。
+4. **提交必须对测试结果做门禁**：只有 `pytest` 退出码为 0 才允许提交。
+   **工作区是绿的 ≠ 提交是绿的**——子代理边写边跑时，提交很容易抓到"写了一半的中间态"。
+   因此提交后必须用**独立 worktree 复核该提交本身**：
+   ```bash
+   git worktree add --detach /tmp/atlas-verify <commit>
+   cd /tmp/atlas-verify && PYTHONPATH=/tmp/atlas-verify/src \
+     /mnt/c/Users/bestz/Documents/projects/Atlas/.venv-new/bin/python -m pytest tests -q
+   ```
+   （`PYTHONPATH` 必须指向该检出，否则可编辑安装仍会导入主工作区的 `src`。）
 
 ## 环境
 
