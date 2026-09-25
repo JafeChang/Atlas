@@ -775,17 +775,6 @@ def test_default_assembly_cannot_bypass_robots(
         archive.close()
 
 
-@pytest.mark.xfail(
-    reason=(
-        "T-120 接线时发现的已提交包缺陷（已报告，未就地修改）："
-        "atlas/collect/robots.py 的 FetcherRobotsAdapter 在 fetcher 抛 FetchError 时丢弃了"
-        " FetchHTTPError.status_code，于是真实抓取路径（UrllibFetcher + 适配器）拿不到 404，"
-        "RobotsCache 只能按『拿不到规则』保守拒绝 —— 与 SPEC §2.12『其它 4xx（含 404）→ 允许"
-        "（RFC 9309：站方明确表示没有 robots.txt）』冲突。该包的单元测试注入的是直接返回"
-        " status_code=404 的假 robots fetcher，因此覆盖不到这条真实路径"
-    ),
-    strict=False,
-)
 def test_real_robots_404_is_treated_as_absent_per_spec_2_12(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
