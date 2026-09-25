@@ -5,118 +5,48 @@ build-backend = "hatchling.build"
 [project]
 name = "atlas"
 version = "0.1.0"
-description = "Atlas 个人信息聚合系统 - MVP版本"
+description = "Atlas 个人信息聚合分析服务"
 readme = "README.md"
 license = {file = "LICENSE"}
 requires-python = ">=3.13"
-authors = [
-    {name = "Atlas Team", email = "atlas@example.com"},
-]
-keywords = ["information-aggregation", "llm", "data-collection"]
+authors = [{name = "Atlas"}]
+keywords = ["information-aggregation", "research", "news"]
 classifiers = [
     "Development Status :: 3 - Alpha",
-    "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
-    "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.13",
-    "Topic :: Software Development :: Libraries :: Python Modules",
-    "Topic :: Internet :: WWW/HTTP :: Indexing/Search",
 ]
 
+# 依赖最小化：只声明当前保留代码（依赖闭包）真正需要的包。
+# 新增依赖必须先说明用途，并确认无法用标准库或已有依赖解决。
 dependencies = [
-    # HTTP 客户端和网络请求
+    # HTTP 客户端
     "requests>=2.31.0",
     "httpx>=0.25.0",
-    # HTML 和 XML 解析
+    # 解析（HTML / XML / RSS）
     "beautifulsoup4>=4.12.0",
     "lxml>=4.9.0",
-    # 数据处理和验证
-    "pydantic>=2.5.0",
-    "python-dateutil>=2.8.0",
-    # RSS/Atom 解析
     "feedparser>=6.0.0",
-    # 配置管理
+    # 配置与校验
+    "pydantic>=2.5.0",
+    "pydantic-settings>=2.12.0",
     "pyyaml>=6.0.0",
     "python-dotenv>=1.0.0",
-    # 日志和监控
+    # 日志
     "loguru>=0.7.0",
-    # 命令行工具
-    "click>=8.1.0",
-    "rich>=13.0.0",
-    # 任务调度 (TASK-003: Celery + Redis)
-    "celery>=5.3.0",
-    "redis>=5.0.0",
-    "flower>=2.0.0",
-    # 备用轻量级调度器 (开发环境)
-    "schedule>=1.2.0",
-    # 数据库 (SQLite 标准库，但添加辅助工具)
-    "sqlite-utils>=3.35.0",
-    # PostgreSQL 和异步数据库支持 (TASK-002)
-    "sqlalchemy>=2.0.23",
-    "asyncpg>=0.29.0; sys_platform != 'win32'",
-    "aiosqlite>=0.19.0",
-    "psycopg2-binary>=2.9.9; sys_platform != 'win32'",
-    "pydantic-settings>=2.12.0",
     # 异步文件操作
     "aiofiles>=23.0.0",
-    # 系统监控
-    "psutil>=5.9.0",
-    "aiohttp>=3.13.2",
-    "numpy>=2.3.5",
-    "scikit-learn>=1.8.0",
-    "openai>=2.12.0",
-    "flask>=3.1.2",
-    "flask-cors>=6.0.2",
+    # 对象存储（原文归档后端之一）
     "minio>=7.2.20",
-    # FastAPI 和 ASGI 服务器 (TASK-004)
-    "fastapi>=0.109.0",
-    "uvicorn[standard]>=0.27.0",
-    "python-multipart>=0.0.6",
-    # 认证和安全 (TASK-004)
-    "python-jose[cryptography]>=3.3.0",
-    "passlib[bcrypt]>=1.7.4",
-    # 模板引擎
-    "jinja2>=3.1.3",
-    # 速率限制
-    "slowapi>=0.1.9",
-    # User-Agent解析
-    "user-agents>=2.2.0",
 ]
 
-[project.optional-dependencies]
+[dependency-groups]
 dev = [
-    # 测试框架
     "pytest>=8.0.0",
     "pytest-asyncio>=0.23.0",
     "pytest-cov>=4.0.0",
-    "pytest-mock>=3.12.0",
-
-    # 代码质量
     "ruff>=0.1.0",
-    "mypy>=1.8.0",
-    "black>=23.0.0",
-    "isort>=5.13.0",
-
-    # 类型检查
-    "types-requests>=2.31.0",
-    "types-python-dateutil>=2.8.0",
-    "types-PyYAML>=6.0.0",
 ]
-
-llm = [
-    # LLM 客户端
-    "openai>=1.5.0",
-    "anthropic>=0.8.0",
-]
-
-[project.scripts]
-atlas = "atlas.cli:main"
-
-[project.urls]
-Homepage = "https://github.com/your-username/atlas"
-Repository = "https://github.com/your-username/atlas.git"
-Documentation = "https://github.com/your-username/atlas/docs"
-"Bug Tracker" = "https://github.com/your-username/atlas/issues"
 
 [tool.hatch.version]
 path = "src/atlas/__init__.py"
@@ -125,9 +55,8 @@ path = "src/atlas/__init__.py"
 include = [
     "/src",
     "/config",
-    "/scripts",
-    "/tests",
     "/docs",
+    "/SPEC.md",
     "/README.md",
     "/LICENSE",
     "/pyproject.toml",
@@ -136,10 +65,12 @@ include = [
 [tool.hatch.build.targets.wheel]
 packages = ["src/atlas"]
 
-# Ruff 配置
+# Ruff
 [tool.ruff]
 target-version = "py313"
 line-length = 88
+
+[tool.ruff.lint]
 select = [
     "E",   # pycodestyle errors
     "W",   # pycodestyle warnings
@@ -150,105 +81,25 @@ select = [
     "UP",  # pyupgrade
 ]
 ignore = [
-    "E501",  # line too long, handled by black
-    "B008",  # do not perform function calls in argument defaults
+    "E501",  # line too long
+    "B008",  # function call in argument defaults
     "C901",  # too complex
 ]
 
-[tool.ruff.per-file-ignores]
+[tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["F401"]
 
-# Black 配置
-[tool.black]
-target-version = ['py313']
-line-length = 88
-include = '\.pyi?$'
-extend-exclude = '''
-/(
-  # directories
-  \.eggs
-  | \.git
-  | \.hg
-  | \.mypy_cache
-  | \.tox
-  | \.venv
-  | build
-  | dist
-)/
-'''
-
-# isort 配置
-[tool.isort]
-profile = "black"
-multi_line_output = 3
-line_length = 88
-known_first_party = ["atlas"]
-
-# MyPy 配置
-[tool.mypy]
-python_version = "3.13"
-warn_return_any = true
-warn_unused_configs = true
-disallow_untyped_defs = true
-disallow_incomplete_defs = true
-check_untyped_defs = true
-disallow_untyped_decorators = true
-no_implicit_optional = true
-warn_redundant_casts = true
-warn_unused_ignores = true
-warn_no_return = true
-warn_unreachable = true
-strict_equality = true
-
-[[tool.mypy.overrides]]
-module = [
-    "feedparser.*",
-    "sqlite_utils.*",
-    "schedule.*",
-]
-ignore_missing_imports = true
-
-# Pytest 配置
+# Pytest（tests/ 由 T-002 起重建；此处暂不设 testpaths，避免空目录导致收集报错）
 [tool.pytest.ini_options]
 minversion = "7.0"
 addopts = "-ra -q --strict-markers --strict-config"
-testpaths = ["tests"]
 python_files = ["test_*.py", "*_test.py"]
-python_classes = ["Test*"]
-python_functions = ["test_*"]
 markers = [
-    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "slow: marks tests as slow",
     "integration: marks tests as integration tests",
     "unit: marks tests as unit tests",
 ]
 
-# Coverage 配置
 [tool.coverage.run]
 source = ["src"]
-omit = [
-    "*/tests/*",
-    "*/test_*",
-    "*/__pycache__/*",
-    "*/.*",
-]
-
-[tool.coverage.report]
-exclude_lines = [
-    "pragma: no cover",
-    "def __repr__",
-    "if self.debug:",
-    "if settings.DEBUG",
-    "raise AssertionError",
-    "raise NotImplementedError",
-    "if 0:",
-    "if __name__ == .__main__.:",
-    "class .*\\bProtocol\\):",
-    "@(abc\\.)?abstractmethod",
-]
-
-[dependency-groups]
-dev = [
-    "pytest>=9.0.2",
-    "pytest-asyncio>=1.3.0",
-    "pytest-cov>=7.0.0",
-]
+omit = ["*/tests/*", "*/test_*", "*/__pycache__/*", "*/.*"]

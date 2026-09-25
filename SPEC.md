@@ -307,4 +307,94 @@ PI 不含权限系统、不沙箱化工具调用（其官方文档明确说明�
 
 ---
 
+## 8. T-001 执行记录（2026-09-25）
+
+> 本节**取代 §7.1 / §7.2 的清单**——那两份清单不闭合（漏了 `cli.py`、`models/`、`scripts/`、部署文件、根目录散件等）。以本节为准。
+
+### 8.1 处置清单（闭合）
+
+**保留（28 个跟踪文件）**
+
+| 路径 | 说明 |
+|---|---|
+| `src/atlas/collectors/`（6 文件） | 采集器；闭包已验证可运行 |
+| `src/atlas/core/{__init__,config,logging,storage,unified_storage,minio_adapter}.py` | 依赖闭包必需 |
+| `src/atlas/models/{__init__,documents}.py` | 被 `core/storage.py` 依赖 |
+| `src/atlas/__init__.py` | 包定义与版本 |
+| `config/{config.yaml,sources.yaml}` | 配置驱动 + arXiv 分类种子 |
+| `docs/guidelines/{atlas_技术与合规实施准则,workflow}.md` | 目标与协作原则的原始出处 |
+| `docs/tech/{architecture-questions,architecture-decisions,tech-architecture}.md` | 架构原始出处（`tech-architecture.md` 含被 D10 取消的分级演进，**仅作参考**） |
+| `SPEC.md`、`CLAUDE.md`、`README.md`、`LICENSE`、`.gitignore`、`pyproject.toml` | 规格与工程文件 |
+
+**本地保留、不进 git（不动）**：`data/`（534 个原始文档）、`logs/`、`.venv/`、`.env`、`.env.local`、`config/.env.development`、`.claude/settings.local.json`
+
+> ⚠️ `data/` 与 `logs/` **必须就地保留**：运行中的 Docker 旧栈（`atlas-beat` / `atlas-worker`）正把它们挂载为 `/app/data` 与 `/app/logs`。
+
+**弃用（194 个跟踪文件，历史完整保留在归档 tag）**
+
+| 类别 | 内容 |
+|---|---|
+| 已弃用栈 | `src/atlas/{web,scheduler,monitoring,processors,llm}/`、`core/{database,database_async,operations}.py`、`models/schema.py`、`cli.py`、`cli/audit.py`、`src/core/`、`__main__.py` |
+| 测试 | `tests/`（28 文件） |
+| 脚本 | `scripts/`（27 文件） |
+| 文档 | `docs/` 中除上表之外的 43 篇（含 PG / Redis 运维指南） |
+| 部署 | `Dockerfile`、`docker-compose*.yml`、`.dockerignore`、`get-docker.sh`、`manage.sh`、`DEPLOYMENT.md`、`QUICKSTART.md` |
+| 散件 | 6 个根目录 `test_*.py`、`audit_report.json`、`simple_dashboard.json`、`atlas_api.log`、`.env.*.example`、`examples/`（2 个 demo） |
+| 凭据 / 二进制 | `config/minio/minio.env`、`config/.env.minio.example`、`.local/bin/minio`（5.3 MB） |
+| 治理体制 | `.claude/config`、`.claude/README.md` |
+| 待重建 | `uv.lock`（依赖精简后失效，需 `uv lock` 重新生成） |
+
+同时精简 `pyproject.toml`：依赖从 40+ 项降至 12 项（闭包所需），移除 `atlas = "atlas.cli:main"` 入口。
+
+### 8.2 本次确定的三项
+
+| 项 | 结论 |
+|---|---|
+| 采集连续性 | 保留旧系统一份**可跑副本**：worktree `../Atlas-legacy` @ `main`，共享 `data/` 与 `.venv` |
+| `CLAUDE.md` / `.claude/config` | `CLAUDE.md` 重写为指向本规格的**薄指针**；`.claude/config` 弃用 |
+| `docs/` 范围 | 保留 `docs/guidelines/` + 3 篇 `docs/tech/` 原始文档；其余弃用 |
+
+### 8.3 环境实测（WSL 才是真实开发环境）
+
+```
+WSL Ubuntu-24.04 | uv 0.9.8 | .venv = Python 3.13.9
+保留清单 10 个模块 import 全部 OK
+```
+
+> 早前"本机跑不起来"的判断**仅对 Windows PowerShell 成立**。WSL 内可以真实执行代码，因此 §7.3 的"跑通的数据流"判据具备落地条件。
+
+### 8.4 旧系统可跑副本（`../Atlas-legacy`）
+
+```bash
+cd /mnt/c/Users/bestz/Documents/projects/Atlas-legacy
+PYTHONPATH=src ./.venv/bin/python -m atlas collect --dry-run   # 已验证可跑
+```
+
+- `data/` 与 `.venv/` 是指向主仓库的 **junction**：两者共享同一份数据与依赖，不分叉
+- Docker 旧栈（Postgres / Redis / MinIO / Worker / Beat / Flower）随 WSL 启动自动拉起；**无 crontab，采集并不自动运行**
+- ⚠️ 新结构必须使用**独立 venv**（见 `CLAUDE.md`），否则 `uv sync` 会裁剪共享 venv 并破坏旧副本
+
+### 8.5 验证结果（T-001 完成判据）
+
+| 检查 | 结果 |
+|---|---|
+| 保留模块 import | **10 / 10 OK** |
+| 弃用模块**不可导入** | **9 / 9 GONE**（`atlas.web` / `scheduler` / `cli` / `processors` / `llm` / `monitoring`、`core.database` / `operations`、`models.schema`） |
+| 真实数据流 | `config → sources.yaml(12 个源) → CollectorFactory → RSSCollector(openai-blog)` 通过 |
+
+**过程中发现并修复的一个陷阱**：`git rm` **不会**删除未跟踪的 `__pycache__`，于是 `src/atlas/{web,llm,processors,scheduler,monitoring}/` 变成空目录，而 Python 把空目录当作**命名空间包**——结果 `import atlas.web` **依然成功**。这是"静态残留伪装成存在"的又一形态：已删除的模块看起来还在。已显式清除残留目录并复验为 GONE。
+
+> 由此追加一条判据：**删除类任务必须验证"弃用项确实不可用"，而不只是"文件不在了"。**
+
+**未完成项**
+
+| 项 | 原因 | 归属 |
+|---|---|---|
+| `uv.lock` 重新生成 | 代理（Clash `127.0.0.1:7897`）**仅监听本机回环**，`192.168.1.8:7897` 不可达 → WSL2(NAT) 无法借道；而 WSL 直连 PyPI 又因 fake-IP DNS 超时 | 环境任务（T-002 开工前） |
+
+> 可选修法（择一）：① 在 Clash 开启「允许局域网连接」后于 WSL 显式设 `HTTPS_PROXY=http://<宿主IP>:7897`；② 改用 `.wslconfig` 的 `networkingMode=mirrored`，使 WSL 内 `127.0.0.1` 直达宿主代理。
+> 注意：**Windows 侧直连抓取可用**（`web_search` 正常，`curl -x 127.0.0.1:7897` 已验证 200），受阻的只是 WSL。
+
+---
+
 *本文件遵循"单一事实来源"原则。修订请直接更新本文件，并在 §0 更新版本与日期。*
