@@ -36,11 +36,34 @@
 - `RawContentMissingError`（`NotFoundError` 子类）：DB 有行但字节缺失，或字节在而副本损坏。
   这是**归档被破坏**，不是普通的"查不到"；子类化是为了让"照 `RawStore` 契约捕获
   `NotFoundError`"的调用方仍然可用，同时持有具体信息的人能区分二者。
+
+并发与线程安全（存储层的保证，不是调用方纪律）
+----------------------------------------------
+
+真实消费方天生多线程（`ThreadingHTTPServer` 每请求一个线程，SPEC §2.11），
+所以"单个 `ArchiveStore` 实例接进服务"必须能跑，不能要求调用方每请求新建：
+
+- **元数据**：`SqliteRawStore` 的连接以 `check_same_thread=False` 打开，所有
+  execute/commit/rollback/close 都在一把 `threading.RLock` 内（见该模块 docstring）；
+- **读路径**（`get` / `get_content` / `all_raw_ids` / `verify`）：线程安全，
+  元数据在锁内查询，字节是文件读；
+- **写路径**（`put`）：本实例的 `put` 被一把 `threading.RLock`（`self._commit_lock`）
+  串行化，因此"查元数据 → 写字节 → 插元数据"整个提交序列是原子的。并发 `put`
+  同一 `raw_id` 的结果因此**确定**：恰好一个版本胜出（同一实例内即最先拿到锁的那个），
+  其余线程拿到幂等的已有记录，或内容不同时拿到 `ImmutabilityError`；
+- **字节**：按**内容寻址**的不可变文件，`write_new` 用"临时目录 → fsync →
+  `os.replace`"落盘，因此并发读者永远不会看到半个文件；
+- **跨实例边界**：上述提交锁是**每实例**的。两个进程/两个 `ArchiveStore` 实例
+  同时 `put` 同一个 `raw_id` 时，元数据仍由 `raw_records` 主键收敛（SQLite 的
+  `busy_timeout` 兜住争用），但字节目录的最终归属不保证 —— 极端情况下
+  `os.replace` 会抛 `OSError: Directory not empty`。这是**响亮失败**而非静默坏数据，
+  上层重试即可；单实例（服务的正常形态）不存在这个窗口。
 """
 
 from __future__ import annotations
 
 import shutil
+import threading
 from pathlib import Path
 from typing import List, Optional, Union
 
@@ -84,6 +107,10 @@ class ArchiveStore:
 
     ``ArchiveStore(root)``                        → ``<root>/raw`` + ``<root>/atlas.db``
     ``ArchiveStore(raw_dir=..., db_path=...)``    → 两个路径分别指定
+
+    **可跨线程使用**：单个实例可以安全地交给 `ThreadingHTTPServer`（每请求一线程），
+    不需要调用方"每请求新建"。`put` 由 `self._commit_lock` 串行化，读路径走
+    `SqliteRawStore` 的锁；详见模块 docstring 的"并发与线程安全"。
     """
 
     def __init__(
@@ -101,6 +128,9 @@ class ArchiveStore:
             db_path = base / "atlas.db"
         self._blobs = BlobStore(DEFAULT_RAW_DIR if raw_dir is None else raw_dir)
         self._records = SqliteRawStore(DEFAULT_DB_PATH if db_path is None else db_path)
+        # 提交锁：让"查元数据 → 写字节 → 插元数据"整段原子。
+        # 可重入（`put` 内部不再重入，但保持与 SqliteRawStore 锁一致的语义）。
+        self._commit_lock = threading.RLock()
 
     # ------------------------------------------------------------------
     # 组件访问（只读诊断用；不暴露写入旁路）
@@ -121,7 +151,18 @@ class ArchiveStore:
     def raw_dir(self) -> Path:
         return self._blobs.root
 
+    @property
+    def lock(self) -> "threading.RLock":
+        """保护元数据连接的锁（与 `SqliteRawStore` 同一把），供诊断使用。"""
+        return self._records.lock
+
+    @property
+    def commit_lock(self) -> "threading.RLock":
+        """保护整个提交序列（`put`）的锁。`put` 内部已持有，仅用于诊断/测试。"""
+        return self._commit_lock
+
     def close(self) -> None:
+        """关闭元数据连接（幂等）。原文字节在文件系统上，不涉及句柄。"""
         self._records.close()
 
     def __enter__(self) -> "ArchiveStore":
@@ -139,6 +180,11 @@ class ArchiveStore:
         - 同 `raw_id` + 同内容 → 返回已有记录（幂等，不报错）
         - 同 `raw_id` + 不同内容 → `ImmutabilityError`
         - `content` 指纹与声明不符 → `IdError`
+
+        整个提交序列（查元数据 → 写字节 → 插元数据）在 `self._commit_lock` 内，
+        因此**同一实例的并发 `put` 结果确定**：不会出现两个线程同时通过"不存在"
+        检查、其中一个把另一个刚写好的目录覆盖掉（那会在 rename 处抛
+        `OSError: Directory not empty`，或更糟：静默串版本）。
         """
         actual = content_sha256(content)
         if actual != record.content_sha256:
@@ -146,24 +192,25 @@ class ArchiveStore:
                 f"内容指纹与标识不一致：声明 {record.content_sha256[:12]}… 实际 {actual[:12]}…"
             )
 
-        # 1) 元数据已存在 → 幂等返回，绝不触碰字节。
-        existing = self._records.get_optional(record.raw_id)
-        if existing is not None:
-            if existing.content_sha256 == record.content_sha256:
-                self._verify_blob(record)
-                return existing  # 与内存版一致：返回**已有**记录，不是入参
-            raise ImmutabilityError(f"raw_id 已存在且内容不同：{record.raw_id}")
+        with self._commit_lock:
+            # 1) 元数据已存在 → 幂等返回，绝不触碰字节。
+            existing = self._records.get_optional(record.raw_id)
+            if existing is not None:
+                if existing.content_sha256 == record.content_sha256:
+                    self._verify_blob(record)
+                    return existing  # 与内存版一致：返回**已有**记录，不是入参
+                raise ImmutabilityError(f"raw_id 已存在且内容不同：{record.raw_id}")
 
-        # 2) 字节落盘（原子 rename；已存在的目录不会被覆盖）。
-        created = self._write_blob(record, content)
+            # 2) 字节落盘（原子 rename；已存在的目录不会被覆盖）。
+            created = self._write_blob(record, content)
 
-        # 3) 元数据入库；失败则补偿掉本次新建的目录。
-        try:
-            return self._records.insert(record)
-        except BaseException:
-            if created:
-                shutil.rmtree(self._blobs.record_dir(record.raw_id), ignore_errors=True)
-            raise
+            # 3) 元数据入库；失败则补偿掉本次新建的目录。
+            try:
+                return self._records.insert(record)
+            except BaseException:
+                if created:
+                    shutil.rmtree(self._blobs.record_dir(record.raw_id), ignore_errors=True)
+                raise
 
     def get(self, raw_id: str) -> RawRecord:
         """按 `raw_id` 取元数据；不存在 → `NotFoundError`（不静默返回空对象）。"""
