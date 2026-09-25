@@ -246,3 +246,7 @@ temp/
 *.crt
 *.p12
 secrets/
+
+# Claude Code 本地设置（含本地凭据与会话令牌，禁止提交）
+.claude/settings.local.json
+
