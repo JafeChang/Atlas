@@ -33,9 +33,10 @@ NormalizedText.text / .to_raw_offset
 
 `atlas.normalize` 对 HTML 实体各成一个原子（`&mdash;` → `—`，原子原文区间长度 = 实体字面量
 长度）。因此当归一化区间**恰好结束在一个实体字符上**时，`to_raw_offset(norm_end)` 会停在
-实体字面量**内部**（`&mdas`），这样的锚点无法代表证据。本模块用一个**纯函数、只看段表**
-的端点对齐把它补到段边界：`norm_end == seg.norm_end and seg.raw_length > seg.length` 时，
-`char_end` 取 `seg.raw_end`。除此之外**一律原样保留 `build_anchor` 的输出**
+实体字面量**内部**（例如只覆盖到 `&mdash;` 的第一个字符 `&`），这样的锚点无法代表证据。
+本模块用一个**纯函数、只看段表**的端点对齐把它补到段边界：
+`norm_end == seg.norm_end and seg.raw_length > seg.length` 时，`char_end` 取 `seg.raw_end`。
+除此之外**一律原样保留 `build_anchor` 的输出**
 （测试 `test_plain_quote_anchor_is_exactly_build_anchor` 钉死这一点）。
 
 对齐之后仍要用 SPEC §2.2 的判据自检：
@@ -57,6 +58,7 @@ from atlas.contracts import (
     DerivedLocator,
     EvidenceAnchor,
     EvidenceMismatchError,
+    IdError,
     ProposedClaim,
     VerificationStatus,
     VersionError,
@@ -130,8 +132,8 @@ def _assert_anchor_represents_quote(
         raise AnchorError(
             "锚点无法代表证据（SPEC §2.2）："
             f"原文切片 {normalized.raw_text[anchor.char_start:anchor.char_end]!r}"
-            f"（解码后 {window!r}）既不包含 quote 的首字符 {first!r}、"
-            f"也不包含尾字符 {last!r}（quote={quote!r}）"
+            f"（解码后 {window!r}）未同时包含 quote 的首字符 {first!r} 与尾字符 {last!r}"
+            f"（quote={quote!r}）"
         )
 
 
@@ -217,7 +219,7 @@ def verify_quote(
         否则为 `FAILED` 且两者皆 `None`。
     """
     if not raw_id:
-        raise ValueError("raw_id 不得为空：锚点必须绑定到具体原文")
+        raise IdError("raw_id 不得为空：锚点必须绑定到具体原文")
     payload = _as_bytes(raw_bytes)
     digest = content_sha256(payload)
     if declared_anchor is not None and declared_anchor.raw_id != raw_id:
