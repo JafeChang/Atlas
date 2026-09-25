@@ -37,7 +37,13 @@ from enum import Enum
 from typing import Callable, Dict, Optional, Tuple
 from urllib.parse import urlsplit
 
-from atlas.collect.fetch import DEFAULT_USER_AGENT, Fetcher, FetchError, FetchRequest
+from atlas.collect.fetch import (
+    DEFAULT_USER_AGENT,
+    Fetcher,
+    FetchError,
+    FetchHTTPError,
+    FetchRequest,
+)
 
 __all__ = [
     "RobotsOutcome",
@@ -302,17 +308,21 @@ class RobotsCache:
         entry.status_code = result.status_code
         entry.robots_url = result.url or robots_url
 
-        if result.error:
-            entry.blocked_outcome = RobotsOutcome.DISALLOWED_ROBOTS_UNAVAILABLE
-            entry.blocked_reason = (
-                f"抓取 robots.txt 失败，按保守策略视为不允许：{result.error}"
-            )
-            return entry
-
+        # **先判状态码，再判 error**：只要"HTTP 有应答"，应答本身就是规则依据
+        # （404 = 站方明确说没有 robots.txt）。只有"没有状态码"才退回 error 分支。
+        # 顺序反了会让 404 落到"拿不到规则 → 保守拒绝"，与 SPEC §2.12 表格矛盾。
         status = result.status_code
         if status is None:
-            entry.blocked_outcome = RobotsOutcome.DISALLOWED_ROBOTS_UNAVAILABLE
-            entry.blocked_reason = "robots.txt 响应既无状态码也无错误信息，视为不允许（保守）"
+            if result.error:
+                entry.blocked_outcome = RobotsOutcome.DISALLOWED_ROBOTS_UNAVAILABLE
+                entry.blocked_reason = (
+                    f"抓取 robots.txt 失败，按保守策略视为不允许：{result.error}"
+                )
+            else:
+                entry.blocked_outcome = RobotsOutcome.DISALLOWED_ROBOTS_UNAVAILABLE
+                entry.blocked_reason = (
+                    "robots.txt 响应既无状态码也无错误信息，视为不允许（保守）"
+                )
             return entry
         if status in _FORBIDDEN_STATUS_CODES:
             entry.blocked_outcome = RobotsOutcome.DISALLOWED_ROBOTS_FORBIDDEN
@@ -374,8 +384,14 @@ def _allow_all_parser(robots_url: str) -> robotparser.RobotFileParser:
 class FetcherRobotsAdapter:
     """把内容 `Fetcher` 当成 robots 获取器用（真实运行的便利桥接）。
 
-    只做"调用 + 归类"：fetcher 抛出的 `FetchError` 被记录成 `error` 文本（含类型名），
-    由 `RobotsCache` 按保守策略处理。
+    归类规则（必须保住"HTTP 有应答 ≠ 拿不到规则"这条区分）：
+
+    - fetcher 成功返回 → 状态码与响应体原样传下去；
+    - fetcher 抛 `FetchHTTPError`（**HTTP 有应答**）→ 传下 `status_code`，
+      `error=None`：`UrllibFetcher` 对所有非 2xx 都抛这个异常，若在这里丢掉状态码，
+      404（没有 robots.txt → 允许）会被误判成"拿不到规则"（→ 保守拒绝）；
+    - 其它 `FetchError`（超时 / 连接 / 传输）→ 确实没拿到规则，记 `error`（含类型名），
+      由 `RobotsCache` 按保守策略拒绝。
     """
 
     fetcher: Fetcher
@@ -389,6 +405,18 @@ class FetcherRobotsAdapter:
         )
         try:
             result = self.fetcher(request)
+        except FetchHTTPError as exc:
+            status_code = getattr(exc, "status_code", None)
+            if status_code is not None:
+                return RobotsFetchResult(
+                    url=robots_url, status_code=status_code, body=b"", error=None
+                )
+            return RobotsFetchResult(
+                url=robots_url,
+                status_code=None,
+                body=b"",
+                error=f"{type(exc).__name__}: {exc}",
+            )
         except FetchError as exc:
             return RobotsFetchResult(
                 url=robots_url, status_code=None, body=b"", error=f"{type(exc).__name__}: {exc}"

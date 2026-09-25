@@ -2,11 +2,21 @@
 
 from __future__ import annotations
 
+import email.message
+import io
+import urllib.error
 import urllib.robotparser as robotparser
 
 import pytest
 
-from atlas.collect.fetch import FetchHTTPError, FetchResult, FetchTimeout
+from atlas.collect.fetch import (
+    FetchConnectionError,
+    FetchHTTPError,
+    FetchResult,
+    FetchTimeout,
+    FetchTransportError,
+    UrllibFetcher,
+)
 from atlas.collect.robots import (
     FetcherRobotsAdapter,
     RobotsCache,
@@ -14,6 +24,7 @@ from atlas.collect.robots import (
     RobotsOutcome,
 )
 
+ROBOTS_URL = "https://example.com/robots.txt"
 ROBOTS_DISALLOW = "User-agent: *\nDisallow: /private/\n"
 ROBOTS_UA_SPECIFIC = "User-agent: atlas\nDisallow: /\n"
 
@@ -149,8 +160,9 @@ def test_network_failure_is_conservatively_denied_with_reason() -> None:
     assert "ConnectionResetError" in decision.reason and "boom" in decision.reason
 
 
-def test_fetcher_reported_error_is_conservatively_denied() -> None:
-    cache = make_cache(FakeRobotsFetcher(error="FetchTimeout: 请求超时"))
+def test_fetcher_reported_error_without_status_is_conservatively_denied() -> None:
+    """没有状态码（= 没拿到规则）时才走 error 分支；保守拒绝。"""
+    cache = make_cache(FakeRobotsFetcher(error="FetchTimeout: 请求超时", status=None))
 
     decision = cache.check("https://example.com/feed.xml")
 
@@ -344,10 +356,180 @@ def test_adapter_propagates_non_fetch_errors() -> None:
         adapter("https://example.com/robots.txt", user_agent="Atlas/0.1.0")
 
 
-def test_adapter_maps_http_error_to_error_text() -> None:
+def test_adapter_maps_http_error_to_status_code() -> None:
+    """HTTP 有应答：状态码必须传下去（error 留空，不得当成"拿不到规则"）。"""
     fetcher = StubContentFetcher(raises=FetchHTTPError("HTTP 500", status_code=500))
     adapter = FetcherRobotsAdapter(fetcher)
 
-    result = adapter("https://example.com/robots.txt", user_agent="Atlas/0.1.0")
+    result = adapter(ROBOTS_URL, user_agent="Atlas/0.1.0")
 
-    assert result.error is not None and "FetchHTTPError" in result.error
+    assert result.status_code == 500
+    assert result.error is None
+
+
+# --- 真实适配器路径（FetcherRobotsAdapter + 抛 FetchHTTPError 的 fetcher）------
+# 这组测试是"404 被误判成拿不到规则"这个缺陷的**根因防线**：
+# 只注入"直接返回 status_code=404 的假 robots fetcher"会绕过适配器，抓不到该缺陷。
+
+
+def test_real_adapter_path_404_allows_fetching() -> None:
+    """SPEC §2.12：其它 4xx（含 404，站点没有 robots.txt）→ 允许。"""
+    fetcher = StubContentFetcher(
+        raises=FetchHTTPError("HTTP 404 Not Found", url=ROBOTS_URL, status_code=404)
+    )
+    cache = RobotsCache.from_fetcher(fetcher, user_agent="Atlas/0.1.0")
+
+    decision = cache.check("https://example.com/feed.xml")
+
+    assert decision.allowed is True
+    assert decision.outcome is RobotsOutcome.ALLOWED_NO_ROBOTS
+    assert decision.status_code == 404
+
+
+def test_real_adapter_path_404_is_cached_across_targets() -> None:
+    fetcher = StubContentFetcher(raises=FetchHTTPError("HTTP 404", status_code=404))
+    cache = RobotsCache.from_fetcher(fetcher, user_agent="Atlas/0.1.0")
+
+    first = cache.check("https://example.com/feed.xml")
+    second = cache.check("https://example.com/other.xml")
+
+    assert first.allowed is True and second.allowed is True
+    assert len(fetcher.requests) == 1  # 404 也缓存，不反复请求
+    assert second.from_cache is True
+
+
+def test_real_adapter_path_404_can_still_be_tightened() -> None:
+    fetcher = StubContentFetcher(raises=FetchHTTPError("HTTP 404", status_code=404))
+    cache = RobotsCache.from_fetcher(
+        fetcher, user_agent="Atlas/0.1.0", allow_when_absent=False
+    )
+
+    decision = cache.check("https://example.com/feed.xml")
+
+    assert decision.allowed is False
+    assert decision.outcome is RobotsOutcome.DISALLOWED_ROBOTS_UNAVAILABLE
+
+
+@pytest.mark.parametrize("status", [500, 502, 503])
+def test_real_adapter_path_5xx_is_still_conservatively_denied(status: int) -> None:
+    """保守策略不变：5xx → 视为不允许（SPEC §2.12）。"""
+    fetcher = StubContentFetcher(raises=FetchHTTPError(f"HTTP {status}", status_code=status))
+    cache = RobotsCache.from_fetcher(fetcher, user_agent="Atlas/0.1.0")
+
+    decision = cache.check("https://example.com/feed.xml")
+
+    assert decision.allowed is False
+    assert decision.outcome is RobotsOutcome.DISALLOWED_ROBOTS_UNAVAILABLE
+    assert str(status) in decision.reason
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        FetchTimeout("请求超时", url=ROBOTS_URL),
+        FetchConnectionError("连接被拒绝", url=ROBOTS_URL),
+        FetchTransportError("协议层异常", url=ROBOTS_URL),
+    ],
+)
+def test_real_adapter_path_transport_failures_are_still_denied(error: Exception) -> None:
+    fetcher = StubContentFetcher(raises=error)
+    cache = RobotsCache.from_fetcher(fetcher, user_agent="Atlas/0.1.0")
+
+    decision = cache.check("https://example.com/feed.xml")
+
+    assert decision.allowed is False
+    assert decision.outcome is RobotsOutcome.DISALLOWED_ROBOTS_UNAVAILABLE
+    assert type(error).__name__ in decision.reason
+
+
+def test_real_adapter_path_401_and_403_are_denied_as_forbidden() -> None:
+    for status in (401, 403):
+        fetcher = StubContentFetcher(
+            raises=FetchHTTPError(f"HTTP {status}", status_code=status)
+        )
+        cache = RobotsCache.from_fetcher(fetcher, user_agent="Atlas/0.1.0")
+
+        decision = cache.check("https://example.com/feed.xml")
+
+        assert decision.allowed is False
+        assert decision.outcome is RobotsOutcome.DISALLOWED_ROBOTS_FORBIDDEN
+
+
+def test_real_adapter_path_200_rules_are_enforced() -> None:
+    fetcher = StubContentFetcher(
+        FetchResult(url=ROBOTS_URL, status_code=200, content=ROBOTS_DISALLOW.encode("utf-8"))
+    )
+    cache = RobotsCache.from_fetcher(fetcher, user_agent="Atlas/0.1.0")
+
+    assert cache.check("https://example.com/private/x").allowed is False
+    assert cache.check("https://example.com/public/x").allowed is True
+
+
+def test_adapter_http_error_without_status_code_stays_conservative() -> None:
+    """HttpError 但状态码缺失：信息不足 → 保守拒绝，原因仍带类型名。"""
+    fetcher = StubContentFetcher(raises=FetchHTTPError("HTTP ?", status_code=None))
+    cache = RobotsCache.from_fetcher(fetcher, user_agent="Atlas/0.1.0")
+
+    decision = cache.check("https://example.com/feed.xml")
+
+    assert decision.allowed is False
+    assert decision.outcome is RobotsOutcome.DISALLOWED_ROBOTS_UNAVAILABLE
+    assert "FetchHTTPError" in decision.reason
+
+
+def test_status_code_wins_over_error_text() -> None:
+    """状态码与 error 同时存在时以状态码为准（HTTP 应答是确定的规则依据）。"""
+
+    def both(robots_url: str, *, user_agent: str) -> RobotsFetchResult:
+        return RobotsFetchResult(
+            url=robots_url, status_code=404, body=b"", error="顺手塞的错误文本"
+        )
+
+    cache = RobotsCache(both, user_agent="Atlas/0.1.0")
+
+    decision = cache.check("https://example.com/feed.xml")
+
+    assert decision.allowed is True
+    assert decision.outcome is RobotsOutcome.ALLOWED_NO_ROBOTS
+
+
+class _RaisingOpener:
+    """假 opener：模拟 urllib 在非 2xx 时抛 HTTPError（不打网络）。"""
+
+    def __init__(self, error: BaseException) -> None:
+        self.error = error
+        self.timeouts: list[float | None] = []
+
+    def open(self, request: object, timeout: float | None = None) -> object:
+        self.timeouts.append(timeout)
+        raise self.error
+
+
+def _http_error(status: int) -> urllib.error.HTTPError:
+    return urllib.error.HTTPError(
+        ROBOTS_URL, status, f"HTTP {status}", email.message.Message(), io.BytesIO(b"")
+    )
+
+
+def test_full_real_chain_urllib_fetcher_404_allows() -> None:
+    """完整真实链路：`UrllibFetcher`（非 2xx 抛 HTTPError）+ 适配器 + RobotsCache。"""
+    fetcher = UrllibFetcher(opener=_RaisingOpener(_http_error(404)))
+    cache = RobotsCache.from_fetcher(fetcher, user_agent="Atlas/0.1.0")
+
+    decision = cache.check("https://example.com/feed.xml")
+
+    assert decision.allowed is True
+    assert decision.outcome is RobotsOutcome.ALLOWED_NO_ROBOTS
+    assert decision.status_code == 404
+
+
+def test_full_real_chain_urllib_fetcher_503_still_denies() -> None:
+    """同一真实链路的保守侧：5xx 仍视为不允许。"""
+    fetcher = UrllibFetcher(opener=_RaisingOpener(_http_error(503)))
+    cache = RobotsCache.from_fetcher(fetcher, user_agent="Atlas/0.1.0")
+
+    decision = cache.check("https://example.com/feed.xml")
+
+    assert decision.allowed is False
+    assert decision.outcome is RobotsOutcome.DISALLOWED_ROBOTS_UNAVAILABLE
+    assert "503" in decision.reason
