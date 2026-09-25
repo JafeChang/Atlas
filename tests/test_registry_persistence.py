@@ -93,20 +93,31 @@ def test_explicit_path_is_used(tmp_path: Path) -> None:
     store.close()
 
 
-def test_configured_path_never_touches_repo_data_dir(tmp_path: Path) -> None:
-    """测试用 tmp_path：仓库内不得出现 data/store/atlas.db。"""
+def test_configured_path_never_touches_repo_data_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """显式给出路径时，默认位置（仓库内 `data/store/atlas.db`）绝不被创建。
+
+    把 cwd 换到 `tmp_path` 再跑，这样断言与**仓库当前是否干净**无关：
+    默认路径会被解析到 tmp_path 下，任何"忘了用显式路径"的写入都会立刻现形。
+    """
+    monkeypatch.chdir(tmp_path)
     store = seed_store(tmp_path / "atlas.db")
-    store.commit(
-        [
-            RegistryMutation(
-                kind="create",
-                object_kind="industry",
-                payload=industry("biotech", name="生物技术").payload(),
-            )
-        ]
-    )
+    store.create_industry(industry("biotech", name="生物技术"))
     store.close()
-    assert not DEFAULT_DB_PATH.exists()
+    assert not (tmp_path / "data" / "store" / "atlas.db").exists()
+    assert (tmp_path / "atlas.db").exists()
+
+
+def test_default_path_is_used_when_not_configured(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """不传 `db_path` 时才用默认值；默认值就是 SPEC §2.10 的 `data/store/atlas.db`。"""
+    monkeypatch.chdir(tmp_path)
+    store = SqliteConfigStore(author="alice", clock=make_clock())
+    assert store.db_path == DEFAULT_DB_PATH
+    assert (tmp_path / "data" / "store" / "atlas.db").exists()
+    store.close()
 
 
 # --- genesis ------------------------------------------------------------------

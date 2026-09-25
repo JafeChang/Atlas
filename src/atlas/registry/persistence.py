@@ -40,7 +40,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
-from atlas.contracts import InvalidContractStateError, NotFoundError, VersionError
+from atlas.contracts import InvalidContractStateError, VersionError
 
 from .schema import Channel, Industry, validate_registry
 from .versioning import (

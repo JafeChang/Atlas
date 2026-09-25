@@ -166,6 +166,7 @@ class ArchiveStore:
             raise
 
     def get(self, raw_id: str) -> RawRecord:
+        """按 `raw_id` 取元数据；不存在 → `NotFoundError`（不静默返回空对象）。"""
         return self._records.get(raw_id)
 
     def get_content(self, raw_id: str) -> bytes:
@@ -183,9 +184,10 @@ class ArchiveStore:
             ) from exc
 
     def all_raw_ids(self) -> List[str]:
-        """已归档的全部 `raw_id`（字典序）。以 `raw_records` 为准。
+        """已归档的全部 `raw_id`（字典序）。
 
-        只认"元数据行与字节都齐全"的记录：单纯的文件系统残留不被当成已归档。
+        以 `raw_records` 为准：只认"元数据行与字节都齐全"的记录，
+        单纯的文件系统残留（上次写入的孤儿）不被当成已归档。
         """
         return self._records.all_raw_ids()
 

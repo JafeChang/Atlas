@@ -23,7 +23,7 @@ from pydantic import Field, field_validator
 
 from atlas.contracts import ContractModel, InvalidContractStateError, NotFoundError
 
-from .schema import Channel, FetchSpec, FetchType, Industry, validate_endpoint, validate_id
+from .schema import Channel, FetchType, Industry, validate_endpoint, validate_id
 
 __all__ = [
     "CHANNEL_OVERRIDABLE_FIELDS",

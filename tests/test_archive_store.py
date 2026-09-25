@@ -279,6 +279,30 @@ def test_differential_covers_all_contract_error_types() -> None:
     assert {"IdError", "ImmutabilityError", "NotFoundError"} <= observed, observed
 
 
+def test_signatures_match_the_contract() -> None:
+    """方法签名逐一相同：不只是"行为像"，而是同名、同参、同默认值。"""
+    import inspect
+
+    for name in ("put", "get", "get_content", "all_raw_ids"):
+        reference = inspect.signature(getattr(RawStore, name))
+        mine = inspect.signature(getattr(ArchiveStore, name))
+        assert mine == reference, f"{name} 的签名与契约不同：{mine} != {reference}"
+
+        # 参数名与注解也要一致（契约是类型化的：RawRecord / bytes / str / list[str]）
+        for param in reference.parameters.values():
+            other = mine.parameters[param.name]
+            assert other.kind == param.kind
+            assert other.default == param.default
+            assert other.annotation == param.annotation, (
+                f"{name}({param.name}) 注解不同：{other.annotation} != {param.annotation}"
+            )
+        # 契约里没有的方法（update/delete）不得由本实现提供
+        assert getattr(ArchiveStore, name).__doc__ is not None, f"{name} 缺少文档字符串"
+
+    assert not hasattr(ArchiveStore, "update")
+    assert not hasattr(ArchiveStore, "delete")
+
+
 def test_both_implementations_raise_the_same_contract_classes(tmp_path: Path) -> None:
     """两个实现抛出的必须是**同一批契约异常类**，不是各自的自定义异常。"""
     memory = RawStore()
