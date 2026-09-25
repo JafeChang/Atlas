@@ -24,15 +24,16 @@
 
 ## 环境
 
-开发在 WSL 内进行（Windows PowerShell 无法执行项目 venv）：
+开发在 WSL 内进行（Windows PowerShell 无法执行项目 venv）。**WSL 是镜像网络模式**，外网必须走宿主代理：
 
 ```bash
-wsl bash -lc 'cd /mnt/c/Users/bestz/Documents/projects/Atlas && ./.venv/bin/python -c "import atlas"'
+wsl bash -lc 'cd /mnt/c/Users/bestz/Documents/projects/Atlas && ./.venv-new/bin/python -m pytest tests -q'
 ```
 
-- **项目 venv**：`.venv`（Python 3.13.9）。**旧系统副本与运行中的 Docker 旧栈共用它**，因此新结构需要独立环境时请显式指定：
-  `UV_PROJECT_ENVIRONMENT=.venv-new uv sync`
-  直接跑 `uv sync` 会按精简后的依赖裁剪共享 venv，从而破坏旧副本。
+- **新结构一律使用 `.venv-new`**（Python 3.13.9，由 `uv sync` 按 `uv.lock` 建立，与你声明的依赖严格一致）。
+  需要联网时先导出代理：`export HTTPS_PROXY=http://127.0.0.1:7897`（直连会因 fake-IP DNS 失败，**必须走代理**）。
+- **`.venv` 只服务旧系统副本**（`../Atlas-legacy`），**不要动它、不要对它执行 `uv sync`**。
+- 新增依赖：改 `pyproject.toml` → `uv lock` → `uv sync`，全部只作用于 `.venv-new`。
 - **旧系统可跑副本**：`../Atlas-legacy`（git worktree @ `main`），共享 `data/` 与 `.venv`。
   采集入口：`PYTHONPATH=src ./.venv/bin/python -m atlas collect`
 - **归档基线**：tag `archive/growth-baseline-2026-09-25`（目标重梳理前的完整历史，被弃用的代码都可从这里取回）。

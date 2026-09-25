@@ -142,6 +142,9 @@ celerybeat.pid
 .env.test
 .env.production
 .venv
+# 新结构的独立 venv（.venv 只服务旧系统副本，见 CLAUDE.md）
+.venv-new/
+.venv-*/
 env/
 venv/
 ENV/
