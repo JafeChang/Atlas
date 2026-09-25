@@ -115,6 +115,21 @@ Atlas 是一个**个人信息聚合分析服务**：持续采集不同行业与�
 
 主题本体的种子取自现成分类（如 `config/sources.yaml` 已在使用的 arXiv 分类 `cs.LG` / `cs.CV` / `cs.CL` / `stat.ML`），不自行发明。
 
+**闭环的落地方式（已端到端验证）**
+
+`atlas.feed` **刻意不 import** `atlas.registry`（解耦，见 §4.0）。闭环因此由**组合根**注入完成：
+
+```python
+industry_map = {c.id: c.industry_id for c in registry_service.list_channels()}
+source = archive_source_factory(root, industry_of=lambda cid: industry_map.get(cid))()
+run_query(source, FeedQuery(industries=("ai",)))
+```
+
+主代理独立验证（两个行业各一条渠道）：注入后 `industries == ['ai','semis']`；
+按 `industries=("ai",)` 筛选得 **1** 条、按不存在的行业筛选得 **0** 条。
+
+> ⚠️ 若组合根**忘记注入** `industry_of`，feed 里 `industry` 会是 `None`、按行业筛选会静默返回全空——**能跑，但闭环断开**。这正是需要端到端断言（而非单包测试）才能发现的缝隙。
+
 ### 2.6 C8 的准确边界
 
 | 情形 | 需要写代码？ |
