@@ -248,6 +248,26 @@ C8 的配置来自前端 / API，不依赖手工编辑文件。
 - Confirmed 表**禁用 UPDATE / DELETE**（用 SQL 触发器强制，而非靠约定）
 - 所有派生物（`normalized` / `.map` / 索引）必须能由 `raw` **单独重建**，且重建不得影响 Confirmed
 
+**表归属登记（防止多任务共用同一 DB 时静默冲突）**
+
+`data/store/atlas.db` 由多个域共用。所有 DDL 都是 `CREATE TABLE IF NOT EXISTS`，因此**表名冲突会导致静默复用一张结构错误的表**——这与归档基线里"同一个 SQLite 躺着两套 schema"是同一类故障。
+
+规则：**表名全局唯一；新增表必须先登记到本表**。
+
+| 表 | 归属 | 说明 |
+|---|---|---|
+| `store_meta` | T-101 | 共享元数据（`schema_version` 等）；其它域**只读** |
+| `industries` / `channels` | T-101 | 当前配置的物化投影（可由版本链重建） |
+| `config_versions` | T-101 | 配置版本链（**append-only，触发器强制**） |
+| `label_space` | T-101 | 每版本的启用行业集合（= 标签空间，§2.5） |
+| `registry_label_refs` / `registry_label_ref_snapshots` | T-101 | **标签引用索引**（§2.9 规则 1：被引用 id 不得改删）——**不是标签本身** |
+| `raw_records` | T-103 | 原文元数据（字节本体在文件系统） |
+| `proposed_claims` | T-105 | 机器提议（可覆写，保留版本链） |
+| `confirmed_labels` | T-108 | 人工标签（**Confirmed，只增不改**） |
+| `evidence_spans` | T-107 | 证据锚点索引（如需；真值仍在 `raw` 偏移上） |
+
+**命名要求**：跨域共用 DB 的表名必须带领域前缀（如 `registry_`），避免语义误导与后续静默冲突。
+
 ---
 
 ### 2.11 服务层与前端技术选型（延后登记 #5 的落地）
