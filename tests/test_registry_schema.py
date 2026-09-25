@@ -293,11 +293,11 @@ def test_plain_ua_name_allowed() -> None:
 
 
 def test_records_are_frozen_and_model_copy_update_is_sealed() -> None:
-    industry = industry("ai", name="AI")
+    record = industry("ai", name="AI")
     with pytest.raises(ValidationError):
-        industry.name = "改名"  # type: ignore[misc]
+        record.name = "改名"  # type: ignore[misc]
     with pytest.raises(ImmutabilityError):
-        industry.model_copy(update={"name": "改名"})
+        record.model_copy(update={"name": "改名"})
 
 
 def test_extra_fields_are_rejected() -> None:
