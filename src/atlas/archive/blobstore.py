@@ -19,6 +19,20 @@
 `meta.json` 是**冗余的可读副本**，不是事实来源：真值在 SQLite 的 `raw_records`
 与 `content.bin` 的字节里。它的存在是为了让 `data/store/raw/` 单独可读、可迁移
 （SPEC §2.10 理由 5）。因此本模块不提供任何修改或删除既有记录的入口。
+
+线程安全结论
+------------
+
+**`BlobStore` 自身没有需要保护的共享可变状态**（只持有一个不可变的根路径），
+因此多线程使用是安全的，依据是上述写法的三个性质：
+
+1. 每次写入用**独立**的 `mkdtemp` 临时目录（名字带随机后缀），线程间不共享中间文件；
+2. `os.replace` 是原子 rename，记录目录要么不存在、要么内容完整；
+3. 读路径（`get_content` / `read_meta` / `all_raw_ids` / `exists`）只读文件系统。
+
+已知边界：两个线程**同时**对**同一** `raw_id` 调 `write_new` 时，第二次 `os.replace`
+可能抛 `OSError: Directory not empty`（TOCTOU 的固有结果）——这是响亮失败，不是坏数据。
+`ArchiveStore.put` 用实例级提交锁把这条路串行化，因此该窗口在归档层不存在。
 """
 
 from __future__ import annotations

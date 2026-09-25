@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
 
 import pytest
@@ -189,3 +190,69 @@ def test_all_raw_ids_is_sorted_and_ignores_non_records(blobs: BlobStore) -> None
 
 def test_all_raw_ids_on_missing_root(tmp_path: Path) -> None:
     assert BlobStore(tmp_path / "nope").all_raw_ids() == []
+
+
+# --------------------------------------------------------------------------- #
+# 线程安全（结论：`BlobStore` 自身无共享可变状态，多线程可用）
+# --------------------------------------------------------------------------- #
+
+
+def test_concurrent_writes_of_distinct_ids_are_safe(blobs: BlobStore) -> None:
+    """并发写不同 `raw_id`：全部落盘、读回一致、无临时目录残留。
+
+    `BlobStore` 不持有可变共享状态（只有不可变根路径），每次写入用**独立**临时
+    目录 + 原子 rename，因此多线程写不同 id 天然安全。
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    ids = [f"raw_{index:032d}" for index in range(32)]
+    barrier = threading.Barrier(8)
+
+    def writer(shard: list[str]) -> None:
+        barrier.wait()
+        for raw_id in shard:
+            blobs.put(raw_id, BODY)
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = [pool.submit(writer, ids[index::8]) for index in range(8)]
+        for future in futures:
+            future.result()
+
+    assert blobs.all_raw_ids() == sorted(ids)
+    for raw_id in ids:
+        assert blobs.get_content(raw_id) == BODY
+    leftovers = [p.name for p in blobs.root.iterdir() if p.name.startswith(".")]
+    assert leftovers == []
+
+
+def test_concurrent_reads_while_writing_are_safe(blobs: BlobStore) -> None:
+    """读线程并发执行时**要么看到完整记录、要么明确 `NotFoundError`**，绝无半个文件。"""
+    from concurrent.futures import ThreadPoolExecutor
+
+    ids = [f"raw_{index:032d}" for index in range(24)]
+    stop = threading.Event()
+    problems: list[str] = []
+
+    def writer() -> None:
+        for raw_id in ids:
+            blobs.put(raw_id, BODY)
+        stop.set()
+
+    def reader() -> None:
+        while not stop.is_set():
+            try:
+                for raw_id in blobs.all_raw_ids():
+                    if blobs.get_content(raw_id) != BODY:
+                        problems.append(f"{raw_id}: 读到的字节不完整")
+            except NotFoundError:
+                # 记录目录刚被 rename 出来的瞬间：明确失败，不是坏数据
+                continue
+
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        futures = [pool.submit(reader) for _ in range(4)]
+        futures.append(pool.submit(writer))
+        for future in futures:
+            future.result()
+
+    assert problems == []
+    assert blobs.all_raw_ids() == sorted(ids)
