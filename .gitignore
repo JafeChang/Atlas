@@ -234,6 +234,8 @@ tmp/
 temp/
 *.tmp
 *.temp
+# 子代理/脚本写在仓库根的临时产物（历史上出现过 .tmp_verify_*.sh）
+.tmp_*
 
 # 备份文件
 *.bak
