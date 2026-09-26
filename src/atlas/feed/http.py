@@ -44,8 +44,10 @@
 ----------
 
 - 用 `ThreadingHTTPServer`（SPEC §2.11 硬性要求），慢请求不阻塞其它请求；
-- `source` 可以是 `FeedSource`，也可以是**零参工厂**（`sqlite3` 连接线程亲和，
-  归档实现请传工厂，见 `atlas.feed.repository.ArchiveFeedSource` 的说明）；
+- `source` 可以是 `FeedSource`，也可以是**零参工厂**（工厂是**可选**的部署方式，
+  **不是**因为 `sqlite3` 线程亲和——归档层已用 `check_same_thread=False` + 锁解除了
+  该限制（T-103，`70c5a68`），单个归档实例可以安全地跨线程共享。两种都支持，
+  见 `atlas.feed.repository.ArchiveFeedSource` 的说明）；
 - 本模块只调用 `list_raw` / `industry_of` / 注入的 `label_lookup`，没有任何写入路径。
 """
 
@@ -269,7 +271,7 @@ class FeedHTTPServer(ThreadingHTTPServer):
         super().__init__(server_address, FeedRequestHandler)
 
     def resolve_source(self) -> Any:
-        """`source` 可以是 `FeedSource`，也可以是零参工厂（每请求新建，线程安全）。"""
+        """`source` 可以是 `FeedSource`，也可以是零参工厂（工厂每次调用新建一个实例）。"""
         if hasattr(self._source, "list_raw"):
             return self._source
         if callable(self._source):

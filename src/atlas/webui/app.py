@@ -227,7 +227,10 @@ class StoreLabelAccess:
         """打开只读会话。
 
         库文件**不存在**时返回空会话：浏览路径绝不创建库文件、绝不写盘。
-        `sqlite3` 连接是线程亲和的，因此每次请求各自开一条，不做跨线程共享。
+        每次请求各开一条只读会话（会话本身持有游标/缓存，**不该跨请求复用**）。
+        注意：这**不是**因为 `sqlite3` 连接线程亲和——归档层已用
+        `check_same_thread=False` + 锁解除了该限制（T-103，`70c5a68`），
+        单个 store 实例可以安全地跨线程共享。这里按请求开会话是为了会话状态隔离。
         """
         if not self._db_path.exists():
             return _EmptySession()
@@ -728,7 +731,7 @@ class WebUIHTTPServer(ThreadingHTTPServer):
         super().__init__(server_address, WebUIRequestHandler)
 
     def resolve_source(self) -> Any:
-        """`source` 可以是 `FeedSource`，也可以是零参工厂（每请求新建，线程安全）。"""
+        """`source` 可以是 `FeedSource`，也可以是零参工厂（工厂每次调用新建一个实例）。"""
         if hasattr(self._source, "list_raw"):
             return self._source
         if callable(self._source):
@@ -811,7 +814,7 @@ class WebUIApplication:
 
 
 def _derive_raw_exists(source: Any) -> Callable[[str], bool]:
-    """`raw_exists` 缺省时从数据源派生：工厂则每次新开（`sqlite3` 线程亲和）。"""
+    """`raw_exists` 缺省时从数据源派生：工厂则每次新开（工厂是可选形态，不是线程约束）。"""
     if hasattr(source, "list_raw") or hasattr(source, "by_id"):
         return raw_exists_from_source(source)
     if callable(source):
