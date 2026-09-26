@@ -19,8 +19,9 @@
 为什么索引列与展示列分开（T-205 修订 / 判据 C2）
 -----------------------------------------------
 
-`unicode61` 不切分连续汉字，因此索引列存 `segment_cjk(text)`（`中 文 分 词`），
-而 `text` 保持**原始归一化文本**（对外展示、摘要的来源）。两列分工：
+`unicode61` 不切分连续汉字，也不切"汉字紧贴拉丁/数字"（`Transformer架构` 是一个
+token），因此索引列存 `segment_cjk(text)`（`中 文 分 词`、`Transformer 架 构`、
+`数 据 库 abc`），而 `text` 保持**原始归一化文本**（对外展示、摘要的来源）。两列分工：
 
 - `text_index`：**内部列**，只进 FTS5 倒排索引，任何对外返回路径都不含它；
 - `text`：对外唯一的正文来源（`IndexedDocument.text`、摘要的原文片段）。
@@ -30,7 +31,7 @@ FTS5 外部内容表**要求 FTS 列名与内容表列名一致**（不一致时
 外部内容表**不会**自动跟随内容表变化，必须显式 `'rebuild'`——`rebuild()` 里就有这一步。
 
 摘要：`snippet()` 作用在 `text_index` 上，返回前必须还原（见 `atlas.search.snippet`），
-否则摘要会露出 `中 文` 这种**实现细节外泄**。
+否则摘要会露出 `中 文` / `Transformer 架 构` 这种**实现细节外泄**。
 
 **为什么这里没有 append-only 触发器**：`search_*` 是**派生物**（索引），不是事实层。
 SPEC §2.10 要求用触发器强制"只增不改"的对象是 Raw / Confirmed / 配置版本链这些
@@ -148,8 +149,11 @@ SCHEMA_VERSION = 2
 
 #: 索引语义版本：**分词器、切分规则、文本来源、打分函数、内容表形状**任一变化都必须升版本。
 #: 读者据此判定"库里的索引是不是本代码的索引"（判据 A2 / C3）。
-#: **2** = 汉字逐字切分（`text_index` 列 + 汉字短语查询），v1 索引必须弃用重建。
-INDEX_VERSION = "atlas.search.index/2"
+#: - **2** = 汉字逐字切分（`text_index` 列 + 汉字短语查询）
+#: - **3** = 切分规则扩到"汉字↔字母/数字边界"（`Transformer架构` / `GPT模型` /
+#:   `向量数据库abc` 里的汉字子串必须可查）。物理 schema 不变（仍是 2），但
+#:   `text_index` 的内容变了，因此 v1/v2 索引都必须弃用重建。
+INDEX_VERSION = "atlas.search.index/3"
 
 #: FTS5 分词器配置。`remove_diacritics 2` = 连非 ASCII 的变音符号也折叠。
 TOKENIZER = "unicode61 remove_diacritics 2"
@@ -157,14 +161,16 @@ TOKENIZER = "unicode61 remove_diacritics 2"
 #: 汉字切分规则的身份（写进 `search_meta`，让重建可复现）。
 SEGMENTATION = (
     SEGMENTATION_VERSION
-    + "：segment_cjk（汉字逐字切分，U+3400-U+4DBF/U+4E00-U+9FFF/U+F900-U+FAFF/"
+    + "：segment_cjk（两个词元字符之间只要有一侧是汉字就插分隔符 —— 汉字逐字切开，"
+    "并在汉字↔字母/数字边界切开；范围 "
+    "U+3400-U+4DBF/U+4E00-U+9FFF/U+F900-U+FAFF/"
     "U+20000-U+2EBEF/U+2F800-U+2FA1F/U+30000-U+323AF）"
 )
 
 #: 被索引文本的来源（写进 `search_meta`，让重建可复现）。
 TEXT_SOURCE = (
     "atlas.normalize.normalize -> NormalizedText.text（T-104 文档级归一化文本，不分块）"
-    " -> atlas.search.cjk.segment_cjk（T-205 修订：汉字逐字切分后进倒排索引）"
+    " -> atlas.search.cjk.segment_cjk（T-205 修订：汉字逐字 + 汉字↔拉丁边界切分后进倒排索引）"
 )
 
 #: 跨实例争用同一库文件时，SQLite 的等待上限（秒）。与 T-103 同值。

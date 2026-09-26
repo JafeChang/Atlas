@@ -8,13 +8,25 @@
 
 裁决：**保留 `unicode61`，改为"汉字逐字切分后再索引"**（不用 FTS5 `trigram`）——
 理由是索引膨胀小、英文 BM25 排序不变、零新依赖。
+**第二轮裁决（切分契约 `/2`）**：缺口不止"连续汉字"，`Transformer架构` / `GPT模型` /
+`向量数据库abc` 这种**汉字与拉丁直接相邻**的混写同样是正确性缺陷（实测 `架构`→0、
+`模型`→0、`向量数据库`→0），因此把切分规则扩到"汉字↔字母/数字边界"。
 
 判据 C1–C9（每条都有对应测试；实现见 `src/atlas/search/`）
 ----------------------------------------------------------
 
-C1 **纯函数切分，且可逆**：`segment_cjk(text) -> str` 是纯函数（零 I/O），只在"两个
-   相邻汉字之间的空白间隙"里插入**一个** ASCII 空格（插在间隙末尾、紧贴第二个汉字），
-   其它位置逐字符不动。确切 Unicode 范围硬编码在 `atlas.search.cjk.CJK_RANGES`：
+C1 **纯函数切分，且可逆**：`segment_cjk(text) -> str` 是纯函数（零 I/O），在两个
+   **词元字符**之间的空白间隙里插入**一个** ASCII 空格（插在间隙末尾、紧贴后一个
+   词元字符），其它位置逐字符不动。"需要插入"= 两侧都是词元字符（`str.isalnum()`，
+   **不含** `_`，与查询侧 `[^\\W_]+` 等价）**且至少一侧是汉字**：
+
+   - 汉字↔汉字：`中文` → `中 文`（逐字切分的本意）
+   - 汉字↔字母/数字：`Transformer架构` → `Transformer 架 构`、`第3章` → `第 3 章`
+   - 字母/数字↔汉字：`abc中文` → `abc 中 文`
+   - 字母/数字↔字母/数字：**不插** ⇒ 纯英文是**恒等变换**
+   - 任一侧是标点/符号/空白/`_`：**不插**（`unicode61` 本来就在那里断开）
+
+   确切 Unicode 范围硬编码在 `atlas.search.cjk.CJK_RANGES`：
    U+3400–U+4DBF（扩展 A）、U+4E00–U+9FFF（统一表意）、U+F900–U+FAFF（兼容表意）、
    U+20000–U+2EBEF（扩展 B–F）、U+2F800–U+2FA1F（兼容表意补充）、U+30000–U+323AF
    （扩展 G–H）；**不含**假名（U+3040–U+30FF）与 CJK 标点/部首（它们本来就被
@@ -24,19 +36,28 @@ C1 **纯函数切分，且可逆**：`segment_cjk(text) -> str` 是纯函数（�
    `desegment("中  文") == "中 文"`（**只折叠一个**，不得把真实空格一起吃掉）；
    `desegment("中 文") == "中文"`（单个空格就是切分器插入的那个）。
    对切分像，`segment_cjk(desegment(x)) == x`（两侧互为逆）。
+   判定"某个空格是不是插入的"只有**一个**出处：`is_inserted_space` 与
+   `segment_cjk` 共用同一个 `_needs_separator`。
+
+C1b **汉字↔拉丁边界必须可查**（第二轮裁决的核心）：`架构` 在 `Transformer架构` 中
+   命中、`模型` 在 `GPT模型` 中命中、`向量数据库` 在 `向量数据库abc` 中命中；
+   `第3章` / `BERT模型` 这类数字/字母混写同样可查。每条都是**真实断言**。
 
 C2 **索引进独立列**：`search_documents` 增列 `text_index TEXT NOT NULL`，内容恒为
    `segment_cjk(text)`；FTS5 外部内容表的列名与内容表列名**一致**（SQLite 要求，
    否则报 `no such column: T.…`），且 MATCH 只走切分后的列。
    该列是**内部列**：`IndexedDocument` / `SearchHit` 上不存在它，`get()` 返回原始文本。
 
-C3 **版本必须升 + 补救路径**：`SCHEMA_VERSION == 2`、`INDEX_VERSION ==
-   "atlas.search.index/2"`；磁盘上的 v1 索引在**构造/读取时响亮失败**（`IndexVersionError`，
-   消息指向"删索引后重建"），且**不得**被静默当成空索引；`drop_search_index()` 后重建可用
-   （否定性断言必须配**活对照**：同一路径对合法输入必须成功）。
+C3 **版本必须升 + 补救路径**：`SCHEMA_VERSION == 2`（物理列没变）、`INDEX_VERSION ==
+   "atlas.search.index/3"`（切分规则变了 ⇒ 索引语义变了）、
+   `SEGMENTATION_VERSION == "atlas.search.cjk/2"`；磁盘上的 v1/v2 索引在**构造/读取时
+   响亮失败**（`IndexVersionError`，消息指向"删索引后重建"），且**不得**被静默当成空索引；
+   `drop_search_index()` 后重建可用（否定性断言必须配**活对照**：同一路径对合法输入必须成功）。
 
 C4 **查询侧同一套切分 + 连续汉字是短语（不是逐字 AND）**：
-   `SearchQuery(text="中文分词测试").match_expression() == '"中 文 分 词 测 试"'`。
+   `SearchQuery(text="中文分词测试").match_expression() == '"中 文 分 词 测 试"'`；
+   `SearchQuery(text="数据库abc").match_expression() == '"数 据 库 abc"'`（边界切开后
+   整段是**一个**短语，与文档侧切分一致）。
    **为什么不能逐字 AND**：`"人" AND "工" AND "智" AND "能"` 会命中"世界**人**民**工**
    作**智**慧**能**力"。用两条可执行对照证明（同一条 SQL 路径跑逐字 AND 表达式）：
    查 `中文分词` 短语只命中 `中文分词测试…`，逐字 AND 还命中 `分词中文顺序颠倒…`；
@@ -45,12 +66,13 @@ C4 **查询侧同一套切分 + 连续汉字是短语（不是逐字 AND）**：
    操作符仍只作字面词。
 
 C5 **摘要/高亮绝不露出插入的分隔符**：摘要必须从**原始文本**生成（结构性：去掉高亮
-   标记与省略号后，摘要的每一段都必须是原始文本的子串）；`中 文` / `分 词` 这类被切开的
-   形式**不得出现**，而 `[中文]` 这类高亮必须出现（活对照）。
+   标记与省略号后，摘要的每一段都必须是原始文本的子串）；`中 文` / `分 词` /
+   `Transformer 架 构` 这类被切开的形式**不得出现**，而 `[中文]` / `[Transformer架构]`
+   这类高亮必须出现（活对照）。
 
 C6 **英文行为完全不变**：同一英文语料 + 与 T-205 相同的英文查询，在"FTS5 直接建在
    `text` 上"的**对照索引**与修订后的索引之间，命中 `raw_id` 顺序、`score`、`fts_score`、
-   `snippet` 必须逐条相同；且 `segment_cjk` 对纯英文是恒等变换。
+   `snippet` 必须逐条相同；且 `segment_cjk` 对纯 ASCII/拉丁文本是恒等变换。
 
 C7 **零新增依赖**：只用标准库；`pyproject.toml` / `uv.lock` 不改；包内 import 白名单
    不扩充（`tests/test_search_invariants.py` 静态钉死）。
@@ -63,7 +85,7 @@ C9 **真实数据流证据**（硬规则 1）：真实语料 `data/raw/**/*.json
    完整链路（raw 字节 → 归档 → 归一化 → 索引 → 查询）产生证据，并**明确区分**两类数字。
    见 `tests/test_search_realdata.py`。
 
-本文件覆盖 C1–C6 的纯逻辑与索引行为部分；C7 / C8 见 `test_search_invariants.py` 与
+本文件覆盖 C1/C1b–C6 的纯逻辑与索引行为部分；C7 / C8 见 `test_search_invariants.py` 与
 `test_search_index.py`，C9 见 `test_search_realdata.py`。
 """
 
@@ -86,6 +108,7 @@ from atlas.search import (
     INDEX_VERSION,
     META_TABLE,
     SCHEMA_VERSION,
+    SEGMENTATION_VERSION,
     TOKENIZER,
     ArchiveDocumentSource,
     DocumentText,
@@ -102,12 +125,13 @@ from atlas.search import (
     phrase_groups,
     tokenize,
 )
-from atlas.search import sqlite_index as sqlite_index_module  # noqa: F401  (判据 C2 的 schema 出处)
+from atlas.search import query as query_module
 from atlas.search.cjk import (
     CJK_RANGES,
     desegment,
     is_cjk,
     is_inserted_space,
+    is_token_character,
     segment_cjk,
 )
 from atlas.search.snippet import (
@@ -124,6 +148,14 @@ BASE = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
 DOC_A = "中文分词测试与检索 mixed english"
 DOC_B = "世界人民工作智慧能力"  # 人 / 工 / 智 / 能 四个字都有，但**不连续**
 DOC_C = "分词中文顺序颠倒的样例"  # 中 / 文 / 分 / 词 四个字都有，但**顺序颠倒**
+
+#: C1b 用的**混写**语料（汉字与拉丁/数字直接相邻，没有空白）。
+MIXED_DOCS = (
+    "Transformer架构与注意力机制",
+    "GPT模型驱动的检索系统",
+    "向量数据库abc的工程实践",
+    "第3章 讲 BERT模型 的微调",
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -203,8 +235,46 @@ def test_segment_cjk_puts_exactly_one_space_between_han_characters() -> None:
     assert not segment_cjk("人工智能").endswith(" ")
 
 
+def test_segment_cjk_splits_the_han_latin_boundary() -> None:
+    """C1/C1b：汉字与拉丁/数字**直接相邻**（无空白）时也必须切开，两个方向都要。"""
+    assert segment_cjk("Transformer架构") == "Transformer 架 构"
+    assert segment_cjk("架构Transformer") == "架 构 Transformer"
+    assert segment_cjk("GPT模型") == "GPT 模 型"
+    assert segment_cjk("模型GPT") == "模 型 GPT"
+    assert segment_cjk("向量数据库abc") == "向 量 数 据 库 abc"
+    assert segment_cjk("第3章") == "第 3 章"
+    assert segment_cjk("5G技术") == "5G 技 术"
+    assert segment_cjk("v2版本") == "v2 版 本"
+    assert segment_cjk("A中B文C") == "A 中 B 文 C"
+    # 标点/符号/下划线**不是**词元字符 ⇒ 不插（unicode61 本来就在那里断开）
+    assert segment_cjk("中-文") == "中-文"
+    assert segment_cjk("中_文") == "中_文"
+    assert segment_cjk("中。文") == "中。文"
+    assert segment_cjk("中/文") == "中/文"
+    assert segment_cjk("中+文") == "中+文"
+    # 间隙里已有空白时同样插入（可逆性所需），数字/字母两侧一致
+    assert segment_cjk("中 abc") == "中  abc"
+    assert segment_cjk("abc 中") == "abc  中"
+    assert segment_cjk("第 3 章") == "第  3  章"
+
+
+def test_segment_cjk_is_the_identity_on_pure_latin_and_digits() -> None:
+    """C6 的结构性保证：没有汉字 ⇒ 逐字节不变（英文索引内容因此完全不变）。"""
+    for text in (
+        "vector database retrieval with BM25 ranking.",
+        "C++ 17 café naïve 42%",
+        "foo-bar_baz/qux+v2",
+        "  leading and trailing  ",
+        "multi   space\tand\nnewline",
+        "ABCdef123",
+        "[]{}()<>!?",
+    ):
+        assert segment_cjk(text) == text, f"{text!r} 不是恒等变换"
+        assert desegment(text) == text
+
+
 def test_segment_cjk_touches_nothing_outside_han_runs() -> None:
-    """契约："其它位置一律不动"——拉丁、标点、空白、非汉字 CJK 全部原样。"""
+    """契约："其它位置一律不动"——只有词元字符之间、且至少一侧是汉字时才插。"""
     for text in (
         "vector database retrieval",
         "C++ 17 café naïve",
@@ -214,15 +284,38 @@ def test_segment_cjk_touches_nothing_outside_han_runs() -> None:
         "テキスト と 漢字",  # 假名不在范围内（见 C1 的说明）
         "emoji 🙂 与文字",
         "多   空格\t与\n换行",
+        "Transformer架构 v2 与 GPT模型",
     ):
         segmented = segment_cjk(text)
-        # 每个汉字两侧一定是"非汉字"或"空格"，不会出现两个连续汉字
+        # 不会出现两个连续汉字，也不会出现"汉字紧贴字母/数字"
         for index in range(len(segmented) - 1):
-            assert not (is_cjk(segmented[index]) and is_cjk(segmented[index + 1])), (
-                f"{text!r} 切分后仍有连续汉字：{segmented!r}"
+            first, second = segmented[index], segmented[index + 1]
+            if not (is_token_character(first) and is_token_character(second)):
+                continue
+            assert not (is_cjk(first) or is_cjk(second)), (
+                f"{text!r} 切分后仍有未切开的汉字词元边界：{segmented!r}"
             )
         # 去掉插入的空格必须得到原文（可逆性的结构性表述）
         assert desegment(segmented) == text
+
+
+def test_is_token_character_matches_the_query_side_term_regex() -> None:
+    """`is_token_character` 必须与查询侧切词正则 `[^\\W_]+` 逐字符等价（否则两侧口径分家）。"""
+    samples = (
+        "a", "Z", "0", "9", "_", "-", "+", ".", " ", "\t", "中", "文", "あ", "テ",
+        "🙂", "é", "٣", "Ⅷ", "①", "\U00020000", "\uf900", "。", "，", "％", "＿",
+    )
+    for character in samples:
+        assert is_token_character(character) == bool(
+            query_module._TERM_RE.fullmatch(character)
+        ), f"{character!r} 的判定与查询侧不一致"
+    # 穷举 BMP 中一批码点，确保不是靠样例凑出来的
+    mismatches = [
+        code
+        for code in range(0x0000, 0x3000)
+        if is_token_character(chr(code)) != bool(query_module._TERM_RE.fullmatch(chr(code)))
+    ]
+    assert mismatches == [], f"U+{mismatches[0]:04X} 起有 {len(mismatches)} 个码点判定不一致"
 
 
 def test_segment_cjk_range_boundaries_are_exact() -> None:
@@ -305,8 +398,8 @@ def test_desegment_is_the_exact_inverse_of_segment_cjk(text: str) -> None:
 
 
 def test_round_trip_holds_for_long_generated_mixtures() -> None:
-    """组合式覆盖：空白/汉字/拉丁/标点的各种拼接都必须往返。"""
-    alphabet = ("中", "文", "a", "1", " ", "  ", "\n", "\t", "。", "🙂", " 中文 ")
+    """组合式覆盖：空白/汉字/拉丁/数字/标点的各种拼接都必须往返。"""
+    alphabet = ("中", "文", "a", "1", "A", " ", "  ", "\n", "\t", "。", "-", "_", "🙂", " 中文 ")
     texts = {""}
     for first in alphabet:
         for second in alphabet:
@@ -395,7 +488,7 @@ def test_text_index_is_exactly_the_segmented_text(harness: Harness) -> None:
             f"{row['raw_id']} 的 text_index 不是切分后的文本"
         )
     by_text = {row["text"]: row["text_index"] for row in rows}
-    assert by_text[DOC_A] == "中 文 分 词 测 试 与 检 索 mixed english"
+    assert by_text[DOC_A] == "中 文 分 词 测 试 与 检 索  mixed english"
     assert by_text["vector database retrieval"] == "vector database retrieval"
 
 
@@ -436,8 +529,9 @@ def test_text_index_never_leaks_through_any_public_return_path(harness: Harness)
 # C3：版本升级与补救路径
 # =========================================================================== #
 def test_schema_and_index_versions_are_bumped() -> None:
-    assert SCHEMA_VERSION == 2
-    assert INDEX_VERSION == "atlas.search.index/2"
+    assert SCHEMA_VERSION == 2, "物理列没变（切分规则变化不动 schema）"
+    assert INDEX_VERSION == "atlas.search.index/3", "切分规则变了 ⇒ 索引语义版本必须升"
+    assert SEGMENTATION_VERSION == "atlas.search.cjk/2"
 
 
 _LEGACY_V1_DDL = f"""
@@ -549,8 +643,19 @@ def test_legacy_v1_index_fails_loudly_and_is_recoverable(tmp_path: Path) -> None
         recovered.close()
 
 
-def test_stale_index_version_is_not_silently_an_empty_index(harness: Harness) -> None:
-    """版本不符必须响亮失败——不得伪装成"没有命中"（判据 C3 的否定性断言 + 活对照）。"""
+@pytest.mark.parametrize(
+    "stale_version",
+    ["atlas.search.index/1", "atlas.search.index/2"],
+)
+def test_stale_index_version_is_not_silently_an_empty_index(
+    harness: Harness, stale_version: str
+) -> None:
+    """版本不符必须响亮失败——不得伪装成"没有命中"（判据 C3 的否定性断言 + 活对照）。
+
+    `/1` = T-205 原始形态；`/2` = 上一轮修订（只切汉字↔汉字）——两者现在都必须弃用重建，
+    因为切分规则又变了、`text_index` 的内容不同（物理 schema 相同，所以只有
+    `index_version` 能识别出来）。
+    """
     seed_cjk(harness)
     harness.rebuild()
     # 活对照：版本正确时确实有命中
@@ -559,19 +664,20 @@ def test_stale_index_version_is_not_silently_an_empty_index(harness: Harness) ->
     with harness.index.lock:
         harness.index.connection.execute(
             f"UPDATE {META_TABLE} SET value = ? WHERE key = 'index_version'",
-            ("atlas.search.index/1",),
+            (stale_version,),
         )
     with pytest.raises(IndexVersionError) as info:
         harness.index.search(SearchQuery(text="中文分词"))
     message = str(info.value)
     assert "索引版本不符" in message and "重建" in message
     assert harness.index.is_built() is False
-    assert harness.index.meta()["index_version"] == "atlas.search.index/1"
+    assert harness.index.meta()["index_version"] == stale_version
 
     # 活对照之二：重建之后恢复可用（索引是可重建派生物）
     harness.index.drop()
     harness.rebuild()
     assert harness.index.search(SearchQuery(text="中文分词")).total == 1
+    assert harness.index.meta()["index_version"] == INDEX_VERSION
 
 
 # =========================================================================== #
@@ -595,8 +701,12 @@ def test_han_and_latin_are_combined_with_and() -> None:
         SearchQuery(text="vector 数据库 retrieval").match_expression()
         == '"vector" AND "数 据 库" AND "retrieval"'
     )
-    assert SearchQuery(text="数据库abc").match_expression() == '"数 据 库abc"'
+    # 汉字与拉丁直接相邻 ⇒ 同一段未切开的输入 ⇒ **一个**短语（与文档侧切分一致）
+    assert SearchQuery(text="数据库abc").match_expression() == '"数 据 库 abc"'
+    assert SearchQuery(text="Transformer架构").match_expression() == '"Transformer 架 构"'
+    assert SearchQuery(text="GPT模型").match_expression() == '"GPT 模 型"'
     assert SearchQuery(text="BM25 排序").match_expression() == '"BM25" AND "排 序"'
+    # 用户打了空白就是两个组（`BM25` 与 `排 序` 之间是真实空白）
 
 
 def test_tokenize_still_dedupes_and_undercuts_the_term_cap() -> None:
@@ -617,6 +727,8 @@ def test_phrase_groups_agree_with_segment_cjk_runs() -> None:
         "vector 数据库 retrieval",
         "数据库abc",
         "abc中文",
+        "Transformer架构",
+        "第3章",
         "中\n文\t之 间",
         "「中文」测试。",
         "abc",
@@ -644,6 +756,12 @@ def test_phrase_groups_agree_with_segment_cjk_runs() -> None:
     # 用户打了空白就是两个组（不是一条短语）
     assert phrase_groups("中 文") == (("中",), ("文",))
     assert phrase_groups("中文分词") == (("中", "文", "分", "词"),)
+    # 汉字与拉丁直接相邻是**同一段未切开的输入** ⇒ 一个组（字母+汉字同组）
+    assert phrase_groups("Transformer架构") == (("Transformer", "架", "构"),)
+    assert phrase_groups("数据库abc") == (("数", "据", "库", "abc"),)
+    assert phrase_groups("第3章") == (("第", "3", "章"),)
+    # 标点不是词元字符 ⇒ 天然拆组
+    assert phrase_groups("中-文") == (("中",), ("文",))
 
 
 def test_expression_contains_only_quoted_literals_and_and_for_cjk_input() -> None:
@@ -739,6 +857,77 @@ def test_single_han_character_query_still_works(harness: Harness) -> None:
         ids["c"],
     }
     assert harness.index.search(SearchQuery(text="文")).total == 2
+
+
+# =========================================================================== #
+# C1b：汉字↔拉丁/数字边界必须可查（第二轮裁决的核心，真实断言不是"应该可以"）
+# =========================================================================== #
+def seed_mixed(harness: Harness) -> Dict[str, str]:
+    return {
+        body: harness.add("ch-mix", f"https://x.invalid/mix-{position}", body).raw_id
+        for position, body in enumerate(MIXED_DOCS)
+    }
+
+
+@pytest.mark.parametrize(
+    "query,expected_docs",
+    [
+        ("架构", ("Transformer架构与注意力机制",)),
+        ("注意力机制", ("Transformer架构与注意力机制",)),
+        ("模型", ("GPT模型驱动的检索系统", "第3章 讲 BERT模型 的微调")),
+        ("GPT", ("GPT模型驱动的检索系统",)),
+        ("向量数据库", ("向量数据库abc的工程实践",)),
+        ("工程实践", ("向量数据库abc的工程实践",)),
+        ("abc", ("向量数据库abc的工程实践",)),
+        ("第3章", ("第3章 讲 BERT模型 的微调",)),
+        ("BERT", ("第3章 讲 BERT模型 的微调",)),
+        ("微调", ("第3章 讲 BERT模型 的微调",)),
+    ],
+)
+def test_han_latin_boundary_is_searchable(
+    harness: Harness, query: str, expected_docs: Tuple[str, ...]
+) -> None:
+    """`架构` 必须命中 `Transformer架构`、`模型` 必须命中 `GPT模型`…（C1b）。
+
+    这些是**扩展前实测为 0 命中**的查询（`tools/t205cjk_boundary_probe.py` 记录了前后对照）。
+    """
+    seed_mixed(harness)
+    harness.rebuild()
+    result = harness.index.search(SearchQuery(text=query, limit=10))
+    hits = {harness.index.get(hit.raw_id).text for hit in result.items}
+    assert hits == set(expected_docs), f"{query!r} 的命中集合不符：{hits}"
+    # 活对照：两个集合都非空，因此上面的相等不是"两边都空"凑出来的
+    assert result.total == len(expected_docs) >= 1
+
+
+def test_han_latin_boundary_is_really_split_in_the_index(harness: Harness) -> None:
+    """负向对照：索引里**不再存在**"汉字紧贴拉丁"的单一 token。"""
+    seed_mixed(harness)
+    harness.rebuild()
+    with harness.index.lock:
+        def count(expression: str) -> int:
+            return harness.index.connection.execute(
+                f"SELECT COUNT(*) AS n FROM {FTS_TABLE} WHERE {FTS_TABLE} MATCH ?",
+                (expression,),
+            ).fetchone()["n"]
+
+        assert count('"Transformer架构"') == 0, "未切开的连写不该还能命中"
+        assert count('"Transformer 架 构"') == 1
+        assert count('"GPT模型"') == 0
+        assert count('"GPT 模 型"') == 1
+        assert count('"向量数据库abc"') == 0
+        assert count('"向 量 数 据 库 abc"') == 1
+
+
+def test_snippet_reconstructs_the_contiguous_mixed_text(harness: Harness) -> None:
+    """摘要里汉字与拉丁重新贴回原文形态（不得露出 `Transformer 架 构`）。"""
+    record = harness.add("ch-mix", "https://x.invalid/mix", "Transformer架构与注意力机制")
+    harness.rebuild()
+    hit = harness.index.search(SearchQuery(text="架构", limit=1)).items[0]
+    assert hit.raw_id == record.raw_id
+    assert "Transformer[架构]" in hit.snippet, hit.snippet
+    assert "Transformer 架 构" not in hit.snippet
+    assert "架 构" not in hit.snippet
 
 
 # =========================================================================== #

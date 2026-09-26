@@ -82,6 +82,8 @@ MEASURED_REAL_CJK_DOCUMENTS = 0
 
 #: 合成中文文档：真实语料里没有中文，因此这条链路证据必须自己造一份**真实的中文文档**
 #: （不是从真实语料里抄的），并单独标注。
+#: 含**汉字↔拉丁/数字直接相邻**的混写（`Transformer架构` / `GPT模型` / `BERT模型` /
+#: `向量数据库abc`）——中文技术文本的常态形态，切分契约 `/2` 专门覆盖。
 SYNTHETIC_ZH_ARTICLE = (
     "<html><head><title>中文分词测试</title>"
     "<style>styleonlytoken</style></head><body>"
@@ -89,6 +91,8 @@ SYNTHETIC_ZH_ARTICLE = (
     "<h1>中文分词测试与检索</h1>"
     "<p>检索系统需要把连续汉字切成单字，再以短语查询保证顺序。</p>"
     "<p>向量数据库与关键词检索是两条互补的技术路线。</p>"
+    "<p>Transformer架构与GPT模型驱动的检索系统评测。</p>"
+    "<p>第3章 用 BERT模型 做向量数据库abc 的微调工程实践。</p>"
     "<p>mixed english tokens with BM25 ranking</p>"
     "</body></html>"
 )
@@ -500,7 +504,19 @@ def test_synthetic_chinese_document_goes_through_the_whole_pipeline(tmp_path: Pa
         assert "scriptonlytoken" not in normalized and "styleonlytoken" not in normalized
 
         # 查询：命中数 + 排序 + 摘要
-        for text in ("中文分词", "向量数据库", "检索", "中文字", "分词中文", "bm25"):
+        for text in (
+            "中文分词",
+            "向量数据库",
+            "检索",
+            "中文字",
+            "分词中文",
+            "bm25",
+            "bw25",
+            "架构",
+            "GPT模型",
+            "BERT模型",
+            "第3章",
+        ):
             result = index.search(SearchQuery(text=text, limit=MAX_LIMIT))
             keys = [(-hit.score, -hit.fetched_at.timestamp(), hit.raw_id) for hit in result.items]
             assert keys == sorted(keys), "结果必须按 (score desc, fetched_at desc, raw_id asc)"
@@ -514,22 +530,36 @@ def test_synthetic_chinese_document_goes_through_the_whole_pipeline(tmp_path: Pa
                 )
             )
 
-        # 核心修复：子串汉字命中，且**顺序敏感**
+        # 核心修复一：子串汉字命中，且**顺序敏感**
         assert index.search(SearchQuery(text="中文")).total == 1
         assert index.search(SearchQuery(text="中文分词")).total == 1
         assert index.search(SearchQuery(text="向量数据库")).total == 1
         assert index.search(SearchQuery(text="分词中文")).total == 0, "短语必须顺序敏感"
         # 合成语料里没有"工人智能"这类字面串，验证逐字 AND 的假阳性在真实链路里也存在
         assert index.search(SearchQuery(text="数据库与关键")).total == 1
+        # 核心修复二（切分契约 /2）：跨"汉字↔拉丁/数字"边界的子串也命中
+        for text in ("架构", "模型", "微调", "工程实践", "第3章", "3章", "BERT", "GPT"):
+            assert index.search(SearchQuery(text=text)).total == 1, (
+                f"跨汉字↔拉丁边界的查询 {text!r} 未能命中合成中文文档"
+            )
+        print(
+            "[T-205CJK 合成] 汉字↔拉丁边界可查：架构 / 模型 / 微调 / 工程实践 / 第3章 / "
+            "3章 / BERT / GPT 各 1 命中"
+        )
 
         hit = index.search(SearchQuery(text="中文分词", limit=1)).items[0]
         assert "[中文分词]" in hit.snippet
         assert "中 文" not in hit.snippet and "分 词" not in hit.snippet
         for piece in _snippet_pieces(hit.snippet):
             assert piece in normalized, f"摘要片段不是原文子串：{piece!r}"
+        mixed_hit = index.search(SearchQuery(text="架构", limit=1)).items[0]
+        assert "Transformer[架构]" in mixed_hit.snippet, mixed_hit.snippet
+        assert "Transformer 架 构" not in mixed_hit.snippet
+        for piece in _snippet_pieces(mixed_hit.snippet):
+            assert piece in normalized, f"混写摘要片段不是原文子串：{piece!r}"
         print(
             f"[T-205CJK 合成] 摘要还原后不含插入分隔符；片段均为原文子串："
-            f"{hit.snippet!r}"
+            f"{hit.snippet!r} / {mixed_hit.snippet!r}"
         )
 
         # 删索引 → 从 raw 全量重建 → 结果逐条相同（判据 C8：索引仍是只读投影）
@@ -559,6 +589,7 @@ def test_synthetic_chinese_document_goes_through_the_whole_pipeline(tmp_path: Pa
         ).fetchone()
         assert row["text"] == normalized
         assert row["text_index"] != normalized and "中 文 分 词" in row["text_index"]
+        assert "Transformer 架 构" in row["text_index"]
         assert not hasattr(document, "text_index")
         assert query.match_expression() == '"中 文 分 词"'
         assert archive.verify() == []

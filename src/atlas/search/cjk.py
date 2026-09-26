@@ -19,24 +19,37 @@ FTS5 的 `unicode61` 没有词典分词：连续汉字被当成**一个词元**
 切分规则（确切定义）
 --------------------
 
-`segment_cjk(text)`：在**两个相邻汉字之间的空白间隙**里插入**一个** ASCII 空格
-（`" "`），插入位置是间隙的**末尾**，即紧贴第二个汉字之前；**其它位置一律不动**。
+`segment_cjk(text)`：在**两个"词元字符"之间的空白间隙**里插入**一个** ASCII 空格
+（`" "`），插入位置是间隙的**末尾**，即紧贴后一个词元字符之前；**其它位置一律不动**。
 
-===========  ==================  ================
-原文         切分结果             说明
-===========  ==================  ================
-`中文`        `中 文`             间隙为空
-`中 文`       `中  文`            间隙已有空白 ⇒ 真实空格 + 1 个插入空格
-`中a文`       `中a文`（不变）      中间是**非空白**字符 ⇒ 不是"相邻汉字间隙"
-`abc`         `abc`（不变）        无汉字
-===========  ==================  ================
+"需要插入"的判定（唯一出处：`_needs_separator`）——两个相邻（中间只有空白）的
+词元字符之间，**至少一侧是汉字**时插入：
 
-**为什么间隙已有空白时也要插入**（这一步是可逆性的必要条件）：若只在"两个汉字直接
-相邻"时插入，`中文` 与 `中 文` 会切出同一个串，逆映射不再唯一，原始文本里的真实空格
-无法还原。插入之后：
+| 前 → 后 | 插？ | 例 |
+|---|---|---|
+| 汉字 → 汉字 | 插 | `中文` → `中 文` |
+| 汉字 → 字母/数字 | 插 | `Transformer架构` → `Transformer 架 构`；`第3章` → `第 3 章` |
+| 字母/数字 → 汉字 | 插 | `abc中文` → `abc 中 文` |
+| 字母/数字 → 字母/数字 | **不插** | `vector database` 原样（纯英文恒等变换） |
+| 任一侧是标点/符号/`_` | **不插** | `中-文` 原样（`unicode61` 本来就把它们当分隔符） |
+
+"词元字符"= FTS5 `unicode61` 当作 token 的字符 = `str.isalnum()`（**不含** `_`），
+与查询侧的切词正则 `[^\\W_]+` 完全一致（有测试逐码点核对两者等价）。
+
+**为什么"汉字↔字母/数字"也要切**：`unicode61` 把 `Transformer架构` 当成**一个**
+token，于是 `架构` 查不到它；同理 `GPT模型` 查不到 `模型`、`向量数据库abc` 查不到
+`向量数据库`。中文技术文本里这种混写是常态，是**正确性缺陷**而不是优化项
+（实测证据见 `tools/t205cjk_boundary_probe.py`）。
+
+**为什么间隙已有空白时也要插入**（这一步是可逆性的必要条件）：若某个"需要插入"的
+边界只在两侧直接相邻时插入，`中文` 与 `中 文` 会切出同一个串，逆映射不再唯一，
+原始文本里的真实空格无法还原。插入之后：
 
 - `中 文`（原文，一个真实空格）→ `中  文`（两个空格）→ 逆映射删**一个** → `中 文` ✔
 - `中文`（原文）→ `中 文`（一个空格）→ 逆映射删**一个** → `中文` ✔
+- `中 abc`（原文）→ `中  abc`（两个空格）→ 逆映射删**一个** → `中 abc` ✔
+
+代价：混合中英文本的 `text_index` 会多出少量空格（**纯英文一个也不多**）。
 
 确切 Unicode 范围（硬编码，不依赖 `unicodedata` 的版本，因此跨 Python 版本可复现）
 ----------------------------------------------------------------------------------
@@ -68,12 +81,12 @@ FTS5 的 `unicode61` 没有词典分词：连续汉字被当成**一个词元**
 ------
 
 `desegment(segment_cjk(text)) == text` 对**任意** `str` 成立（有往返性质测试）。
-判定"某个空格是不是切分器插入的"只有**一个**出处：`is_inserted_space`，
-`desegment` 与摘要还原（`atlas.search.snippet`）共用它——不会出现两套规则打架。
+判定"某个空格是不是切分器插入的"只有**一个**出处：`is_inserted_space`
+（它调用与 `segment_cjk` 同一个 `_needs_separator` 判定），`desegment` 与摘要还原
+（`atlas.search.snippet`）共用它——不会出现两套规则打架。
 
-一个**已知的残余边界**（不在本契约内，如实记录）：`中a文` 这种"汉字与拉丁**直接**相邻
-且中间没有空白"的连写仍是一个词元，因此 `segment_cjk` 不动它（契约要求"其它位置一律
-不动"）。真实语料里这需要"汉字↔拉丁边界也插入空格"的另一个裁决。
+纯拉丁文本上 `segment_cjk` 是**恒等变换**（没有任何一侧是汉字），因此英文索引内容
+逐字节不变、BM25 与摘要不变（有对照索引测试钉死）。
 """
 
 from __future__ import annotations
@@ -85,6 +98,7 @@ __all__ = [
     "desegment",
     "is_cjk",
     "is_inserted_space",
+    "is_token_character",
     "segment_cjk",
 ]
 
@@ -101,8 +115,9 @@ CJK_RANGES: Tuple[Tuple[int, int], ...] = (
 #: ASCII 空格：切分器唯一会插入的字符（因此逆映射只需要认识这一个字符）。
 SEPARATOR = " "
 
-#: 版本标识：任一区段或插入规则变化都必须同时升 `SCHEMA_VERSION` / `INDEX_VERSION`。
-SEGMENTATION_VERSION = "atlas.search.cjk/1"
+#: 版本标识：任一区段或插入规则变化都必须同时升 `INDEX_VERSION`（见 `sqlite_index`）。
+#: `/2` = 插入规则从"仅汉字↔汉字"扩到"至少一侧是汉字的任意词元字符边界"。
+SEGMENTATION_VERSION = "atlas.search.cjk/2"
 
 
 def is_cjk(character: str) -> bool:
@@ -116,25 +131,59 @@ def is_cjk(character: str) -> bool:
     return False
 
 
-def segment_cjk(text: str) -> str:
-    """在两个相邻汉字之间的空白间隙里插入一个空格（其余位置逐字符不变）。
+def is_token_character(character: str) -> bool:
+    """该字符是否是 FTS5 `unicode61` 的**词元字符**（字母或数字，**不含** `_`）。
 
+    这就是查询侧切词正则 `[^\\W_]+` 的逐字符版本：CPython 的 `\\w` =
+    `str.isalnum()` ∪ `{_}`，因此 `[^\\W_]` 与 `str.isalnum()` 等价
+    （`tests/test_search_cjk.py` 逐码点核对这一点）。
+
+    标点/符号/空白/`_` 都不是词元字符 ⇒ `unicode61` 本来就在它们处断开，
+    切分器对它们**不需要**插入任何东西。
+    """
+    if len(character) != 1:
+        raise TypeError(f"is_token_character 只接受单个字符（收到 {character!r}）")
+    return character.isalnum()
+
+
+def _needs_separator(previous: str, current: str) -> bool:
+    """两个相邻（中间只有空白）的**非空白**字符之间是否需要插入分隔符。
+
+    **切分规则与逆映射判定的唯一出处**：`segment_cjk` 与 `is_inserted_space` 都调它，
+    因此"插了什么"与"删什么"不可能不一致。
+
+    成立条件（两条都满足）：
+
+    1. 两侧都是 `unicode61` 的词元字符（否则它本来就会断开，插了也没用）；
+    2. **至少一侧是汉字**——汉字↔汉字（逐字切分的本意）与汉字↔字母/数字
+       （`Transformer架构`、`GPT模型`、`向量数据库abc`：不切就查不到 `架构`/`模型`/
+       `向量数据库`）。字母↔字母不插 ⇒ 纯英文恒等变换。
+    """
+    return (
+        is_token_character(previous)
+        and is_token_character(current)
+        and (is_cjk(previous) or is_cjk(current))
+    )
+
+
+def segment_cjk(text: str) -> str:
+    """在"至少一侧是汉字"的两个词元字符之间的空白间隙里插入一个空格。
+
+    其余位置逐字符不变（纯拉丁文本因此是恒等变换）。
     纯函数：无 I/O、无状态、同输入同输出。`desegment` 是它的逆。
     """
     if not isinstance(text, str):
         raise TypeError(f"segment_cjk 只接受 str（收到 {type(text).__name__}）")
     pieces: List[str] = []
-    preceded_by_han = False  # 上一个"非空白"字符是否是汉字（跨空白保持）
+    previous: str | None = None  # 上一个**非空白**字符（跨空白保持）
     for character in text:
-        if is_cjk(character):
-            if preceded_by_han:
-                pieces.append(SEPARATOR)
+        if character.isspace():
             pieces.append(character)
-            preceded_by_han = True
-        else:
-            pieces.append(character)
-            if not character.isspace():
-                preceded_by_han = False
+            continue
+        if previous is not None and _needs_separator(previous, character):
+            pieces.append(SEPARATOR)
+        pieces.append(character)
+        previous = character
     return "".join(pieces)
 
 
@@ -144,23 +193,29 @@ def is_inserted_space(text: str, index: int) -> bool:
     判定规则（`desegment` 与摘要还原共同使用，因此只有这一个出处）：
 
     1. `text[index]` 是 ASCII 空格；
-    2. 紧跟其后的是汉字（插入点紧贴第二个汉字）；
-    3. 从 `index` 往前跨过连续空白，遇到的是**汉字**（即这确实是"两个汉字之间的间隙"、
-       且 `index` 是该间隙末尾，也就是插入点）。
+    2. 紧跟其后的是**词元字符**（插入点永远紧贴后一个词元字符，因此空格后面绝不是空白）；
+    3. 从 `index` 往前跨过连续空白，遇到的是**词元字符**（存在"前一个词元字符"）；
+    4. `_needs_separator(前一个词元字符, 后一个词元字符)` 成立——
+       与 `segment_cjk` 用的是**同一个**判定。
 
-    真实空格永远不满足第 3 条：它不可能同时是"间隙末尾"——若间隙里本来就有空白，
-    `segment_cjk` 会在它**后面**再插一个，于是被判成插入的是后一个。
+    真实空格永远不满足第 2 条：若某个间隙里本来就有空白、且该边界需要插入，
+    `segment_cjk` 会在真实空白**后面**再插一个，于是被判成"插入的"是后一个，
+    真实空白的下一个字符仍是空白。若该边界**不需要**插入（例如 `a b`、`中-文`），
+    第 4 条不成立。
     """
     if not isinstance(text, str):
         raise TypeError(f"is_inserted_space 只接受 str（收到 {type(text).__name__}）")
     if index < 0 or index >= len(text) or text[index] != SEPARATOR:
         return False
-    if index + 1 >= len(text) or not is_cjk(text[index + 1]):
+    following = index + 1
+    if following >= len(text) or not is_token_character(text[following]):
         return False
     cursor = index
     while cursor - 1 >= 0 and text[cursor - 1].isspace():
         cursor -= 1
-    return cursor - 1 >= 0 and is_cjk(text[cursor - 1])
+    if cursor - 1 < 0:
+        return False
+    return _needs_separator(text[cursor - 1], text[following])
 
 
 def desegment(text: str) -> str:

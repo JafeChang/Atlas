@@ -650,6 +650,8 @@ def test_cjk_runs_are_segmented_so_han_queries_hit(harness: Harness) -> None:
     **正确行为**——不是删掉、也不是放松断言。完整判据见 `tests/test_search_cjk.py`（C1–C6）。
     """
     harness.add("ch-a", "https://x.invalid/1", "中文分词测试与检索 mixed english")
+    # 汉字与拉丁**直接相邻**（没有空白）：这是同一个缺口的另一形态，也必须可查
+    harness.add("ch-b", "https://x.invalid/2", "Transformer架构与GPT模型")
     harness.rebuild()
     # 整段连写照旧命中
     assert harness.index.search(SearchQuery(text="中文分词测试与检索")).total == 1
@@ -659,11 +661,19 @@ def test_cjk_runs_are_segmented_so_han_queries_hit(harness: Harness) -> None:
     assert harness.index.search(SearchQuery(text="中文分词")).total == 1
     assert harness.index.search(SearchQuery(text="测试与检索")).total == 1
     assert harness.index.search(SearchQuery(text="检索")).total == 1
+    # 修复点二：跨"汉字↔拉丁"边界的子串也命中（原来是 0）
+    assert harness.index.search(SearchQuery(text="架构")).total == 1
+    assert harness.index.search(SearchQuery(text="模型")).total == 1
+    assert harness.index.search(SearchQuery(text="Transformer")).total == 1
+    assert harness.index.search(SearchQuery(text="GPT")).total == 1
     # 查询表达式是**短语**（逐字 AND 会带来大量假阳性）
     assert SearchQuery(text="中文分词").match_expression() == '"中 文 分 词"'
+    assert SearchQuery(text="数据库abc").match_expression() == '"数 据 库 abc"'
     # 摘要不得露出切分器插入的分隔符
     snippet = harness.index.search(SearchQuery(text="中文", limit=1)).items[0].snippet
     assert "[中文]" in snippet and "中 文" not in snippet
+    mixed = harness.index.search(SearchQuery(text="架构", limit=1)).items[0].snippet
+    assert "Transformer[架构]" in mixed and "Transformer 架 构" not in mixed
     # 拉丁词仍按词元匹配，不受影响（前后缀行为不变）
     assert harness.index.search(SearchQuery(text="english")).total == 1
     assert harness.index.search(SearchQuery(text="eng")).total == 0
