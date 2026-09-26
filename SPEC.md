@@ -419,6 +419,38 @@ C8 的配置来自前端 / API，不依赖手工编辑文件。
 > 再用**静态 import 清单**证明"存在但未被引入/使用"。用"探测不到"来证明"没有能力"是错的论证方式，
 > 这里没有犯这个错。
 
+#### 真实调用与**真实降级**都已验过（2026-09-26）
+
+主代理直接跑 `tools/t003_real_call.py`，两条路由各一次真实调用：
+
+| 路由 | 结果 | 关键数字 |
+|---|---|---|
+| **官方 DeepSeek**（`deepseek/deepseek-flash` @ `api.deepseek.com`） | `ok` | 边车内 2438 ms / 端到端 7300 ms；input 247 / output 256 / **reasoning 119**；**抽出 3 条 claim，每条都带 `quote` 且 `quote_in_document=True`**；`tools_declared=0 tool_calls=0` |
+| **备用**（`deepseek/deepseek-v4-flash` @ OpenRouter） | `ok` | 端到端 7990 ms；input 349 / output 155 / reasoning 106；1 条 claim，`quote_in_document=True` |
+
+这同时验证了 §2.2 的分工**在真实调用里成立**：PI 只吐 `quote`，坐标由系统侧算，且 quote 确实能在原文里找到。
+版本三元组也如 §3 要求随产物记录（`code=cognition-extract-prompt/1` / `config=cognition-config/1` / `model=<实际模型>`）。
+
+**降级路径是在一次真实故障上验的，不是模拟的**
+
+备用路由早先被环境变量指到了一个**已下架**的模型（`ATLAS_LLM_MODEL=xiaomi/mimo-v2-flash:free`，
+OpenRouter 返回 404 `deprecated`）。那次真实调用返回：
+
+```
+状态 : unclassified   reason=model_deprecated
+claims : （空）
+token  : input=0 output=0 total=0
+```
+
+即：模型不可用时**标记未分类并给出原因，一条 claim 都没有编造**——正是本节的决策四。
+这比任何 mock 都更有说服力：**一次真的 404 换来了真的降级**。
+
+> 顺带修掉一个真隐患：`.env.local`（gitignored，本地）里的 `ATLAS_LLM_MODEL` /
+> `ATLAS_OPENAI_MODEL` 仍指向那个已下架模型，会**盖掉代码里正确的默认值**
+> （`OA_MODEL = "deepseek/deepseek-v4-flash"`，T-003 自己已在 config.py 里注明该环境值已失效）。
+> 已把这两个本地值改正，备用路由随即从 `unclassified` 变成 `ok`。
+> ⚠️ **代码默认值是对的，坏的是本地环境值**——这类"配置盖住正确默认值"的问题，只有真的调用一次才会暴露。
+
 **Node 依赖被关在边车进程里**：Python 项目因此**仍是 stdlib-only**，`pyproject.toml` / `uv.lock` 不变。
 这与"依赖最小化、显式声明"不冲突——新增的依赖不在 Python 依赖图里。
 
