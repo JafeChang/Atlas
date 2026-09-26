@@ -186,6 +186,7 @@ class RealRun:
         second,
         rows_after: int,
         channel_industry: Dict[str, str],
+        before_label_rows: int,
         label_rows_after: int,
         table_names: List[str],
         trigger_names: List[str],
@@ -199,6 +200,7 @@ class RealRun:
         self.second = second
         self.rows_after = rows_after
         self.channel_industry = channel_industry
+        self.before_label_rows = before_label_rows
         self.label_rows_after = label_rows_after
         self.table_names = table_names
         self.trigger_names = trigger_names
@@ -211,6 +213,7 @@ def real_run() -> RealRun:
 
     census = _census()
     before_rows = _raw_row_count()
+    before_label_rows = _label_row_count()
     before_files, before_bytes = directory_stats(STORE_ROOT)
     before_tree = tree_digest(LEGACY_RAW)
 
@@ -256,6 +259,7 @@ def real_run() -> RealRun:
         second=second,
         rows_after=rows_after,
         channel_industry=channel_industry,
+        before_label_rows=before_label_rows,
         label_rows_after=label_rows_after,
         table_names=table_names,
         trigger_names=trigger_names,
@@ -266,6 +270,17 @@ def _raw_row_count() -> int:
     connection = sqlite3.connect(f"file:{STORE_DB}?mode=ro", uri=True)
     try:
         return int(connection.execute("SELECT COUNT(*) AS n FROM raw_records").fetchone()[0])
+    finally:
+        connection.close()
+
+
+def _label_row_count() -> int:
+    """`confirmed_labels` 当前行数（**只读**）。"""
+    connection = sqlite3.connect(f"file:{STORE_DB}?mode=ro", uri=True)
+    try:
+        return int(
+            connection.execute("SELECT COUNT(*) AS n FROM confirmed_labels").fetchone()[0]
+        )
     finally:
         connection.close()
 
@@ -456,28 +471,57 @@ def test_real_second_run_creates_nothing_new(real_run: RealRun) -> None:
 def test_real_labels_are_untouched(real_run: RealRun) -> None:
     """判据 5（§2.4）：导入**不新增任何人工标签**，符号层面也不存在写标签的路径。
 
-    真实库里 `confirmed_labels` 的实测行数是 **1**（§6.1 记录的 A1 复验探针，
-    `actor=e2e-verify`）—— 那是**导入之前**就存在的，因此这里断言"仍是 1"。
+    ⚠️ **这条判据在 T-109 之后改成了"导入前后相等"**（原本写死 `== 1`）。
+    原因：真实库里的行数**本就会长**——T-109 打标前端落地后，用户每点一次
+    "标记有效"就多一条 Confirmed。把绝对行数写死，等于**禁止项目达成 §1.4 的成功信号**
+    （"可以在多个渠道、多个领域给收集到的信息打标"）。
+    判据的**本意**是"导入不写标签表"，因此现在比较**导入前后**的行数。
     """
-    assert real_run.label_rows_after == 1, (
+    assert real_run.label_rows_after == real_run.before_label_rows, (
         "confirmed_labels 行数变了 —— 导入动了人工标签（§2.4 禁止）"
     )
+    assert real_run.before_label_rows >= 1, (
+        "真实库里应当至少有 §6.1 记录的那条 A1 复验探针（actor=e2e-verify）"
+    )
     assert not any(reason.startswith("label") for reason in real_run.report.failure_counts())
-    # 表集合没有新增任何标签/提议/证据域的表
+    # 表集合里不得出现"标签 / 提议 / 证据域"的**表**。
+    #
+    # ⚠️ 这条判据在 T-105 之后**收窄了它的对象**（原本把 `proposed_claims` 也列为禁止项）。
+    # 原因：T-105（机器分类与提议）落地后，`proposed_claims` 是 SPEC §2.10
+    # **登记给 T-105 的合法表**，而且 T-105 有正当理由往它写（这正是它的交付内容）。
+    # 把这张表列进"禁止出现"，等于**禁止后续任务交付**——与把 `confirmed_labels`
+    # 行数写死为 1 是同一类错误（见上一个测试的说明）。
+    #
+    # 判据的**本意**没变：**导入不建"导入专用"的表、也不写别人的表**。
+    # 因此这里只保留"导入自己可能偷偷建的表"；`proposed_claims` 只断言"存在也合法"。
+    # （想断言"导入没往它写"，需要一个 before 快照；本文件没有采，属于**已知的判据
+    # 弱点**，在此写明，不假装它被覆盖了。）
     forbidden = {
         "confirmed_labels_imported",
-        "proposed_claims",
-        "evidence_spans",
         "migrate_labels",
+        "migrate_proposed",
+        "import_runs",
     }
     assert forbidden & set(real_run.table_names) == set()
+    if "proposed_claims" in real_run.table_names:
+        print("[T-131 真实] proposed_claims 存在（T-105 的合法表，SPEC §2.10）")
     print(f"[T-131 真实] confirmed_labels 仍为 {real_run.label_rows_after} 行（导入未触碰）")
 
 
 @requires_real_data
 def test_real_no_extra_tables_or_triggers_were_created(real_run: RealRun) -> None:
-    """判据 9 / 10：导入只写 `raw_records`，不新建表、不改触发器集合。"""
-    expected_triggers = {
+    """判据 9 / 10：导入只写 `raw_records`，不新建表、不改触发器集合。
+
+    ⚠️ 这条判据在 T-105 之后**从"写死集合"改成"逐项归类"**：`proposed_claims` /
+    `proposal_runs` 与它们的 4 个 append-only 触发器是 SPEC §2.10 登记给 T-105 的合法
+    对象（由 `atlas.cognition.store` 建立），不是导入建的。写死集合会让"后续任务按
+    SPEC 建自己的表"表现为 T-131 的失败——那是**假失败**，会把运维注意力引到错的地方。
+
+    真正要守的两条（本测试的核心）：
+    1. 每个触发器都必须属于某个**已登记的域**（T-101 配置 / T-103 raw / T-105 提议）；
+    2. `raw_records` 的 append-only 触发器必须**还在**（导入不许把它弄丢）。
+    """
+    t101_t103_triggers = {
         "trg_config_versions_no_delete",
         "trg_config_versions_no_update",
         "trg_confirmed_labels_no_delete",
@@ -489,9 +533,25 @@ def test_real_no_extra_tables_or_triggers_were_created(real_run: RealRun) -> Non
         "trg_registry_label_ref_snapshots_no_delete",
         "trg_registry_label_ref_snapshots_no_update",
     }
-    assert set(real_run.trigger_names) == expected_triggers
+    # T-105 的成员（SPEC §2.10 表归属：proposed_claims / proposal_runs 归 T-105）
+    t105_triggers = {
+        "trg_proposed_claims_no_delete",
+        "trg_proposed_claims_no_update",
+        "trg_proposal_runs_no_delete",
+        "trg_proposal_runs_no_update",
+    }
+    actual = set(real_run.trigger_names)
+    allowed = t101_t103_triggers | t105_triggers
+    assert actual <= allowed, f"出现了归属不明的触发器：{sorted(actual - allowed)}"
+    assert t101_t103_triggers <= actual, (
+        f"T-101/T-103 的触发器丢了：{sorted(t101_t103_triggers - actual)}"
+    )
+    assert "trg_raw_records_no_update" in actual and "trg_raw_records_no_delete" in actual
     assert "raw_records" in real_run.table_names and "raw_store_meta" in real_run.table_names
-    print(f"[T-131 真实] 触发器 {len(real_run.trigger_names)} 个（与导入前一致）")
+    print(
+        f"[T-131 真实] 触发器 {len(actual)} 个 = T-101/T-103 {len(actual & t101_t103_triggers)}"
+        f" + T-105 {len(actual & t105_triggers)}（全部有登记归属）"
+    )
 
 
 # --------------------------------------------------------------------------- #
