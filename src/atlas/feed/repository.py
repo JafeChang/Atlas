@@ -94,10 +94,14 @@ class ArchiveFeedSource:
     - 逐条 `get(raw_id)` 取元数据，不读原文字节（feed 只展示元数据）；
     - `industry_of` 由注入的映射/可调用对象提供（默认恒为 `None`，表示"未归行业"）。
 
-    线程注意：T-103 的 `SqliteRawStore` 用的是 `sqlite3` 默认线程亲和的连接。
-    `ThreadingHTTPServer` 在**各自线程**里处理请求，因此把 `ArchiveStore` 交给
-    `atlas.feed.serve()` 时应当传**工厂**（`lambda: ArchiveFeedSource(open_archive(...))`），
-    让每个请求线程拿到自己的连接，而不是跨线程共享一个连接。
+    线程注意：跨线程可用性已经钉在存储层（T-103，`70c5a68`）——`SqliteRawStore`
+    的连接以 `check_same_thread=False` 打开，且所有连接操作在一把 `threading.RLock`
+    内串行化，因此**单个 `ArchiveStore` 实例可以安全地跨请求线程共享**；
+    `ThreadingHTTPServer` 在各自线程里处理请求这一点不再要求调用方新建连接
+    （`tests/test_archive_threading.py` 与 `tests/test_archive_shared_instance_e2e.py`
+    用同一实例跨线程调用全部契约方法做行为性验证）。
+    共享实例是允许的；`archive_source_factory` 仍然提供"每请求一个独立连接"的另一种
+    部署方式（连接/事务隔离更直观），但它不再是线程安全的必要条件。
     """
 
     def __init__(
@@ -166,11 +170,11 @@ def archive_source_factory(
     industry_of: Callable[[str], str | None] | Mapping[str, str] | None = None,
     **archive_kwargs: Any,
 ) -> Callable[[], ArchiveFeedSource]:
-    """构造**每请求新开归档连接**的源工厂（`sqlite3` 线程亲和的正确用法）。
+    """构造**每请求新开归档连接**的源工厂（返回**零参**可调用对象）。
 
-    `atlas.archive.SqliteRawStore` 的连接只能在创建它的线程里使用，而
-    `ThreadingHTTPServer` 在各自线程里处理请求。因此给 `atlas.feed.serve()` /
-    `FeedServer` 传本工厂，而不是共享一个 `ArchiveFeedSource`::
+    `ArchiveStore` 本身已可跨线程共享（见 `ArchiveFeedSource` 的线程注意，T-103），
+    本工厂提供的是另一种部署方式：每个请求线程拿到自己独立的连接与事务。
+    `atlas.feed.serve()` / `FeedServer` 需要的是零参工厂，因此::
 
         server = FeedServer(archive_source_factory("data/store", industry_of=index))
     """
