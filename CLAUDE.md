@@ -93,6 +93,15 @@ wsl bash -lc 'cd /mnt/c/Users/bestz/Documents/projects/Atlas && ./.venv-new/bin/
 - **旧系统可跑副本**：`../Atlas-legacy`（git worktree @ `main`），共享 `data/` 与 `.venv`。
   采集入口：`PYTHONPATH=src ./.venv/bin/python -m atlas collect`
 - **归档基线**：tag `archive/growth-baseline-2026-09-25`（目标重梳理前的完整历史，被弃用的代码都可从这里取回）。
+- **认知层边车的 Node 依赖不在 git 里**（`src/atlas/cognition/sidecar/node_modules`，70 MB）。
+  它缺失时，需要真起边车进程的那些 `test_cognition_*` 用例会**自跳过**（不是失败）——
+  所以干净检出的 `pytest tests` 仍然**退出码 0**，硬规则 4 的 worktree 复核因此可执行。
+  要**完整**跑这些用例，先在该目录执行 `npm install --no-audit --no-fund`
+  （需要走代理时先 `export HTTPS_PROXY=http://127.0.0.1:7897`）。
+  ⚠️ 装在 `/mnt/c`（drvfs）上时，`import '@earendil-works/pi-ai'` 每次进程启动要约 **4.5 秒**
+  （Linux 原生 fs 只要 0.09 秒，差约 48 倍）——批量任务要把这笔开销算进预算。
+- **`data/` 与 `node_modules` 一类"不在 git 里的依赖"**：凡测试需要它们，一律**自跳过**并写清
+  "缺什么、怎么补"，绝不让环境缺失表现为测试失败（否则新克隆的人会看到一片红，而那不是他改坏的）。
 
 ## 不要做的事
 
