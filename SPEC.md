@@ -1,7 +1,7 @@
 ---
-version: "0.1.0"
-last_updated: "2026-09-25"
-status: "设计定稿，T-001 未执行"
+version: "0.3.0"
+last_updated: "2026-09-26"
+status: "设计定稿；L1 已落地（§6.5 / §6.7 记录剩余缺口）"
 baseline: "archive/growth-baseline-2026-09-25 @ f8231bd"
 branch: "rebaseline"
 document_type: "mutable"
@@ -18,7 +18,7 @@ document_type: "mutable"
 
 | 项 | 值 |
 |---|---|
-| 版本 | 0.2.0 |
+| 版本 | 0.3.0 |
 | 日期 | 2026-09-26 |
 | 归档基线 | `archive/growth-baseline-2026-09-25` → `f8231bd` |
 | 工作分支 | `rebaseline` |
@@ -320,11 +320,11 @@ C8 的配置来自前端 / API，不依赖手工编辑文件。
 | `registry_label_refs` / `registry_label_ref_snapshots` | T-101 | **标签引用索引**（§2.9 规则 1：被引用 id 不得改删）——**不是标签本身** |
 | `raw_records` | T-103 | 原文元数据（字节本体在文件系统） |
 | `catalog_health` | T-111 | 渠道健康状态（探测结果 + 时间；**只增不改**，最新一条为当前状态） |
-| `proposed_claims` | T-105 | 机器提议（可覆写，保留版本链）。**可覆写** ⇒ 刻意**不加** append-only 触发器，而是用 `PK(claim_key, version)` + `supersedes` 做版本链 |
-| `proposal_runs` | T-105 | **"这个单元在这个配置下跑过没有"**——降级单元**没有 claim 但跑过了**，没有这张表就无法区分，会导致降级单元每次重跑都被重复调用模型。append-only 双触发器 |
-| `cognition_store_meta` | T-105 | 认知域的元数据（照 T-103 `raw_store_meta` 先例） |
+| `proposed_claims` | T-105 | 机器提议（**可覆写**，保留版本链）。`PK(claim_key, version)` + `UNIQUE(claim_key, supersedes)`；⚠️ **实现刻意加了 UPDATE/DELETE 双 append-only 触发器**——见 §2.17 的裁决 |
+| `proposal_runs` | T-105 | **"这个单元在本配置下跑过没有"**——降级单元**没有 claim 但跑过了**，没有这张表就无法区分，会导致降级单元每次重跑都被重复调用模型。`UNIQUE(unit_id, plan_digest)`，append-only 双触发器。契约值见 §2.17 |
+| `cognition_store_meta` | T-105 | 认知域的元数据（照 T-103 `raw_store_meta` 先例），`key`/`value` 两列，记 `schema_version` |
 | `confirmed_labels` | T-108 | 人工标签（**Confirmed，只增不改**） |
-| `evidence_spans` | T-107 | 证据锚点索引（如需；真值仍在 `raw` 偏移上） |
+| `evidence_spans` | T-107 | 证据锚点索引（如需；真值仍在 `raw` 偏移上）。⚠️ **截至本轮仍未创建**（T-107 未落地），因此它是一个**已登记但尚不存在**的表名 |
 | `search_meta` / `search_documents` / `search_documents_fts`（+ FTS5 影子表 `search_documents_fts_{data,idx,content,docsize,config}`） | T-205 | 检索索引（**派生物**：可整体 `drop` 后由 raw 全量重建；**刻意不加 append-only 触发器**——加触发器与"可删除重建"自相矛盾） |
 
 **命名要求**：跨域共用 DB 的表名必须带领域前缀（如 `registry_`），避免语义误导与后续静默冲突。
@@ -717,6 +717,175 @@ T-105 做批量分类时必须先量这个数字再决定是否关推理 / 换�
 
 ---
 
+### 2.17 认知层（Proposed）的契约值（T-105）
+
+与 §2.11 / §2.12 / §2.13 / §2.15 / §2.16 同一性质：**默认值不写进文档就等于没有默认值**。
+`f778877` 只登记了"两张新表存在"，**表结构、幂等键、原因码闭集、批量上限都没登记** ——
+本节把它补齐。**契约值的唯一事实来源仍然是本文件。**
+
+包 `src/atlas/cognition/`（`classify.py` 分流、`propose.py` 调用与归属、`store.py` 持久化）。
+**端口是 `CognitionPort`，PI 只是它的一个适配器**（§2.14）。
+
+#### 常量
+
+| 项 | 值 |
+|---|---|
+| 库文件 | `data/store/atlas.db`（与其它域共用，§2.10） |
+| 本域 `SCHEMA_VERSION` | `1`（记在 `cognition_store_meta.schema_version`；**不符即响亮失败**，不做静默兼容） |
+| 表名 | `proposed_claims` / `proposal_runs` / `cognition_store_meta` |
+| `CLAIM_KEY_PREFIX` | `pcl_`（`pcl_` 是本层**表格行身份**；与契约里的 `clm_`、T-130 的 `ent_`、`art_` 分属不同身份空间） |
+| `KIND_INDUSTRY` | `industry`（与 `confirmed_labels.label_key` 同一语义，§2.5 闭环） |
+| `BATCH_MAX_UNITS` / `BATCH_MAX_CHARS` | **4** / **6000**（两条上限**先到者生效**；实测标定，见下） |
+| `UNIT_TEXT_MAX_CHARS` | **2000**（单单元文本截断上限；**截断位置参与 `unit_digest`**） |
+| 单元 ID 前缀 | 文章级 `art_` + 32 hex（`ARTICLE_ID_RE`）；feed 条目用 T-130 的 `ent_` |
+| 批次 / 运行账 ID | `batch_id = "bat_" + batch_key_for(raw_id, unit_ids)[:32]`；`run_id = "prun_" + stable_digest([unit_id, plan_digest])[:32]` |
+| `ProposalPolicy` 默认 | `max_units_per_call=4`、`max_chars_per_call=6000`、`kind=industry`、`include_link=True`、`source="t105-classify"`、**`max_retries=2`**、`retry_max_units_per_call=1`、`retry_shrink=True` |
+| 重试批次规则 | 第 `retry_count` 轮（0 = 首次）：`min(max_units_per_call, retry_max_units_per_call)`，`retry_shrink` 时再 `// 2**(retry_count-1)`，**下界 1** |
+| `ProposalPolicy.fingerprint()` | `sha256("max_units|max_chars|kind|include_link|max_retries|retry_max_units|retry_shrink")[:32]`（**进配置指纹**：批次策略改变模型看到的输入） |
+
+> **为什么是 4 / 6000（实测标定，不是拍的）**：边车**每次调用**的启动开销约 4.5 s（drvfs）且与单元数无关
+> ⇒ 固定成本按**调用次数**计，塞得越多越省；但 `deepseek-flash` 是推理型，实测单次 reasoning token
+> 常达 1000–2000，而单次输出预算是**配置值**（`CognitionConfig.max_output_tokens` 默认 **2048**，
+> 实测经 `max_completion_tokens` 真正生效），一批 5–10 个长单元时 `empty_completion` 明显增多。
+> 两条合起来 ⇒ **中等批量 + 有界重试**，而不是"越大越好"。
+> 改这两个数字**必须重跑** `tools/t105_real_evidence.py`。
+
+#### 幂等键与摘要（公式是契约的一部分）
+
+```
+claim_key    = "pcl_" + sha256(raw_id ␟ unit_id ␟ kind ␟ value ␟ quote ␟ status ␟ reason)[:32]
+output_digest= sha256(json({value, quote, confidence(round 6), status, reason}, sort_keys, ensure_ascii=False))
+plan_digest  = stable_digest([unit_digest, code_version, config_version, model_version, label_space_version])
+```
+
+- ␟ 是**字段分隔符**（`0x1f`），`stable_digest` 逐字段追加分隔符——因此 `"ab"+"c"` 与 `"a"+"bc"` **不相撞**。
+- **两张表的幂等键刻意不同**（这是 `proposal_runs` 必须存在的理由）：
+
+| 表 | 回答 | 幂等键 | 重复写入的语义 |
+|---|---|---|---|
+| `proposed_claims` | 这个单元产出了**什么** | 行身份 `claim_key` + 内容指纹 `output_digest` | 同 `(claim_key, output_digest)` 已存在 ⇒ **无变化**，返回既有行，**版本不推进**；输出不同 ⇒ **追加新版本** |
+| `proposal_runs` | 这个单元跑过没有、花了多少 | `(unit_id, plan_digest)` | 已存在 ⇒ **无变化**，不重复调用模型 |
+
+- `output_digest` **刻意不含** `created_at` / `elapsed_ms` / token 数——重跑时刻不同不代表产出不同；
+  `confidence` **参与**（模型给出不同置信度就是不同输出 ⇒ 新版本，旧版本保留）。
+- `plan_digest` **刻意不含**模型延迟 / token——那些是运行观测，不是计划的一部分。
+- **`unit_id` 必须参与 `claim_key`**：否则同一条 quote 出现在同一 raw 的两个条目里时，
+  两条**不同条目**的证据会塌成同一个 id，而它们指向**不同的原文区间**（锚点会跟着塌）。
+
+**版本链语义**：`version` 是**每条 `claim_key` 自己的单调版本**（从 1 起），
+`supersedes` 是它取代的那一版，**首版为 `0` 而不是 `NULL`**
+（`NULL` 在唯一索引里互不相等，会让"同一身份只允许一个首版"这条约束失效）。
+不变量：`CHECK (supersedes < version)`、`UNIQUE(claim_key, supersedes)`、`UNIQUE(claim_key, version)`。
+
+#### `status` 闭集与 CHECK 约束
+
+| `status` | `value` | `quote` | `confidence` | `reason` | 含义 |
+|---|---|---|---|---|---|
+| `classified` | **必非空** | **必非空** | **必非空且在 [0,1]** | **必须为空** | 正常分类（§2.5 闭环取值） |
+| `unclassified` | 必须为空 | 必须为空 | 必须为空 | **必非空** | **降级**：模型不可用（§2.14 决策四） |
+| `unattributed` | 可以存在 | **必须为空** | 必须为空 | **必非空** | 审计行：模型说了什么，但 quote 归不到**恰好一个**单元（**不得当证据**） |
+| `out_of_space` | 可以存在 | **必须为空** | 必须为空 | **必非空** | 审计行：取值落在**当前标签空间之外** ⇒ **不计入**分类结果（§2.5 的 C8 闭环在存储层强制） |
+
+> 这四条由 `CHECK` 在**存储层**强制，不是靠调用方自觉。
+> `classified` 必须有 `quote` ⇒ §2.2"证据锚点是真值"在 Proposed 层就成立。
+> `unattributed` / `out_of_space` 的 `quote` 必须为空 ⇒ 它们**在物理上不可能**被当成证据使用。
+
+`proposal_runs.status` 的闭集 = 上面四个 **+ `skipped`**。
+
+#### 原因码（**两个闭集，刻意不重叠**）
+
+| 层 | 闭集 | 取值 |
+|---|---|---|
+| T-003 降级原因（`DegradeReason`，§2.14） | 7 | `unreachable_model` / `timeout` / `http_error` / `model_deprecated` / `empty_completion` / `unparseable_output` / `sidecar_error` |
+| **T-105 本层原因** | 4 | `no_claim_extracted` / `unattributed_quote` / `label_out_of_space` / `retry_exhausted` |
+
+- 值域**刻意不重叠**：避免把"模型不可用"与"模型说了但没有可归属的输出"混成一类。
+- **可重试**（`RETRYABLE_REASONS`，6 个）：`timeout` / `empty_completion` / `unparseable_output` / `unreachable_model` / `http_error` / `sidecar_error`
+- **不可重试**（`PERMANENT_REASONS`）：`model_deprecated`（重试一万次也是同一个结果，只会烧钱）
+- 实证依据：失败是**瞬时**的（同一份输入重跑常常成功），因此必须有界重试；而重试必须**缩到单单元**。
+
+#### 归属规则（"某一条没返回"如何记账——不得静默丢）
+
+归属**不依赖模型输出任何 ID**（输出契约是冻结的 `{kind, value, quote, confidence}`，加字段即契约违例）。
+模型只给 `quote`，系统做**确定性匹配**（§2.2 的同一条分工）：恰好命中**一个**单元 → 归属它；
+命中**零个**或**多个** → **不猜**，记为 `unattributed` 行。
+
+批次里**每个**单元都必须有一行结果：
+
+| 情形 | 落库 |
+|---|---|
+| 单元被赋予 ≥1 条 quote | 每个标签一行 `classified` |
+| 单元一条 quote 都没有 | 一行 `unclassified` + `no_claim_extracted` |
+| 整批降级（模型不可用） | **每个**单元一行 `unclassified` + 该批的降级原因码 |
+| 归属不了的 quote | 一行 `unattributed`（不丢，也不硬塞给某个单元） |
+| 取值在标签空间之外 | 一行 `out_of_space`（记下模型说了什么，**不计入**分类结果） |
+| feed 里没有可分类内容 | 由 `classify` 判为 `skipped` + 理由码（`SkipReason` 闭集，**不进本层**） |
+
+对账恒等式在 `ProposalOutcome.__post_init__` 里**强制**（不满足即抛，不是告警）：
+`attributed_claims + unattributed_claims == extracted_claims`、`units_run == classified_units + unclassified_units`。
+`out_of_space` 行既不是 claim 也不是单元，单独计在 `rows_out_of_space`。
+
+**分流（`classify.py`）的判据是看内容，不看 `endpoint`**（§2.16 明确 `endpoint` 有双语义）：
+
+| 顺序 | 判据 | 结论 |
+|---|---|---|
+| 1 | `parse_entries` 成功且条目数 ≥1 | **是 feed** ⇒ 单元 = 条目（`unit_kind=entry`） |
+| 2 | `parse_entries` 成功但 0 条 | 跳过，`empty_feed` |
+| 3 | `EntryParseError`，内容以 `{`/`[` 开头 | 跳过，`unsupported_content_json` |
+| 4 | `EntryParseError`，内容以 `<!doctype html`/`<html` 开头 | 跳过，`unsupported_content_html`（**不做 HTML 正文抽取**：那等于给错误页编一篇正文） |
+| 5 | 其它（纯文本 / 非良构 XML） | **整篇即一个单元**（`unit_kind=article`） |
+
+`SkipReason` 闭集 5 个：`unsupported_content_json` / `unsupported_content_html` / `unsupported_content_xml` / `empty_feed` / `empty_content`。
+`EntryParseError` **绝不被 catch 成"0 个条目"**——"不是 feed"与"feed 是空的"是两件不同的事。
+
+**给模型的单元文本是确定性纯函数**：`text = reduce(title) + "\n\n" + reduce(entry_text)`，
+`reduce` = 解实体 → 按空白切词再单空格拼回（与 `atlas.entries.sanitize_for_quote` 同一口径）。
+因此"模型看到的文字"与"折回单元的判据所用文字"**是同一份**，`unit_digest` 就是它的指纹
+⇒ 换 reduce 规则必然改变幂等键，**不会**出现"文本变了但幂等键没变"。
+
+#### 索引与触发器
+
+- 索引 7 个：`proposed_claims` 上 5 个（`raw_id` / `unit_id` / `status` / `(code_version, config_version, model_version)` / `batch_id`）、`proposal_runs` 上 2 个（`unit_id` / `batch_id`）。
+- 触发器 4 个：两表各 `BEFORE UPDATE` + `BEFORE DELETE`，理由文本含 `append-only`。
+
+> ⚠️ **一处与 §2.10 原文的偏离，在此显式裁决**：§2.10 原写 `proposed_claims`
+> "**刻意不加** append-only 触发器……加触发器与'可覆写'自相矛盾"。
+> **实现加了这两个触发器**，且这是**对的方向**——因为"可覆写"在 Proposed 层的正确表达
+> 从来不是就地 `UPDATE`，而是**追加新版本 + 保留版本链**（§2.3 的四条不变量里
+> Proposed 是"可覆写"，而 T-107/T-108 的 `(claim_id, claim_version)` 早已是同一纪律）。
+> 就地 `UPDATE` 会**销毁版本痕迹**，那才真正违背 §3 的"版本化"。
+> ⇒ 本节的表述取代 §2.10 那一句：**`proposed_claims` 与 `proposal_runs` 都是 append-only**，
+> "可覆写"由新增版本行实现。这与 §2.13"存储层可严于契约，单向"同一先例。
+
+#### T-105 在真实 store 上的实测产出（2026-09-26，主代理独立复核）
+
+| 项 | 实测值 |
+|---|---|
+| `proposed_claims` | **24 行**，`status` 分布 `unclassified=20` / `classified=4` |
+| `proposed_claims` 行身份 | **24 行 / 24 个不同 `claim_key`，全部 `version=1`、`supersedes=0`** ⇒ **尚无版本链分叉**（版本链机制存在但未被行使） |
+| `proposal_runs` | **23 行**，`unclassified=20` / `classified=3` |
+| 未分类原因分布 | `timeout` = **13**、`no_claim_extracted` = **7** |
+| 版本三元组（实际写入值） | `code_version=cognition-extract-prompt/1`、`config_version=cognition-config/1`、`model_version=deepseek-flash` |
+| 标签空间版本 | `cfg-v0007-39f0540a983e#2303895ae70154a921ccf07122d2405e`（§2.5 闭环：来自配置） |
+| provider / model / 凭据路由 | `deepseek` / `deepseek-flash` / `deepseek@api.deepseek.com#b8faa230739d2fa8`（**记录路由，不记录密钥**） |
+| token / 调用 | runs 合计 **input 2004 / output 3886 / reasoning 3471**；`calls=23`、`batches=22`、`Σ elapsed_ms=181042`、**`max_batch_size=2`** |
+
+**两条必须记住的实测事实**
+
+1. **`timeout` 的 13 行是真实失败残留，不是污染，也不可删除**。
+   它们落在 **13 个互不相同的单元**上（10 个 `ent_*` 条目 + 3 个 `art_*` 文章），
+   **不是**同一个单元被重复写入 ⇒ 这 13 行正是 `retry_exhausted` 的实物凭证
+   （`retry_count=2` = `max_retries=2` 已被用尽）。
+   单次 `elapsed_ms ≈ 11.4–11.6 s`，而 `DEFAULT_TIMEOUT_SECONDS = 60.0` ⇒ **耗时本身远小于超时阈值**；
+   成因指向**推理 token 吃掉输出预算**（§2.14 决策三已量到 output 被推理放大 5–25 倍），
+   而不是网络慢。**这表明当前配置下分类器的产出率很低**，是下一阶段要先量的数字。
+   Confirmed 与 Proposed 都是 append-only ⇒ 这些行**按设计删不掉**，只能作为审计事实留在库里。
+2. **批量实际退化到了 1–2**（`max_batch_size=2`、22 个 batch 多为 `batch_size=1`），
+   远低于 `BATCH_MAX_UNITS=4` 的配置。这既解释了调用次数偏高，
+   也说明"上限是 4"与"实际能用 4"是两件事——**上限是配置，退化是观测**。
+
+---
+
 ## 3. 任务规范（引擎可替换的前提）
 
 ```
@@ -757,6 +926,7 @@ T-105 做批量分类时必须先量这个数字再决定是否关推理 / 换�
 | `src/atlas/compose/` | T-120 | **组合根**：把各包接成一条可运行的流水线 |
 | `src/atlas/search/` | T-205 ✅ | 全文检索（FTS5/BM25）+ 排序/高亮；**只读投影，索引可全量重建** |
 | `src/atlas/chunk/` | T-206 ✅ | 分块（纯函数、可重建）；**分块 ID 是派生物，永不作人工产物锚点** |
+
 
 **规则（2026-09-26 修订）**：一个包只由一个任务负责；跨包 import **只允许指向自己在 §4.5 DAG 中的上游**（生产者），外加 `atlas.contracts` 与 `atlas.registry.schema`。
 **禁止**：兄弟包互相 import、被下游 import（成环）、import 别人的实现细节。这让同一波次的子代理可以安全并行。
@@ -805,6 +975,7 @@ T-105 做批量分类时必须先量这个数字再决定是否关推理 / 换�
 | **T-120** | **端到端集成与接线（组合根）** | **M** | T-102,103,104,106,108,110,101 | 把各包接成**一条可运行的流水线**，并用**真实数据**跑通一次：采集 → 归档 → 归一化 → feed → 打标 |
 | **T-130** | **条目化派生层（feed → 条目）** | **L** | T-103, T-104 | 把一份 feed 拆成**条目**（标题 / 链接 / 时间 / 正文区间）；**纯函数、可重建、带解析器版本**；条目 ID 是**派生**量，**永不作人工/证据锚点**，但必须暴露 §2.2 的真值形状 `(raw_id, raw_sha256, char_start, char_end)`（见 §6.3 裁决 B） |
 | **T-131** | **旧语料导入** | **M** | T-103 | 把旧系统 `data/raw/**/*.json` 按篇导入 `data/store/raw/`（当作新 Raw 写入并生成版本）；内容寻址自然收敛；**不得迁移任何人工标签**（§2.4）；见 §5 登记 #12 |
+| **T-207** | **最小调度器（按 `interval_seconds` 只采到期的渠道）** | **S** | T-101, T-103（状态源） | 纯函数判"这一轮到没到" + 组合根/CLI 接线 + 系统 cron。**不新建表、不建常驻进程**；状态取自 `raw_records.fetched_at` 的 `MAX`。闭合 §6.7 的第四个缺口 |
 
 > **T-120 为什么必须存在**：DAG 原先只把包一个个建起来，**没有任何任务负责把它们接起来**。归档基线正是这样失败的——25,937 行代码、四层齐备的模块与文档，而端到端数据流一步没通。SPEC 硬规则 1（"完成必须能用**跑通的数据流**证明"）要求系统级证据，而不只是模块级测试。
 
@@ -855,7 +1026,13 @@ T-104→T-105      T-104→T-106      T-104→T-107
 T-003→T-105
 T-105→T-107
 T-106→T-109      T-108→T-109      T-107→T-109(增强)      T-108→T-112
+T-101→T-207      T-103→T-207
 ```
+
+> **T-207 的边为什么是 T-101 与 T-103**：它读**配置**（`interval_seconds`，来自 T-101）
+> 与**归档事实**（`raw_records.fetched_at`，来自 T-103），两者都是它的上游生产者。
+> 它**不 import** `atlas.collect` / `atlas.compose`（接线由组合根做），也**不被**它们 import 成环：
+> 组合根（T-120）import 它是"组合根 import 各包"，不是包间依赖。
 
 ### 4.6 路径
 
@@ -1243,6 +1420,9 @@ T-131 导入的是**旧系统当年按篇存下来的东西**，所以进来就�
 
 四个 L2 任务**仍未触发**，但复审暴露了**两件比它们都重要的事**。
 
+> **本轮复审（2026-09-26 晚，T-105 交付之后）**：四个任务的结论**逐条重新审过，没有沿用上一轮的判断**，
+> 结论**仍然全部未触发**——但**理由变了，而且变得更硬**。详见本节末尾的"§6.5 补记"。
+
 | 任务 | 触发条件 | 复审结论 |
 |---|---|---|
 | T-112 本体与标签空间生长 | 由标注数据反向扩展 | ⛔ **未触发**：真实人工标签 **0 条**（只有主代理那条 `actor=e2e-verify` 探针） |
@@ -1251,7 +1431,7 @@ T-131 导入的是**旧系统当年按篇存下来的东西**，所以进来就�
 | T-203 多用户与权限 | 第二个真实用户出现前 | ⏸️ 承诺未兑现，但**代价实测很低**（见 §5 #10） |
 
 **① 语料规模已经超过"人工浏览"了。**
-真实条目数是 **895**（830 派生 + 65 直接，见 §6.3），**不是 75**。
+真实条目数是 **897**（830 派生 + 67 直接，见 §6.3；本节原写 895，是 §6.3 已更正过的旧数），**不是 75**。
 §5 #11 给 T-205 的触发条件正是"数据量超过人工浏览"——这条**现在成立**，
 说明 T-205（FTS 检索与排序）不只是提前做了，而是**已经变成必需品**。
 ⇒ **排序与筛选的质量从现在起真的重要了**（尽管 T-201 的*语义*检索仍未被证明需要）。
@@ -1270,6 +1450,38 @@ T-131 导入的是**旧系统当年按篇存下来的东西**，所以进来就�
 > 用户才会产出第一条真实标签，§1.3 的闭环才可能启动。
 > 在此之前，T-112 / T-202 这类"从标注数据生长"的任务**永远等不到触发条件**。
 
+#### §6.5 补记（2026-09-26 晚，T-105 交付之后的**重新**复审）
+
+上面那句"下一个瓶颈是人"**已经兑现了一半、也失手了一半**，必须如实记下：
+
+| 当时的预期 | 实际发生 |
+|---|---|
+| T-109 把条目接进前端 ⇒ 界面"能看懂、能打标" | ✅ **已交付**（`65aaadf`）：`python -m atlas.webapp` 一条命令起服务，按条目渲染，可一次点击打标 |
+| 于是用户会产出**第一条真实标签** | ❌ **没有发生**：真实人工标签**仍然是 0 条**（`confirmed_labels` 共 2 行，两行都是探针：`e2e-verify` 与 `e2e-t109`） |
+| 界面是那个卡点 | ❌ **判断错了**：界面已经通了，卡点**不在代码里**——它在"有没有人去用" |
+
+**这一次我不能再把结论写成"下一个任务是把界面做好"**——界面已经做好了。
+把"没有人打标"继续归因于某个待做的任务，是**逃避**：§1.3 的核心策略
+（由标注数据反向回答"什么信息有效"）要求的是**真的去打标**，而这是一个**人的动作**，
+不是再派一个子任务能解决的。
+
+⇒ **本轮的准确结论**：T-112 / T-201 / T-202 / T-203 **仍未触发**，而且
+**在出现真实人工标签之前，T-112 与 T-202 的触发条件不可能到达**（这不是"还没轮到"，是"结构上等不到"）。
+唯一能解锁它们的动作是**在已可用的界面上真的打标**。
+
+**第四个同类实例（本轮新发现，与 §6.6 那三条同类）**
+
+T-105（机器分类）交付后，我把"机器的分类结果"与"人的标注"摆在一起看，得到一个必须写明的事实：
+
+> **机器提议（24 行 `proposed_claims`）不能替代人工标注。**
+> §1.3 的留白是"**什么信息是有效的**"，而 `proposed_claims` 回答的是"这条属于哪个行业"。
+> 前者是**判断**，后者是**归类**——它们不是同一个问题。
+> 把 `proposed_claims` 的行数当作"有标注数据了"，正是 §7.3"用静态产物包装进度"的形态。
+
+而且 T-105 的实测产出率**很低**：24 行里 20 行是 `unclassified`（**83%** 未分类），
+其中 13 行是 `timeout`（§2.17 有完整数字）。**因此即便有人愿意用机器结果，现在也不够用。**
+这解释了为什么"AI 环"走通之后，§1.3 的闭环**一步都没有前进**。
+
 **③ 复审中发现的第三个同类实例：这个项目根本没法启动 Web UI**
 
 查证（2026-09-26）：全仓只有**一个** `__main__.py`，是 `src/atlas/compose/__main__.py`（跑采集流水线）。
@@ -1283,15 +1495,16 @@ T-131 导入的是**旧系统当年按篇存下来的东西**，所以进来就�
 
 ### 6.6 一个反复出现的模式：**"任务做完了" ≠ "系统能用了"**
 
-本项目的这一点值得单独记下来，因为它已经出现**三次**，而且每次都是主代理复核时才发现的：
+本项目的这一点值得单独记下来，因为它已经出现**四次**，而且每次都是主代理复核时才发现的：
 
 | # | 现象 | 当时的状态 |
 |---|---|---|
 | 1 | feed 页只显示 `raw_id` / 渠道 / 字节数，**看不出"这是什么"** | T-109 标记为已交付 |
-| 2 | 8 条 feed-Raw 是**容器**，却被当成 8 条内容（真实条目 895 不是 75） | T-130/T-131 都已交付 |
+| 2 | 8 条 feed-Raw 是**容器**，却被当成 8 条内容（真实条目 **897** 不是 75） | T-130/T-131 都已交付 |
 | 3 | **没有任何命令能启动 Web UI** | T-109 标记为已交付 |
+| 4 | 一个"活对照"**从未提交**，所以它对"接线是否正确"什么都没证明 | T-131 的判据被 T-105 复核时仍判为"通过" |
 
-三次的共同点：
+四次共同点：
 - 每个任务**自己的判据都满足了**（有文件、有测试、有真实数字）；
 - 但**把系统端到端当成一个用户会用它的东西**来看，就还差一步；
 - 而这一步**没有任何单个任务**在负责。
@@ -1300,6 +1513,38 @@ T-131 导入的是**旧系统当年按篇存下来的东西**，所以进来就�
 > 这边是"每一步都通了，但拼起来还不可用"。
 > **对应的做法**：主代理必须定期以"**用户照着一条命令能不能用**"为判据复审，
 > 而不是逐个核对任务的判据清单。前者才是 §1.4 成功信号的真实形态。
+
+#### 第 4 条：一个"不会失败的活对照"（主代理本轮独立实测）
+
+`tests/test_migrate_realdata.py::test_real_raw_records_are_still_append_only_with_live_controls`
+自称有"活对照"（硬规则 4 要求："断言 X 被拒绝时，同一路径对合法输入必须成功"）。
+**它的活对照是假的**：那句"合法 `INSERT` 必须成功"插入的行**从未提交**。
+
+成因是 `sqlite3` 的一个默认行为：`sqlite3.connect(path)` 的 `isolation_level` 默认是 `""`
+（不是 `None`），此时 **DML 会自动开启一个隐式事务**，而测试里没有 `commit()`；
+`close()` 会把未提交事务**回滚**。于是：
+
+| 检查（主代理在**副本**上实测，真实库未动） | 结果 |
+|---|---|
+| 测试断言的那句（同一连接内 `COUNT(*) == count + 1`） | **True** —— "通过" |
+| `connection.in_transaction` | **True**（确实开着事务） |
+| **另开一个连接**看得见这一行吗 | **False** |
+| `close()` 之后，另一个连接看得见吗 | **False** |
+| 行数（外部连接口径） | 75 → **75**（**没变**）⇒ INSERT 从未提交 |
+| 活对照 + `isolation_level=None`（autocommit）后跨连接 | 75 → **76**，**可见** ⇒ 这样写才是真的活对照 |
+
+⇒ **同一连接的 `COUNT(*)` 只证明"它看得见自己未提交的写"，与"触发器是否生效"无关。**
+（`git show --name-only` 之外的一条独立佐证：真实库 `raw_records` 至今是 **75** 行、
+`channel_id LIKE 't131%'` 的探针行 **0 条**——这个测试跑过多次，一次都没留下 `t131-probe`。）
+
+**精确的结论（不能夸大）**：这个测试**整体仍然有效**——把副本里 `raw_records` 的两个
+append-only 触发器删掉后，它会以 `DID NOT RAISE DatabaseError` **失败**，
+所以 `UPDATE` / `DELETE` 那两条否定断言是真的在验证东西。
+**失效的是"活对照"这一半**：它无法证明"合法写入真的能成功"，
+而这正是硬规则 4 加那条要求的原因。**一个不会成功的对照，和一个不会失败的测试一样没有价值。**
+
+> 修法明确（一行级）：那句 `INSERT` 必须在一个 `isolation_level=None` 的连接上做，
+> **并由另一个连接**确认可见，再断言 `append-only` 的拒绝。
 
 ---
 
@@ -1340,11 +1585,28 @@ T-131 导入的是**旧系统当年按篇存下来的东西**，所以进来就�
 **与 §1.5 的冲突**：§1.5 写"运行形态：**永不停歇的在线服务**"、使用频率"约每天一次"。
 现状是：服务**启动不了**（§6.6 第 3 条），就算启动了也**不会自己采集**（本条）。
 
-> **待决**：是补一个最小调度器（例如基于 T-110 的 `TaskRunner`，
-> 按 `interval_seconds` 决定"这一轮该采哪些渠道"，再配一个常驻循环或交给系统 cron），
-> 还是把"每天手工跑一次"明确写进 §1.5 作为可接受的运行方式？
-> **在裁决之前，`interval_seconds` 应当被视为"已配置但无效"**——
-> 不能让一个看起来有意义的配置项继续悄悄不起作用。
+> **✅ 已裁决（2026-09-26，用户批准）：补一个最小调度器，不由 cron 之外的常驻循环承担。**
+> 落地任务 **T-207**（见 §4.2）。裁决内容与理由：
+>
+> 1. **调度 ≠ 编排**（本节第 4 条已区分）：本项**不是**把 T-204 的编排引擎重新打开——
+>    T-204 关的是"一次多步依赖怎么跑"，本项是"什么时候再跑一次"。T-110 的 `TaskRunner` 仍然是执行者。
+> 2. **触发者用系统 cron**，不新增常驻进程、不新增常驻状态：cron 每 5 分钟调一次
+>    `python -m atlas.compose run --only-due`，由流水线自己按 `interval_seconds` 判"这一轮该采哪些渠道"。
+>    §1.5 的"永不停歇的在线服务"因此由**两件已存在的东西**组成（Web UI 常驻 + cron 定时），
+>    而不是一个新的守护进程。
+> 3. **`interval_seconds` 从"已配置但无效"变成真正的判据**，且判据落在**它自己的语义**上：
+>    它是**轮询周期**（§2.12），因此只能决定"这个渠道这一轮到没到"，**不得**再被当成同域请求间隔
+>    （§2.12 已明确那是 `rate_limit_seconds` 的职责）——`throttle.min_interval_for()` 的取值规则**不动**。
+> 4. **"到期状态"不新建表、不新建状态文件**：它可以从**已有的** `raw_records.fetched_at`
+>    按渠道取 `MAX` 算出来（Raw 是 append-only 的事实来源，本来就要留着）。
+>    §2.10 的"新增表必须先登记"因此不被触发。
+> 5. **两层职责必须分开报，不能混成一个"成功"**：调度层决定"**尝试**哪些渠道"，
+>    执行层的幂等（同渠道配置 + 同窗口 id ⇒ 跳过）决定"**是否真的采**"。
+>    默认窗口是 **UTC 小时桶**（`parse_window`），其下限大于任何合法 `interval_seconds`（≥60s），
+>    因此同一小时内一个已到期的渠道**可能被判为 due 但实际跳过**。这是**有意的失败安全**，
+>    不是缺陷；但必须**显式报告**，否则又会变成 §7.3 失败模式 3（静默失效）。
+>
+> ⚠️ **仍然成立的一条**：在 T-207 落地**之前**，`interval_seconds` 是"已配置但无效"的。
 
 ---
 
