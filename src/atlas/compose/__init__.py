@@ -32,6 +32,15 @@ collect ──▶ archive ──▶ normalize ──┬──▶ feed
         report.result("feed").output.artifacts["identity"]["items"]
 
 真实抓取默认关闭（CLI 要求 `ATLAS_LIVE=1`，见 `atlas.compose.cli`）。
+
+T-207 追加：调度（哪些渠道到期了）
+---------------------------------
+
+`Pipeline.due_decision()` 用 `atlas.schedule` 按 `channel.interval_seconds` 判定本轮
+该试哪些渠道；`Pipeline.run(due_only=True)` 只注册到期的渠道（**默认关闭**，
+`False` 时行为与 T-120 完全一致）。"一个可采集渠道都没有"（配置问题，响亮失败）与
+"有渠道但都还没到期"（正常，`DueDecision.is_idle`）被**显式分开** —— 后者不是错误，
+CLI 以退出码 0 结束并打印说明。理由与 cron 示例见 `atlas.schedule` 的模块文档。
 """
 
 from __future__ import annotations
@@ -47,6 +56,7 @@ from .pipeline import (
     FileExecutionRecordStore,
     LabelAssignment,
     NodeInputs,
+    NothingDueError,
     Pipeline,
     PipelineConfig,
     build_pipeline,
@@ -79,6 +89,7 @@ __all__ = [
     "FileExecutionRecordStore",
     "LabelAssignment",
     "NodeInputs",
+    "NothingDueError",
     "Pipeline",
     "PipelineConfig",
     "build_pipeline",

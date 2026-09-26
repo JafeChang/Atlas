@@ -5,6 +5,25 @@ DAG（边方向：`A depends_on=[B]` ⇒ B → A）::
     collect ──▶ archive ──▶ normalize ──┬──▶ feed
                                         └──▶ label
 
+**T-207 的接线位置（调度器决定"采哪些渠道"）**
+
+调度不在图里，它在**图的入口**：`Pipeline.due_decision()` 用
+`atlas.schedule` 按 `channel.interval_seconds` 判断哪些渠道到期，
+`Pipeline.run(due_only=True)` 只把到期的渠道放进 `collect` 根节点的输入快照。
+因此链条是
+
+    interval_seconds →（atlas.schedule）→ 本轮渠道集合 → 输入快照 → 幂等键 → 是否真抓
+
+三条必须说清的边界：
+
+1. **默认关闭**：`due_only=False` 时行为与 T-120 完全一致（全部启用渠道）。
+2. **"没有到期的渠道"不是错误**：5 分钟一次的 cron 大多数轮次无事可做。
+   `due_decision()` 把"一个可采集渠道都没有"（配置问题 ⇒ `NoSchedulableChannelError`）
+   与"有渠道但都还没到期"（正常 ⇒ `DueDecision.is_idle`）**显式分开**；
+   `run(due_only=True)` 在后一种情形下抛 `NothingDueError`，由 CLI 翻译成"退出码 0"。
+3. **调度 ≠ 真的抓了**：窗口（默认 UTC 整点小时桶）没变，因此同窗口内被调度到的渠道
+   仍会被幂等跳过。调度器只保证"该试的会去试"（见 `atlas.schedule` 的模块文档）。
+
 为什么这样接线
 --------------
 
@@ -41,6 +60,7 @@ import json
 import os
 from collections.abc import Iterator, Mapping as MappingABC
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
@@ -54,6 +74,12 @@ from atlas.runner import (
     RunReport,
     TaskGraph,
     TaskRunner,
+)
+from atlas.schedule import (
+    DueDecision,
+    LastCollectionSource,
+    evaluate_schedule,
+    open_last_collection_source,
 )
 
 from .tasks import (
@@ -79,6 +105,7 @@ __all__ = [
     "FileExecutionRecordStore",
     "LabelAssignment",
     "NodeInputs",
+    "NothingDueError",
     "Pipeline",
     "PipelineConfig",
     "build_pipeline",
@@ -89,6 +116,29 @@ NODE_ARCHIVE = "archive"
 NODE_NORMALIZE = "normalize"
 NODE_FEED = "feed"
 NODE_LABEL = "label"
+
+
+class NothingDueError(PipelineError):
+    """due-only 模式下**一个渠道都还没到期**。
+
+    这是**正常状态**（5 分钟一次的 cron 大多数轮次都如此），不是失败：
+    CLI 把它渲染成一行说明并返回退出码 0。把它做成异常而不是"返回空报告"，
+    是为了让"没有工作"这件事在**类型上**与"跑完了一份工作"区分开 ——
+    绝不用一份看起来成功的空报告假装发生过采集。
+
+    它继承 `PipelineError`（"本层配置 / 输入不接受"的家族），但与
+    `PipelineError` 的**裸实例**语义相反：裸 `PipelineError` 表示配置问题（退出码 1），
+    `NothingDueError` 表示正常空闲（退出码 0）。CLI 因此必须先 `except NothingDueError`，
+    再 `except PipelineError`。
+    """
+
+    def __init__(self, decision: DueDecision) -> None:
+        self.decision = decision
+        super().__init__(
+            f"没有到期的渠道（可采集 {decision.enabled_channels} 个，全部未到期；"
+            f"now={decision.now.isoformat()}）：这是正常状态，不是失败"
+        )
+
 
 #: 节点声明顺序即"同层相对顺序"，因此拓扑序可复现。
 DEFAULT_NODES: Tuple[str, ...] = (
@@ -491,12 +541,59 @@ class Pipeline:
         """本轮将要采集的渠道（启用渠道 × 启用行业，SPEC §2.9）。"""
         return tuple(self.registry.fetchable_channels())
 
-    def plan(self) -> Dict[str, Any]:
-        """干跑：打印将要执行的 DAG 与本轮渠道，**不采集、不落盘**。"""
+    # ------------------------------------------------------------------
+    # 调度（T-207）：哪些渠道到期了
+    # ------------------------------------------------------------------
+    def due_decision(
+        self,
+        *,
+        now: Optional[datetime] = None,
+        last_collected: Optional[Mapping[str, datetime]] = None,
+        source: Optional[LastCollectionSource] = None,
+    ) -> DueDecision:
+        """按 `channel.interval_seconds` 判定本轮该采哪些渠道（**纯判定 + 只读状态**）。
+
+        Args:
+            now: 注入的当前时刻（naive 按 UTC 解释）。缺省 = `datetime.now(UTC)`；
+                测试与 cron 之外的调用都应当显式注入，判定才可复现。
+            last_collected: 显式给出的状态（测试 / 上游已读好时用）；给了它就不再读盘。
+            source: 只读状态源；缺省从 `<store_root>/atlas.db` 打开（**只读**）。
+
+        Returns:
+            `DueDecision`（见 `atlas.schedule`）。**一个渠道都没有时返回空判定**
+            （`enabled_channels == 0`）：`plan` 是对任意状态都成立的只读查询，
+            空注册表也该能打印出来。至于"空注册表不许跑"这条纪律，由
+            `run(due_only=True)` 显式执行（它把空判定转成本层的 `PipelineError`）
+            ——那里才是"真的要做采集"的入口。
+        """
+        channels = self.registrations()
+        moment = now if now is not None else datetime.now(timezone.utc)
+        if moment.tzinfo is None:  # 与 `atlas.schedule` 同一条规则：naive 按 UTC 解释
+            moment = moment.replace(tzinfo=timezone.utc)
+        else:
+            moment = moment.astimezone(timezone.utc)
+        if not channels:
+            # 没有渠道 ⇒ 没有东西可判定 ⇒ 不读 `atlas.db`（库缺失 / 损坏在这里不是错误，
+            # 但也绝不伪造出任何"到期渠道"）。`DueDecision` 因此如实是空的。
+            return DueDecision(now=moment, enabled_channels=0, schedules=(), due_ids=())
+        if last_collected is None:
+            reader = source or open_last_collection_source(self.config.root)
+            last_collected = reader.last_collected_at()
+        return evaluate_schedule(channels, last_collected, moment)
+
+    def plan(self, *, due_only: bool = False, now: Optional[datetime] = None) -> Dict[str, Any]:
+        """干跑：打印将要执行的 DAG 与本轮渠道，**不采集、不落盘**。
+
+        每个渠道额外给出 `interval_seconds` / `due` / `last_collected_at`（T-207）——
+        "这个源现在会不会被采"必须能一眼看出来，而不是靠操作者自己算间隔。
+        `due_only=True` 时另外给出完整的 `schedule` 块（含 `next_due_at`）。
+        """
         channels = self.registrations()
         industry_of = {channel.id: channel.industry_id for channel in channels}
         graph = self.build_graph(industry_of=industry_of)
-        return {
+        decision = self.due_decision(now=now)
+        schedules = {item.channel_id: item for item in decision.schedules}
+        payload: Dict[str, Any] = {
             "store_root": str(self.config.root),
             "config_version": self.registry.config_version,
             "code_version": COMPOSE_CODE_VERSION,
@@ -510,10 +607,20 @@ class Pipeline:
                     "industry_id": channel.industry_id,
                     "endpoint": channel.endpoint,
                     "type": channel.type.value,
+                    "interval_seconds": channel.interval_seconds,
+                    "due": schedules[channel.id].due,
+                    "last_collected_at": (
+                        schedules[channel.id].last_collected_at.isoformat()
+                        if schedules[channel.id].last_collected_at
+                        else None
+                    ),
                 }
                 for channel in channels
             ],
         }
+        if due_only:
+            payload["schedule"] = decision.as_dict()
+        return payload
 
     # ------------------------------------------------------------------
     # 执行
@@ -523,17 +630,56 @@ class Pipeline:
         *,
         window: Optional[str] = None,
         targets: Optional[Iterable[str]] = None,
+        due_only: bool = False,
+        now: Optional[datetime] = None,
     ) -> RunReport:
         """按拓扑序执行整条流水线。
 
+        Args:
+            window: 轮询窗口（见 `parse_window`）。
+            targets: 只跑这些节点及其先决条件。
+            due_only: T-207。`True` 时只注册**到期**的渠道（默认 `False`：全部启用渠道，
+                与 T-120 行为完全一致）。**同一个已有渠道集合不会被改动**，只是入口过滤。
+            now: 调度判定用的当前时刻（`due_only=True` 时才有意义；naive 按 UTC 解释）。
+                注入它是为了让"哪一轮采了哪些渠道"可复现。
+
         Raises:
             TaskFailedError: 某节点重试用尽仍失败（异常带 `partial_report`，**向上传播**）。
+            PipelineError: 一个可采集渠道都没有 —— **配置问题**，非零退出。
+            NothingDueError: `due_only=True` 且没有任何渠道到期 —— **正常状态**，
+                由调用方（CLI）翻译成"退出码 0 + 一行说明"。
         """
-        channels = self.registrations()
+        if due_only:
+            decision = self.due_decision(now=now)
+            if decision.enabled_channels == 0:
+                # "一个可采集渠道都没有"是**配置问题**，与"没有到期的渠道"完全不同。
+                # `due_decision()` 对空注册表返回空判定（`plan` 需要它），
+                # 但**真的要做采集**的入口必须把这件事响亮地说出来。
+                raise PipelineError(
+                    "注册表里没有可采集的渠道（启用渠道 × 启用行业 为空）："
+                    "这是**配置问题**，不是'这一轮没有到期的渠道'。"
+                    "先配置渠道（`python -m atlas.compose register ...`）再跑。"
+                )
+            if decision.is_idle:
+                raise NothingDueError(decision)
+            due_ids = set(decision.due_ids)
+            channels = tuple(
+                channel for channel in self.registrations() if channel.id in due_ids
+            )
+        else:
+            channels = self.registrations()
+            if not channels:
+                # 与 T-120 完全一致的语义（唯一变化：这句话现在只在"真的没有渠道"时说，
+                # "没有到期的渠道"走上面的 NothingDueError，不再伪装成配置错误）。
+                raise PipelineError(
+                    "注册表里没有可采集的渠道（启用渠道 × 启用行业 为空）："
+                    "先配置渠道再跑，绝不用空输入产出'成功'的空结果"
+                )
         if not channels:
+            # 不变量：上面两个分支各自保证了"渠道集合非空"，走到这里就是接线错误。
             raise PipelineError(
-                "注册表里没有可采集的渠道（启用渠道 × 启用行业 为空）："
-                "先配置渠道再跑，绝不用空输入产出'成功'的空结果"
+                "本轮渠道集合为空（due_only 过滤后仍不应为空）——这是接线错误，"
+                "绝不用空输入产出'成功'的空结果"
             )
 
         window_id, window_start = parse_window(window or self.config.window)

@@ -4,13 +4,29 @@
 
 | 命令 | 作用 | 需要联网？ |
 |---|---|---|
-| `plan` | 打印将要执行的 DAG 与本轮渠道（**干跑**） | 否 |
+| `plan` | 打印将要执行的 DAG 与本轮渠道（**干跑**），每个渠道附 `due` / `last_collected_at` | 否 |
 | `run` | 真实跑一次流水线（采集 → 归档 → 归一化 → feed → 打标） | 是（且需 `ATLAS_LIVE=1`） |
 | `register` | 往注册表里配一个行业 + 渠道 | 否 |
 
 **真实抓取默认关闭**：`run` 要求环境变量 `ATLAS_LIVE=1`，否则以退出码 2 明确拒绝
 （SPEC §2.12 的合规默认值是"不主动抓"，而不是"默默抓了"）。该模式下走的是
 `atlas.collect` 的真实实现，因此 robots 检查与同域限速**照常生效**，不存在旁路。
+
+**T-207 due-only 模式（默认关闭）**
+
+`run --due-only` / `plan --due-only` 只考虑 `channel.interval_seconds` 已到期的渠道
+（判定规则与系统 cron 示例见 `atlas.schedule` 的模块文档）。三种结局被显式区分：
+
+| 情形 | `run --due-only` | `plan --due-only` |
+|---|---|---|
+| 一个可采集渠道都没有 | 退出码 **1**（配置问题：`NoSchedulableChannelError`），响亮失败 | 退出码 **0**，JSON + 一行"没有可采集渠道（配置问题）"——只读查询对任何状态都成立 |
+| 有渠道但**都还没到期** | 退出码 **0**：**正常状态**，打印一行说明，什么都不做 | 退出码 **0**，`schedule.idle=true` |
+| 有渠道到期 | 照常跑；节点失败仍是退出码 1 | 退出码 0，列出到期渠道 |
+
+第二行是这里的重点：5 分钟一次的 cron 大多数轮次无事可做，把它算成失败会
+每小时报 11 次假故障。但也**绝不**用"报成功"假装采过 —— 输出里明确写"没有到期的
+渠道，本轮不采集"，而不是渲染一份空报告。第一行的两种退出码差异也是刻意的：
+"要采集"是一个动作（没有渠道就没法做），"看一眼计划"是一个查询（空配置也该能看）。
 
 失败语义：节点失败时 `TaskFailedError` 向上传播到本层，本层把它与
 `partial_report`（失败节点 + 被阻塞的下游）打印到 stderr 并返回**非零退出码**；
@@ -23,17 +39,19 @@ import argparse
 import json
 import os
 import sys
+from datetime import datetime
 from typing import Any, List, Mapping, Optional, Sequence
 
 from atlas.contracts import ContractError
 from atlas.registry.schema import Channel, FetchSpec, FetchType, Industry
 from atlas.runner import RunReport, TaskFailedError
 from atlas.runner.runner import STATUS_FAILED, STATUS_SKIPPED
+from atlas.schedule import ScheduleError
 
-from .pipeline import LabelAssignment, build_pipeline
+from .pipeline import LabelAssignment, NothingDueError, build_pipeline
 from .tasks import PipelineError
 
-__all__ = ["build_parser", "main", "render_failure", "render_report"]
+__all__ = ["build_parser", "main", "render_failure", "render_report", "render_schedule"]
 
 LIVE_ENV_VAR = "ATLAS_LIVE"
 
@@ -42,11 +60,26 @@ def _store_root_default() -> str:
     return os.environ.get("ATLAS_STORE_ROOT", "data/store")
 
 
+def _parse_now(value: Optional[str]) -> Optional[datetime]:
+    """`--now`：调度判定用的当前时刻（naive 按 UTC 解释，与全仓同一规则）。"""
+    if value is None:
+        return None
+    text = value.strip()
+    if not text:
+        raise SystemExit("--now 不得为空字符串")
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError as exc:
+        raise SystemExit(f"--now 不是 ISO-8601 时间：{value!r}（{exc}）") from exc
+    return parsed
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m atlas.compose",
         description=(
             "Atlas 组合根（T-120）：把采集 / 归档 / 归一化 / feed / 打标接成一条流水线。"
+            "T-207 追加 --due-only：只采 interval_seconds 已到期的渠道。"
         ),
     )
     sub = parser.add_subparsers(dest="command", required=True)
@@ -60,11 +93,28 @@ def build_parser() -> argparse.ArgumentParser:
         target.add_argument("--author", default="operator", help="配置变更的作者（审计用）")
         target.add_argument("--actor", default=None, help="打标判断的作者（默认同 --author）")
 
-    plan = sub.add_parser("plan", help="干跑：打印 DAG 与本轮渠道，不采集")
+    def add_schedule_flags(target: argparse.ArgumentParser) -> None:
+        target.add_argument(
+            "--due-only",
+            action="store_true",
+            help=(
+                "T-207：只注册 interval_seconds 已到期的渠道（默认关闭 = 全部启用渠道）。"
+                "一个都不到期时**不是错误**：打印说明并以退出码 0 结束"
+            ),
+        )
+        target.add_argument(
+            "--now",
+            default=None,
+            help="调度判定用的当前时刻（ISO-8601；naive 按 UTC 解释，默认取系统时钟）",
+        )
+
+    plan = sub.add_parser("plan", help="干跑：打印 DAG 与本轮渠道（含到期判定），不采集")
     add_common(plan)
+    add_schedule_flags(plan)
 
     run = sub.add_parser("run", help="真实跑一次流水线（需 ATLAS_LIVE=1）")
     add_common(run)
+    add_schedule_flags(run)
     run.add_argument(
         "--window",
         default=None,
@@ -186,6 +236,35 @@ def render_report(report: RunReport) -> str:
     return "\n".join(lines)
 
 
+def render_schedule(decision: Any) -> str:
+    """把一轮调度判定渲染成人能读的几行（CLI 的 `plan --due-only` / 空闲轮次用）。
+
+    必须显式给出"哪些到期、哪些没到期、上次什么时候采的"：只打一句"无到期渠道"
+    会让操作者无法判断是**真的没到期**还是**状态读不到**（后者会是响亮失败，
+    但把两者摆在一起才看得出区别）。`enabled_channels == 0` 时明确说"没有渠道"，
+    而不是说"没有到期的渠道"——两者退出码不同，不能混。
+    """
+    lines: List[str] = [
+        f"调度判定（now={decision.now.isoformat()}，可采集渠道 {decision.enabled_channels} 个）："
+    ]
+    if decision.enabled_channels == 0:
+        lines.append("注册表里一个可采集渠道都没有（配置问题，不是空闲轮次）")
+        return "\n".join(lines)
+    for item in decision.schedules:
+        last = item.last_collected_at.isoformat() if item.last_collected_at else "（从未采集）"
+        mark = "到期" if item.due else "未到期"
+        lines.append(
+            f"  [{mark}] {item.channel_id}  interval={item.interval_seconds}s  "
+            f"last_collected_at={last}  next_due_at={item.next_due_at.isoformat()}"
+        )
+    lines.append(f"到期渠道（{len(decision.due_ids)}）：{list(decision.due_ids)}")
+    if decision.is_idle:
+        lines.append(
+            "没有到期的渠道，本轮不采集（正常状态，不是错误；退出码 0）"
+        )
+    return "\n".join(lines)
+
+
 def render_failure(error: TaskFailedError) -> str:
     lines = [
         "流水线失败：",
@@ -227,9 +306,13 @@ def _parse_assignment(text: str, *, kind: str, actor: str) -> LabelAssignment:
 
 
 def _cmd_plan(args: argparse.Namespace) -> int:
+    now = _parse_now(args.now)
     with build_pipeline(store_root=args.store_root, actor=args.actor or args.author) as pipe:
-        plan = pipe.plan()
-    print(json.dumps(plan, ensure_ascii=False, indent=2, sort_keys=True))
+        plan = pipe.plan(due_only=args.due_only, now=now)
+        print(json.dumps(plan, ensure_ascii=False, indent=2, sort_keys=True))
+        if args.due_only:
+            # 人读的一行行判定走 stderr，stdout 保持"纯 JSON"（脚本可直接 json.loads）。
+            print(render_schedule(pipe.due_decision(now=now)), file=sys.stderr)
     return 0
 
 
@@ -276,6 +359,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         return 2
 
     actor = args.actor or args.author
+    now = _parse_now(args.now)
     assignments = [
         _parse_assignment(text, kind="channel", actor=actor)
         for text in args.label_channel
@@ -290,8 +374,31 @@ def _cmd_run(args: argparse.Namespace) -> int:
         max_retries=args.max_retries,
     )
     with pipeline:
+        if args.due_only:
+            decision = pipeline.due_decision(now=now)
+            if decision.enabled_channels == 0:
+                # 与 `run --due-only` 同一条纪律：**一个可采集渠道都没有**是配置问题
+                # （退出码 1），绝不能因为 due-only 而退化成"正常空闲"（退出码 0）。
+                print(render_schedule(decision))
+                print(
+                    "注册表里没有可采集的渠道（启用渠道 × 启用行业 为空）："
+                    "这是配置问题，不是'这一轮没有到期的渠道'；"
+                    "先配置渠道（python -m atlas.compose register ...）",
+                    file=sys.stderr,
+                )
+                return 1
+            if decision.is_idle:
+                # 正常状态，退出码 0：5 分钟一次的 cron 大多数轮次走这里。
+                print(render_schedule(decision))
+                return 0
+            print(render_schedule(decision))
         try:
-            report = pipeline.run()
+            report = pipeline.run(due_only=args.due_only, now=now)
+        except NothingDueError as exc:
+            # 判定与执行之间状态变了（例如另一个进程刚采完）：仍然是"没有工作"，
+            # 仍然退出码 0，但如实说明是哪一种"没有工作"。
+            print(render_schedule(exc.decision), file=sys.stderr)
+            return 0
         except TaskFailedError as exc:
             print(render_failure(exc), file=sys.stderr)
             return 1
@@ -310,8 +417,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     handler = handlers[args.command]
     try:
         return handler(args)
-    except (PipelineError, ContractError) as exc:
+    except (PipelineError, ScheduleError, ContractError) as exc:
         # 领域错误：如实报错并非零退出，不吞、不降级。
+        # 注意 `NothingDueError` 是 `PipelineError` 的子类，但**不会**走到这里：
+        # "没有到期的渠道"由上面的 `is_idle` 分支 / 专门的 `except` 处理成退出码 0。
         print(f"{type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
 

@@ -24,10 +24,8 @@ import contextlib
 import hashlib
 import http.server
 import json
-import os
 import sqlite3
 import subprocess
-import sys
 import threading
 import time
 from pathlib import Path
@@ -76,6 +74,7 @@ from atlas.registry import (
 )
 from atlas.runner import InMemoryExecutionRecordStore, TaskFailedError
 from atlas.runner.runner import STATUS_BLOCKED, STATUS_FAILED, STATUS_SKIPPED
+from tests._compose_cli import run_cli
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -811,21 +810,12 @@ def test_real_robots_404_is_treated_as_absent_per_spec_2_12(
 
 
 def _run_cli(*args: str, env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
-    environment = dict(os.environ)
-    environment.pop("ATLAS_LIVE", None)
-    environment["PYTHONPATH"] = os.pathsep.join(
-        [str(REPO_ROOT / "src"), environment.get("PYTHONPATH", "")]
-    ).rstrip(os.pathsep)
-    if env:
-        environment.update(env)
-    return subprocess.run(
-        [sys.executable, "-m", "atlas.compose", *args],
-        capture_output=True,
-        text=True,
-        cwd=str(REPO_ROOT),
-        env=environment,
-        timeout=120,
-    )
+    """委托给共享辅助（T-207 起 `tests/_compose_cli.py` 是唯一实现）。
+
+    保留这个名字是为了不动本文件里已有的调用点；两个文件共用一个实现，
+    免得"CLI 真的能跑"这条证据因为两份漂移的环境构造而失真。
+    """
+    return run_cli(*args, env=env)
 
 
 def test_cli_help_runs_offline() -> None:
