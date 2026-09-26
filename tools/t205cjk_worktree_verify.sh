@@ -7,6 +7,8 @@ COMMIT="$1"
 PY="$REPO/.venv-new/bin/python"
 
 rm -rf "$WT"
+# 只清理**本任务**那一条注册（不动别人的 worktree，也不用会牵连他人的 prune）
+git -C "$REPO" worktree remove --force "$WT" 2>/dev/null || true
 git -C "$REPO" worktree add --detach "$WT" "$COMMIT" || exit 90
 echo "=== worktree HEAD ==="
 git -C "$WT" log --oneline -1
