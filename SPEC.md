@@ -395,6 +395,30 @@ C8 的配置来自前端 / API，不依赖手工编辑文件。
 > ⚠️ 这不是"永远不用做"：一旦需要给模型工具（例如让它自己调检索），门槛**立即复活**，
 > 那时必须上真隔离。现在的裁决只是**不为尚未存在的需求预付基础设施成本**。
 
+#### 隔离是**被独立验证过**的，不是被声称的（2026-09-26）
+
+主代理**没有采信 T-003 自己的测试**，而是直接驱动真实边车，并**故意在父进程环境里塞了三把假凭据**
+（`LEAKED_OPENAI_KEY` / `LEAKED_DEEPSEEK_KEY` / `AWS_SECRET_ACCESS_KEY`）看它会不会继承：
+
+| 检查 | 实测结果 |
+|---|---|
+| `toolsRegistered` | **0** |
+| `declared_tools` / `declared_tool_count` | **`[]` / 0** |
+| **静态 import 清单**（= 真实能力面） | `['./json-extract.mjs', '@earendil-works/pi-ai', '…/openai-completions.lazy', 'node:crypto', 'node:fs']` —— **无任何执行能力面** |
+| `child_process_used` / `shell_used` | **false / false** |
+| `require_available` | **false**（ESM，没有 CommonJS `require` 作用域） |
+| **子进程实际环境变量名** | `['HOME', 'NODE_ENV', 'NODE_NO_WARNINGS', 'PATH']` —— **三把假凭据一个都没继承进来** |
+| 子进程环境里有凭据形变量吗 | **没有** |
+
+> **一个必须说清楚的精确性**：边车**确实** import 了 `node:fs`（读自己的源码算 `sidecarSha256`）。
+> 所以隔离claim 的准确表述是「**模型无法导致执行**」（零工具 ⇒ 模型没有调用通道），
+> **不是**「这个进程被沙箱化了」。两者不可混为一谈。
+
+> **设计上值得记一笔的诚实之处**：边车**不**用"探测不到 `child_process`"来证明无执行面——
+> 它明确报告 `builtin_available.child_process = **true**`（Node 里当然存在），
+> 再用**静态 import 清单**证明"存在但未被引入/使用"。用"探测不到"来证明"没有能力"是错的论证方式，
+> 这里没有犯这个错。
+
 **Node 依赖被关在边车进程里**：Python 项目因此**仍是 stdlib-only**，`pyproject.toml` / `uv.lock` 不变。
 这与"依赖最小化、显式声明"不冲突——新增的依赖不在 Python 依赖图里。
 
