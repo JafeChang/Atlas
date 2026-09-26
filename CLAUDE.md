@@ -54,6 +54,21 @@
   照 `tests/test_search_realdata.py` 的先例（`pytest.mark.skipif` / 模块级 `pytest.skip`），
   并在主工作区真的跑出真实数字。
 
+## `tools/` 约定（立这条规矩的原因：三个任务往里混了三种东西）
+
+**只放"可复现的测量/证据脚本"**——那种重跑一次就能产出数字、且**将来还有人会想再跑一次**的东西。
+例：索引体积对比（`t205cjk_measure.py`）、边界探针（`t205cjk_boundary_probe.py`）、
+真实调用证据（`t003_real_call.py`）、导入工具（`migrate_legacy.py`）。
+
+**不放个人脚手架**，包括但不限于：`*_commit*.sh`、`*_msg*.txt`、`*_gate.sh`、`*_counts*.sh`、
+`*_worktree_verify.sh`、`*_suite_report.sh`、调试脚本（`*_dbg*.py` / `*_smoke.py` / `*_probe*.py` 一次性的那些）。
+这些是一次性过程产物，留在库里只会让下一个人分不清哪些还得跑。
+
+命名带任务号以便追溯与清理。**仓库根一律不放临时脚本**——
+历史教训：T-130 在仓库根留了 12 个 `scripts_t130_*.py`，T-131 留了 `.t131_probe/`。
+
+> 判据很简单：**"这个东西下个月还有人会跑吗？"** 会 → 放 `tools/`；不会 → 别提交。
+
 ## 环境
 
 开发在 WSL 内进行（Windows PowerShell 无法执行项目 venv）。**WSL 是镜像网络模式**，外网必须走宿主代理：

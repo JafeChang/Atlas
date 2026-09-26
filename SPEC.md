@@ -480,6 +480,29 @@ token  : input=0 output=0 total=0
 （跨文档的会话状态可能互串），得不偿失。真要在意，正确的方向是让 ESM 解析到
 **Linux 原生**的 `node_modules`（符号链接或打包），而不是复用进程。
 
+#### 认知层的契约值（T-003 锁定，主代理登记）
+
+包 `src/atlas/cognition/`（归属 **T-003 / T-105**）。**端口是 `CognitionPort`，PI 只是它的一个适配器**（`PiSidecarCognitionPort`）。
+
+| 项 | 值 |
+|---|---|
+| IPC 协议 | `PROTOCOL = "atlas.cognition.sidecar/1"`；帧前缀 `FRAME_PREFIX = "#atlas-cognition/1#"`；父→子 stdin **一行** JSON job；子→父 **fd 3**（未开则退回 stdout）上的帧行；**非帧行一律忽略**（对"库往 stdout 打警告"的真实防御） |
+| job 字段 | `protocol` / `jobId` / `operation` ∈ {`inspect`, `call`, `parse`} |
+| 主路由 | `deepseek`：provider `deepseek`、model **`deepseek-flash`**、base `https://api.deepseek.com`、key 环境名 `DEEPSEEK_API_KEY` |
+| 备用路由 | `openai-compatible`：provider `atlas-openai-compatible`、model `deepseek/deepseek-v4-flash`、base `https://openrouter.ai/api/v1`、key 环境名 `ATLAS_OPENAI_API_KEY` |
+| 默认路由 | `DEFAULT_ROUTE = "deepseek"` |
+| 超时 / 代理豁免 | `DEFAULT_TIMEOUT_SECONDS = 60.0`；`DEFAULT_NO_PROXY = "127.0.0.1,localhost,::1"` |
+| 版本三元组（§3） | `SCHEMA_VERSION = "cognition-output/1"`、`CONFIG_VERSION = "cognition-config/1"`、`PROMPT_VERSION = "cognition-extract-prompt/1"` |
+| 最低 Node | **22.3.0**（用了 `process.getBuiltinModule` + 顶层 await + ESM） |
+| 状态 | `CallStatus ∈ {ok, unclassified}` |
+| **降级原因码** | `unreachable_model` / `timeout` / `http_error` / `model_deprecated` / `empty_completion` / `unparseable_output` / `sidecar_error` |
+| **响亮失败（绝不降级）** | `ModelEnvelopeError`（结构违反冻结契约）、`IsolationViolationError`（边车报告注册了**非零**工具 ⇒ 隔离前提不成立）、`SidecarUnavailableError`、`ProtocolError`、`ConfigError` |
+| **降级不变式** | `is_unclassified` 为真 ⇒ `claims` **恒为空** 且 `record.reason` **必非空**（§2.14 决策四） |
+| 输出契约 | 冻结 `ContractModel`（`extra="forbid"`）；**PI 只输出 `quote`，不输出坐标**（§2.2） |
+
+> `src/atlas/cognition/PROTOCOL.md` 是**实现说明**，它自己第一句就写明"不是第二份规格；规格以 `SPEC.md` 为准"。
+> 上面这张表才是权威——**契约值的唯一事实来源仍然只有本文件**。
+
 **Node 依赖被关在边车进程里**：Python 项目因此**仍是 stdlib-only**，`pyproject.toml` / `uv.lock` 不变。
 这与"依赖最小化、显式声明"不冲突——新增的依赖不在 Python 依赖图里。
 
