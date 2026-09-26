@@ -1145,6 +1145,23 @@ T-131 导入的是**旧系统当年按篇存下来的东西**，所以进来就�
 |---|---|---|
 | **T-106**（Feed API） | 把 `entries` 作为**派生视图**挂在 `raw_id` 下（新端点或 `GET /feed/{raw_id}/entries`），暴露 `entry_id / title / link / published_at / char_start / char_end` | **`Entry` 必须带 `raw_id` + `raw_sha256` 一起输出**，否则前端只拿到"某个 feed 里的第 N 条"，**无法构造锚点**。任何以 `entry_id` 为**标签锚点**的设计都是错的 |
 | **T-108**（标签锚点） | **存储与契约都不用改**——`ConfirmedLabel.anchor` 已经是 `EvidenceAnchor`，`Entry.anchor()` 直接产出合法的那个 | 要做的是**允许"条目区间"作为一种打标目标**：§2.1 那句"仅文档级"需按裁决 B 更新为"文档级 + 条目级"。**人工标签不得存 `entry_id`**（换解析器版本会漂移） |
+
+> **上面这条"存储不用改"原本只是断言，主代理已在副本上预验证为真（2026-09-26）**
+> （在 `data/store/atlas.db` 的**副本**上做，真实库未动）：
+>
+> | 检查 | 结果 |
+> |---|---|
+> | 从真实 `arxiv-computer-vision` feed 取 `entry[0]` | span `(876, 2975)`；`entry.anchor()` 给出合法 `EvidenceAnchor`，其 `raw_id` 就是该 feed 的 `raw_id` |
+> | **活对照**：不带 anchor 的标签 | 可存可读（既有行为不变） |
+> | **关键**：带**条目区间**锚点的标签 | **可以存入** ✓ |
+> | 独立开 `sqlite3` 读回 | `anchor_char_start=876`、`anchor_char_end=2975`、`anchor_raw_id == label.raw_id` —— 全对 |
+> | **负向 + 活对照**：锚点跨 raw（证据在 B、标签在 A） | **被拒**，抛 `AnchorError` ✓ |
+>
+> ⇒ **唯一缺的一环就是 `ConfirmedLabel.human()` 不接受 `anchor` 参数。** 契约层加一个可选参数即可，
+> 不需要新表、不需要迁移、不需要升 `raw_store_meta.schema_version`。
+>
+> （顺带一个对 UI 有用的事实：真实 arXiv 标题里含 LaTeX 标记，
+> 如 `'$\unicode{x1F493}$Heartian: Physiology-Aware…'`——**渲染必须继续走 `escape()`**。）
 | **T-109**（前端） | 从"只显示 raw_id/渠道/字节数"改为**按条目渲染**（标题 + 链接 + 时间），并提供"打开原文并高亮条目区间" | 条目正文是**标记文本**：`Entry.content_slice()` 只去标签与 CDATA 外壳、**不解实体**（解实体会让字符数与偏移解耦）；拿去匹配 quote 用 `sanitize_for_quote()`，但**坐标只能由确定性匹配产出，不得从 sanitize 的产物反推偏移** |
 | **T-105**（机器分类） | 应**按条目分类**（输入 `Entry.title` / `content_slice`，quote 走 `sanitize_for_quote`），而不是按 feed | 已按此派发 |
 
