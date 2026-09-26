@@ -24,8 +24,13 @@
 1. **固定开销按调用次数计**：batch 4 把 895 次压到 334 次，
    单是边车启动就从 67 min 降到 25 min；
 2. **批量不能无限大**：`deepseek-flash` 是推理型，实测一次调用的 reasoning token
-   常达 1000–2000，而单次调用的输出预算有限（边车 `maxTokens` 默认 4096，
-   T-003 的 `max_output_tokens` 字段**没有**被 adapter 送进边车）——
+   常达 1000–2000，而单次调用的输出预算有限。
+   ⚠️ **本注释原先写错了，2026-09-26 由主代理更正并实测**：原文称 T-003 的
+   `max_output_tokens` **没有**被 adapter 送进边车——**这是假的**。
+   实测链路：`adapter._build_job()` → `call.maxOutputTokens` → 边车
+   `{...base, maxTokens: call.maxOutputTokens}` → SDK 以 **`max_completion_tokens`**
+   发出（实测：配置 1234 → 请求体 `max_completion_tokens: 1234`）。
+   生效预算是**配置值**（默认 2048），不是 4096。
    一批塞 5–10 个长单元时 `empty_completion` 明显增多；
 3. **单单元调用也会失败**（实测 83% 成功），失败是**瞬时**的（同一份输入重跑常常成功）
    ⇒ 必须**有界重试**，且重试要把批次缩到单单元。
