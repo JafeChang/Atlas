@@ -746,6 +746,26 @@ PI 不含权限系统、不沙箱化工具调用（其官方文档明确说明�
 >
 > **教训**：`render_report` 此前**没有任何测试覆盖**。运维输出没人测，"静默失效"就会从这里回来。
 
+**A1 成功信号已在真实 store 上复验（此前只在临时目录里验过）**
+
+用**用户真正会走的路径**（T-109 前端 HTTP 接口）在 `data/store` 上跑完整闭环，全部通过：
+
+| 检查 | 结果 |
+|---|---|
+| `GET /feed` | **200**，10 篇真实文档，**每条都有 `industry`**（C8 闭环已接通） |
+| `POST /label`（合法行业） | **303** |
+| 重复 `POST /label` 同内容 | 303，且**幂等**——两次运行得到**同一个 `label_id`** |
+| `POST /label`（不存在的行业） | **400**（C8 闭环被**强制**，不是装饰） |
+| `GET /feed` 再次 | 标签正常回显 |
+| 独立开 `sqlite3` 复核（不经任何前端代码） | `confirmed_labels` **1 行**，actor=`e2e-verify` |
+| 非法行业是否写入 | **没有**（负向对照成立） |
+| append-only 触发器 | **10 个**（`config_versions` / `confirmed_labels` / `label_space` / `raw_records` / `registry_label_ref*` 各 no_update + no_delete） |
+
+> ⚠️ 这次复验在 `confirmed_labels` 里留下**一条**验证标签
+> （`raw_0a57b660…` / `industry=machine-learning` / **actor=`e2e-verify`**）。
+> Confirmed 是 append-only，因此它不可删除。actor 字段就是为区分这种情况存在的：
+> 用 `actor='e2e-verify'` 过滤即可排除。**这不是人工判断，是探针。**
+
 ### 6.2 旧数据导入时的预期收敛
 
 `data/raw/` 的旧产物**未去重**（同一篇文章被重复采集约 10 次）。按内容寻址导入时：
