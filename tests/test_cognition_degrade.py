@@ -53,6 +53,7 @@ from tests.test_cognition_support import (  # noqa: E402
     completion_body,
     fake_config,
     mock_port,
+    require_sidecar_installed,
 )
 
 REQUEST = CognitionRequest(
@@ -85,6 +86,7 @@ def _reject_codes(reason: DegradeReason, detail: str = "boom") -> dict:
 
 def test_unreachable_endpoint_degrades_to_unclassified() -> None:
     """端口 1 上没有服务 ⇒ 连接被拒 ⇒ 降级，而不是抛异常。"""
+    require_sidecar_installed()  # 这条例外用**真实边车**；依赖未装则跳过（环境问题不是缺陷）
     port = PiSidecarCognitionPort(fake_config(base_url="http://127.0.0.1:1/v1"))
     result = port.extract(REQUEST)
     assert result.status is CallStatus.UNCLASSIFIED

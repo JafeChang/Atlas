@@ -44,6 +44,7 @@ from tests.test_cognition_support import (  # noqa: E402
     fake_config,
     live_config,
     mock_port,
+    require_sidecar_installed,
     route_credential_available,
 )
 
@@ -158,6 +159,7 @@ def test_model_version_tracks_the_configured_model() -> None:
 
 
 def test_secret_never_appears_in_config_repr_or_records() -> None:
+    require_sidecar_installed()  # 经真实边车跑一次；依赖未装则跳过（环境问题不是缺陷）
     secret = "sk-t003-super-secret-value"
     config = fake_config(api_key=secret, proxy_url="http://user:pass@127.0.0.1:7897")
     assert secret not in repr(config)

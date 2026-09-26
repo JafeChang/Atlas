@@ -122,6 +122,7 @@ def test_stdout_noise_is_ignored_and_frame_still_parsed() -> None:
 
 def test_real_sidecar_stderr_warning_does_not_pollute_the_protocol() -> None:
     """真实边车跑一次：stderr 上确实有 `[UNDICI-EHPA] Warning`，但帧照常解析。"""
+    require_sidecar_installed()  # 真起边车进程；依赖未装则跳过（环境问题不是缺陷）
     port = fake_port_for_real_sidecar()
     report = port.inspect()
     assert report["toolsRegistered"] == 0
@@ -170,6 +171,7 @@ def test_watchdog_control_process_that_answers_quickly_is_not_degraded(tmp_path:
 
 def test_protocol_mismatch_is_rejected_loudly() -> None:
     """job 的 `protocol` 与边车不一致 ⇒ 边车回 error 帧 ⇒ Python 侧响亮失败。"""
+    require_sidecar_installed()  # 真起边车进程；依赖未装则跳过（环境问题不是缺陷）
     port = fake_port_for_real_sidecar()
     # 活对照：正确版本号的同一 job 走得通。
     ok = port.raw_outcome({"protocol": PROTOCOL, "operation": "inspect"})
@@ -181,6 +183,7 @@ def test_protocol_mismatch_is_rejected_loudly() -> None:
 
 
 def test_unsupported_operation_is_rejected_loudly() -> None:
+    require_sidecar_installed()  # 真起边车进程；依赖未装则跳过（环境问题不是缺陷）
     port = fake_port_for_real_sidecar()
     # 活对照：受支持的操作成功。
     ok = port.raw_outcome({"protocol": PROTOCOL, "operation": "inspect"})
@@ -192,6 +195,7 @@ def test_unsupported_operation_is_rejected_loudly() -> None:
 
 
 def test_bad_job_line_yields_bad_job_frame_and_exit_code_2() -> None:
+    require_sidecar_installed()  # 真起边车进程；依赖未装则跳过（环境问题不是缺陷）
     port = fake_port_for_real_sidecar()
     outcome = port.raw_outcome({"protocol": PROTOCOL, "operation": "inspect"})
     assert outcome.return_code == 0
