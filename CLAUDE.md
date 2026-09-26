@@ -16,7 +16,7 @@
 | 数据源 | 仅公开可访问数据；不绕过反爬、登录、验证码 |
 | 优先级 | 工程可持续性 > 可迁移性 > 可审计性 > 性能 |
 
-## 四条硬规则（来自归档基线的失败教训）
+## 五条硬规则（来自归档基线的失败教训）
 
 1. **"完成"必须能用跑通的数据流证明**——不得用"有文件 / 有字段 / 有测试报告"证明。
 2. **不允许用 `except` 掩盖接线错误**；未实现的部分必须响亮失败（`NotImplementedError`），不得返回编造的结果。
@@ -26,11 +26,17 @@
    **工作区是绿的 ≠ 提交是绿的**——子代理边写边跑时，提交很容易抓到"写了一半的中间态"。
    因此提交后必须用**独立 worktree 复核该提交本身**：
    ```bash
-   git worktree add --detach /tmp/atlas-verify <commit>
-   cd /tmp/atlas-verify && PYTHONPATH=/tmp/atlas-verify/src \
+   git worktree add --detach /tmp/atlas-verify-<任务号> <commit>
+   cd /tmp/atlas-verify-<任务号> && PYTHONPATH=/tmp/atlas-verify-<任务号>/src \
      /mnt/c/Users/bestz/Documents/projects/Atlas/.venv-new/bin/python -m pytest tests -q
    ```
-   （`PYTHONPATH` 必须指向该检出，否则可编辑安装仍会导入主工作区的 `src`。）
+   （`PYTHONPATH` 必须指向该检出，否则可编辑安装仍会导入主工作区的 `src`。
+   **worktree 路径必须带任务号**——固定用 `/tmp/atlas-verify` 在多个代理并行时会被互相抢占。）
+5. **并行代理的 git 纪律**（来自 T-205 / T-206 的实测事故：同一分支上发生 **3 次**提交被卷走 / 被孤立）：
+   - **只 `git add <你自己的具体路径>`**。**禁止** `git add -A` / `git add .` / `git commit -a`——它们会把别人暂存中的文件一起卷进你的提交。
+   - **禁止** `git commit --amend` / `git reset` / `git rebase` / `git checkout <branch>` / `git stash` 等会移动别人提交的操作。
+   - 提交后**立刻**核对：`git show --name-only --format='%H %s' HEAD` 只能包含你改的文件。发现混入**停下来报告**，不要自行 amend 或 reset。
+   - 主代理编排时：**git 写操作串行化**——同一时刻只允许一个代理处于"提交中"。
 
 ## 环境
 
