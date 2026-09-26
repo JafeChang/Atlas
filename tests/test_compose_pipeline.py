@@ -49,6 +49,7 @@ from atlas.compose import (
     PipelineError,
     build_pipeline,
 )
+from atlas.compose.cli import render_report
 from atlas.compose.tasks import (
     MAP_SCHEMA,
     CollectionFailedError,
@@ -877,3 +878,39 @@ def test_cli_run_requires_explicit_live_opt_in(tmp_path: Path) -> None:
     assert proc.returncode == 2
     assert "ATLAS_LIVE" in proc.stderr
     assert not (tmp_path / "store").exists(), "被拒绝的运行不得留下任何存储痕迹"
+
+
+def test_partial_run_surfaces_channel_failures_in_the_rendered_report(
+    store_root: Path,
+) -> None:
+    """`--allow-partial` 的承诺是"失败进入 observed.failures，**不会被吞掉**"。
+
+    实测缺陷（一次真实运行踩到）：`render_report()` 只打印 `artifacts["identity"]`，
+    而渠道级失败在**另一个**键 `artifacts["observed"]` 里。
+    于是一次真实运行的输出是"计数 failed: 0 / succeeded: 5"加 10 条 feed——
+    操作者**完全看不出** 13 个源里有 3 个根本没采到
+    （openai-blog HTTP 403、ai-techpark robots 403、venturebeat-ai HTTP 429）。
+
+    这正是 SPEC §7.3 失败模式 3「静默失效」的形态：数据被记录了但没有被呈现，
+    等于没记录。这条测试锁死"渠道级失败必须出现在渲染结果里"。
+    """
+    # 只给 chan-plain 准备响应 → chan-html 必然失败（假 fetcher 拒绝未知 URL，
+    # 该异常会被 fetch_once 归类成一条失败的 FetchOutcome，而不是让整轮崩溃）。
+    fetcher = FakeFetcher({PLAIN_ENDPOINT: PLAIN_BODY})
+    with _pipeline(store_root, fetcher, on_channel_failure="report") as pipeline:
+        report = pipeline.run()
+
+    # 前提一：渠道级确实失败了，但**节点级**没有失败（这正是 allow-partial 的语义）
+    assert not report.failed, "report 模式下渠道失败不应让节点失败"
+    observed = report.result("collect").output.artifacts["observed"]
+    assert [item["channel_id"] for item in observed["failures"]] == ["chan-html"], observed
+    assert observed["skipped"] == []
+
+    rendered = render_report(report)
+
+    # 关键断言：失败必须在**渲染结果**里可见，而不是只躺在 artifacts 里
+    assert "chan-html" in rendered, f"渠道级失败被吞掉了：\n{rendered}"
+    assert "failed=1" in rendered, rendered
+    assert "collected=1" in rendered, rendered
+    # 失败原因也要能看见（只报 channel_id 不足以定位）
+    assert observed["failures"][0]["reason"] in rendered, rendered

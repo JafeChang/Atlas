@@ -23,7 +23,7 @@ import argparse
 import json
 import os
 import sys
-from typing import List, Optional, Sequence
+from typing import Any, List, Mapping, Optional, Sequence
 
 from atlas.contracts import ContractError
 from atlas.registry.schema import Channel, FetchSpec, FetchType, Industry
@@ -122,6 +122,43 @@ def build_parser() -> argparse.ArgumentParser:
 # --------------------------------------------------------------------------- #
 
 
+def render_observed(name: str, observed: Any) -> List[str]:
+    """把 `observed` 里的**失败与跳过**显式打出来。
+
+    为什么必须打：`identity` 只含内容寻址字段（**不含失败**），而 `--allow-partial`
+    对操作者的承诺是"个别渠道失败时继续，失败会进入 `observed.failures`，**不会被吞掉**"。
+    只打印 `identity` 会让"13 个渠道里 3 个失败"看起来像"一切正常"。
+
+    实测踩到过：一次真实运行报 `failed: 0`、feed 有 10 条，
+    操作者完全看不出 openai-blog(403) / ai-techpark(robots 403) / venturebeat-ai(429) 三个源根本没采到。
+    这是"静默失效"的典型形态（SPEC §7.3 失败模式 3），因此必须显式呈现。
+    """
+    if not isinstance(observed, Mapping):
+        return []
+
+    failures = list(observed.get("failures") or [])
+    skipped = list(observed.get("skipped") or [])
+    per_channel = list(observed.get("per_channel") or [])
+
+    lines: List[str] = []
+    if per_channel:
+        collected = sum(1 for item in per_channel if item.get("status") == "collected")
+        lines.append(
+            f"  观察 {name}：渠道 {len(per_channel)}"
+            f"（collected={collected} failed={len(failures)} skipped={len(skipped)}）"
+        )
+    for item in failures:
+        lines.append(
+            f"    [failed] {item.get('channel_id')}  "
+            f"{item.get('kind')}: {item.get('reason')}"
+        )
+    for item in skipped:
+        lines.append(
+            f"    [skipped] {item.get('channel_id')}  {item.get('note')}"
+        )
+    return lines
+
+
 def render_report(report: RunReport) -> str:
     lines: List[str] = ["执行汇总（拓扑序）："]
     for name in report.order:
@@ -145,6 +182,7 @@ def render_report(report: RunReport) -> str:
             continue
         identity = result.output.artifacts.get("identity", {})
         lines.append(f"产物 {name}：{json.dumps(identity, ensure_ascii=False, sort_keys=True)}")
+        lines.extend(render_observed(name, result.output.artifacts.get("observed")))
     return "\n".join(lines)
 
 
