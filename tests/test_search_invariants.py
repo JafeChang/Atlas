@@ -40,9 +40,11 @@ SEARCH_DIR = Path(atlas.search.__file__).resolve().parent
 SEARCH_MODULES = sorted(SEARCH_DIR.glob("*.py"))
 EXPECTED_MODULES = [
     "__init__.py",
+    "cjk.py",
     "documents.py",
     "errors.py",
     "query.py",
+    "snippet.py",
     "source.py",
     "sqlite_index.py",
 ]

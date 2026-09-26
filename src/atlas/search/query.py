@@ -10,7 +10,7 @@ FTS5 的 `MATCH` 语法自带操作符（`"` 短语、`*` 前缀、`-`/`NOT` 排
 有三种坏结果：语法错误穿透到调用方（500）、语义被劫持（用户以为在搜索，
 实际在构造查询）、以及"某些输入静默全空"。
 
-本模块的做法是**先切词、再去重、再逐词加双引号、最后以 `AND` 连接**：
+本模块的做法是**先切词、再去重、再逐组加双引号、最后以 `AND` 连接**：
 
     用户输入  C++ build "quoted" -NEAR*  →  词元 («C», «build», «quoted», «NEAR»)
                                          →  "C" AND "build" AND "quoted" AND "NEAR"
@@ -20,9 +20,25 @@ FTS5 的 `MATCH` 语法自带操作符（`"` 短语、`*` 前缀、`-`/`NOT` 排
 切词后为空（空串 / 纯空白 / 纯操作符）→ `EmptyQueryError`（明确错误，
 不是静默全空）。
 
-**有意不做**的操作符语义：短语搜索（`"a b"`）、前缀（`a*`）、排除（`-a`）、
-`NEAR`。它们都需要"解析用户意图"，而本任务是"用户输入即文本"。
-将来若要开放，必须显式引入解析层，而不是让 `MATCH` 自己解释。
+汉字：同一套切分 + **短语**，不是逐字 `AND`（T-205 修订）
+-------------------------------------------------------
+
+索引侧的汉字是**逐字切开**后再索引的（`atlas.search.cjk.segment_cjk`），
+因此查询侧必须用同一套切分。但"逐字切分"不能直接变成"逐字 `AND`"：
+
+    "人" AND "工" AND "智" AND "能"   会命中"世界**人**民**工**作**智**慧**能**力"
+
+连续汉字必须变成 FTS5 **短语**（短语只匹配**连续出现**的汉字串）：
+
+    中文分词测试  →  "中 文 分 词 测 试"
+
+分组规则（`phrase_groups`）：把查询里**连续的汉字**归为一个短语组，其它按
+切词规则切成单字词元组；组间 `AND`。用户在汉字之间打了空白就是两个组
+（`中文 分词` → `"中 文" AND "分 词"`），因为那本来就是两个词。
+
+**仍然有意不做**的用户级操作符语义：引号短语（`"a b"`）、前缀（`a*`）、排除（`-a`）、
+`NEAR`。它们需要"解析用户意图"，而本任务是"用户输入即文本"。汉字短语是**切分规则的
+产物**（同一个切分函数在两侧的使用），不是"解析用户写的引号"。
 
 切词规则与索引侧的分词器对齐
 ----------------------------
@@ -31,6 +47,8 @@ FTS5 的 `MATCH` 语法自带操作符（`"` 短语、`*` 前缀、`-`/`NOT` 排
 当分隔符，并对字母做变音符号折叠。本模块的切词用 `[^\\W_]+`（Unicode 感知、
 排除下划线）近似同一分隔规则，于是"切出来的词"正好是"索引里的词"：
 `foo-bar` → `"foo" AND "bar"` 而不是 `"foo-bar"` 这样的短语。
+汉字部分先过 `segment_cjk`（与索引侧**同一个函数**），于是汉字也满足
+"切出来的词正好是索引里的词"。
 
 排序键与全序（判据 A4）
 ----------------------
@@ -58,6 +76,10 @@ FTS5 的 `MATCH` 语法自带操作符（`"` 短语、`*` 前缀、`-`/`NOT` 排
 `limit ∈ [1, 200]`（默认 50）与 SPEC §2.13 对 T-106 的裁决一致：**拒绝不截断**。
 `offset ≥ 0`、`snippet_tokens ∈ [1, 64]`、筛选值非空且 ≤ 200 个、
 查询词 ≤ 64 个、查询文本 ≤ 4096 字符——全部显式拒绝，不做静默截断。
+
+> ⚠️ `MAX_QUERY_TERMS = 64` 计的是**词元**；汉字逐字切分之后一个汉字就是一个词元，
+> 因此**中文查询的上限是 64 个汉字**（超出仍然**拒绝**而不是截断）。这是本修订对
+> 契约的直接影响，已在交付报告里单独列出。
 """
 
 from __future__ import annotations
@@ -65,8 +87,9 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, Iterable, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Sequence, Tuple, Union
 
+from .cjk import is_inserted_space, segment_cjk
 from .errors import EmptyQueryError, SearchQueryError
 
 __all__ = [
@@ -84,12 +107,14 @@ __all__ = [
     "ORDERS",
     "SNIPPET_ELLIPSIS",
     "Boost",
+    "Group",
     "SearchHit",
     "SearchQuery",
     "SearchResult",
     "canonical_utc_iso",
     "match_expression",
     "parse_canonical_utc",
+    "phrase_groups",
     "rank_hits",
     "tokenize",
 ]
@@ -134,19 +159,62 @@ _TERM_RE = re.compile(r"[^\W_]+", re.UNICODE)
 #: `boost`：第二个打分源。返回**附加分**（与 FTS 分数相加）。
 Boost = Callable[["SearchHit"], float]
 
+#: 一个"查询组"：由若干词元组成。长度 1 的组等价于普通词元；长度 > 1 的组是
+#: **连续汉字**，会拼成 FTS5 短语（只匹配连续出现的汉字串）。
+Group = Tuple[str, ...]
+
 
 # --------------------------------------------------------------------------- #
 # 关键词 → 安全表达式
 # --------------------------------------------------------------------------- #
-def tokenize(text: str) -> Tuple[str, ...]:
-    """把用户输入切成词元（去重保序）。切不出词元时返回空元组。"""
+def phrase_groups(text: str) -> Tuple[Group, ...]:
+    """把查询切成有序的组（去重保序）：连续汉字一组，其它词元各自一组。
+
+    实现**复用索引侧同一个切分函数** `segment_cjk`：先把查询按同样的规则切分，
+    再判定"相邻两个词元之间是不是只有切分器插入的那一个空格"——是则属于同一个
+    汉字短语。两侧因此共用同一套"连续汉字"定义（`atlas.search.cjk.is_inserted_space`
+    是唯一出处），不会出现"索引切了、查询没切"或反过来的情况。
+    """
     if not isinstance(text, str):
         raise SearchQueryError("text", f"必须是 str（收到 {type(text).__name__}）")
-    seen: list[str] = []
-    for match in _TERM_RE.finditer(text):
+    segmented = segment_cjk(text)
+    groups: List[Group] = []
+    current: List[str] = []
+    previous_end = -1
+    for match in _TERM_RE.finditer(segmented):
         term = match.group(0)
-        if term not in seen:
-            seen.append(term)
+        contiguous_han = (
+            bool(current)
+            and match.start() - previous_end == 1
+            and is_inserted_space(segmented, match.start() - 1)
+        )
+        if contiguous_han:
+            current.append(term)
+        else:
+            if current:
+                groups.append(tuple(current))
+            current = [term]
+        previous_end = match.end()
+    if current:
+        groups.append(tuple(current))
+
+    deduped: List[Group] = []
+    for group in groups:
+        if group not in deduped:
+            deduped.append(group)
+    return tuple(deduped)
+
+
+def tokenize(text: str) -> Tuple[str, ...]:
+    """把用户输入切成词元（去重保序）。切不出词元时返回空元组。
+
+    汉字逐字切分之后，**一个汉字就是一个词元**（与索引侧一致）。
+    """
+    seen: List[str] = []
+    for group in phrase_groups(text):
+        for term in group:
+            if term not in seen:
+                seen.append(term)
     return tuple(seen)
 
 
@@ -155,9 +223,22 @@ def _quote(term: str) -> str:
     return '"' + term.replace('"', '""') + '"'
 
 
-def match_expression(terms: Sequence[str]) -> str:
-    """把词元拼成**只含字符串字面量与 `AND`** 的 FTS5 表达式。"""
-    return " AND ".join(_quote(term) for term in terms)
+def match_expression(groups: Sequence[Union[str, Sequence[str]]]) -> str:
+    """把查询组拼成**只含字符串字面量与 `AND`** 的 FTS5 表达式。
+
+    - 长度为 1 的组（或直接给一个 `str`）→ `"term"`；
+    - 长度 > 1 的组（连续汉字）→ `"中 文 分 词"`，即 FTS5 **短语**，
+      只匹配连续出现的汉字串（逐字 `AND` 会命中"人民工作智慧能力"这类假阳性）。
+
+    引号一律由本函数生成；组内词元里的引号按 FTS5 规则双写逃逸（纵深防御）。
+    """
+    parts: List[str] = []
+    for group in groups:
+        terms = (group,) if isinstance(group, str) else tuple(group)
+        if not terms:
+            raise SearchQueryError("terms", "查询组不得为空")
+        parts.append(_quote(" ".join(terms)))
+    return " AND ".join(parts)
 
 
 # --------------------------------------------------------------------------- #
@@ -254,9 +335,13 @@ class SearchQuery:
         """切出的词元（与构造期校验使用同一函数，结果确定）。"""
         return tokenize(self.text)
 
+    def groups(self) -> Tuple[Group, ...]:
+        """切出的查询组（连续汉字各成一组短语；组间 `AND`）。"""
+        return phrase_groups(self.text)
+
     def match_expression(self) -> str:
-        """实际下发给 FTS5 的 `MATCH` 表达式（只含字面量与 `AND`）。"""
-        return match_expression(self.terms())
+        """实际下发给 FTS5 的 `MATCH` 表达式（只含字面量、短语与 `AND`）。"""
+        return match_expression(self.groups())
 
     def sort_description(self) -> Dict[str, Any]:
         """排序契约的可审计描述（与实现同一个出处）。"""

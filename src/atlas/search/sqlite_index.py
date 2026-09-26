@@ -9,12 +9,28 @@
 
 | 表 | 说明 |
 |---|---|
-| `search_meta` | 索引身份与配置（`schema_version` / `index_version` / `tokenizer` / `text_source` / `document_count` / `corpus_sha256` / `industry_source` / `built_at` / `index_built`） |
-| `search_documents` | 文档级投影：`RawRecord` 元数据 + T-104 归一化文本（**一文档一行**，不分块） |
-| `search_documents_fts` | FTS5 外部内容表（`content='search_documents'`）：只存倒排索引，不重复存文本 |
+| `search_meta` | 索引身份与配置（`schema_version` / `index_version` / `tokenizer` / `segmentation` / `text_source` / `document_count` / `corpus_sha256` / `industry_source` / `built_at` / `index_built`） |
+| `search_documents` | 文档级投影：`RawRecord` 元数据 + T-104 归一化文本（**一文档一行**，不分块）+ **切分后的索引列** `text_index` |
+| `search_documents_fts` | FTS5 外部内容表（`content='search_documents'`，列名 `text_index`）：只存倒排索引，不重复存文本 |
 
 三张表都是本域私有，全部以 `search_` 前缀命名，避免 `CREATE TABLE IF NOT EXISTS`
 把别的域的表静默复用成结构不同的表（SPEC §2.10 的登记规则）。
+
+为什么索引列与展示列分开（T-205 修订 / 判据 C2）
+-----------------------------------------------
+
+`unicode61` 不切分连续汉字，因此索引列存 `segment_cjk(text)`（`中 文 分 词`），
+而 `text` 保持**原始归一化文本**（对外展示、摘要的来源）。两列分工：
+
+- `text_index`：**内部列**，只进 FTS5 倒排索引，任何对外返回路径都不含它；
+- `text`：对外唯一的正文来源（`IndexedDocument.text`、摘要的原文片段）。
+
+FTS5 外部内容表**要求 FTS 列名与内容表列名一致**（不一致时 SQLite 直接报
+`no such column: T.<name>`，实测），所以 FTS 只声明一列且命名 `text_index`。
+外部内容表**不会**自动跟随内容表变化，必须显式 `'rebuild'`——`rebuild()` 里就有这一步。
+
+摘要：`snippet()` 作用在 `text_index` 上，返回前必须还原（见 `atlas.search.snippet`），
+否则摘要会露出 `中 文` 这种**实现细节外泄**。
 
 **为什么这里没有 append-only 触发器**：`search_*` 是**派生物**（索引），不是事实层。
 SPEC §2.10 要求用触发器强制"只增不改"的对象是 Raw / Confirmed / 配置版本链这些
@@ -74,6 +90,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Mapping, Optional, Union
 
+from .cjk import SEGMENTATION_VERSION, segment_cjk
 from .documents import DocumentText
 from .errors import (
     Fts5UnavailableError,
@@ -82,10 +99,7 @@ from .errors import (
     SearchQueryError,
 )
 from .query import (
-    HIGHLIGHT_CLOSE,
-    HIGHLIGHT_OPEN,
     ORDER_RELEVANCE,
-    SNIPPET_ELLIPSIS,
     Boost,
     SearchHit,
     SearchQuery,
@@ -94,6 +108,12 @@ from .query import (
     canonical_utc_iso,
     parse_canonical_utc,
     rank_hits,
+)
+from .snippet import (
+    SNIPPET_SENTINEL_CLOSE,
+    SNIPPET_SENTINEL_ELLIPSIS,
+    SNIPPET_SENTINEL_OPEN,
+    restore_snippet,
 )
 
 __all__ = [
@@ -108,6 +128,7 @@ __all__ = [
     "MAX_DOCUMENTS",
     "META_TABLE",
     "SCHEMA_VERSION",
+    "SEGMENTATION",
     "TOKENIZER",
     "TEXT_SOURCE",
     "IndexReport",
@@ -121,18 +142,30 @@ __all__ = [
 #: SPEC §2.10 的目录布局：元数据与配置共用同一个库文件。
 DEFAULT_DB_PATH = Path("data/store/atlas.db")
 
-#: 本域物理 schema 版本。将来加列/加表必须显式迁移，不静默兼容。
-SCHEMA_VERSION = 1
+#: 本域物理 schema 版本。**2** = 增加 `search_documents.text_index`（T-205 修订）。
+#: 将来加列/加表必须显式迁移，不静默兼容。
+SCHEMA_VERSION = 2
 
-#: 索引语义版本：**分词器、文本来源、打分函数、内容表形状**任一变化都必须升版本。
-#: 读者据此判定"库里的索引是不是本代码的索引"（判据 A2）。
-INDEX_VERSION = "atlas.search.index/1"
+#: 索引语义版本：**分词器、切分规则、文本来源、打分函数、内容表形状**任一变化都必须升版本。
+#: 读者据此判定"库里的索引是不是本代码的索引"（判据 A2 / C3）。
+#: **2** = 汉字逐字切分（`text_index` 列 + 汉字短语查询），v1 索引必须弃用重建。
+INDEX_VERSION = "atlas.search.index/2"
 
 #: FTS5 分词器配置。`remove_diacritics 2` = 连非 ASCII 的变音符号也折叠。
 TOKENIZER = "unicode61 remove_diacritics 2"
 
+#: 汉字切分规则的身份（写进 `search_meta`，让重建可复现）。
+SEGMENTATION = (
+    SEGMENTATION_VERSION
+    + "：segment_cjk（汉字逐字切分，U+3400-U+4DBF/U+4E00-U+9FFF/U+F900-U+FAFF/"
+    "U+20000-U+2EBEF/U+2F800-U+2FA1F/U+30000-U+323AF）"
+)
+
 #: 被索引文本的来源（写进 `search_meta`，让重建可复现）。
-TEXT_SOURCE = "atlas.normalize.normalize -> NormalizedText.text（T-104 文档级归一化文本，不分块）"
+TEXT_SOURCE = (
+    "atlas.normalize.normalize -> NormalizedText.text（T-104 文档级归一化文本，不分块）"
+    " -> atlas.search.cjk.segment_cjk（T-205 修订：汉字逐字切分后进倒排索引）"
+)
 
 #: 跨实例争用同一库文件时，SQLite 的等待上限（秒）。与 T-103 同值。
 BUSY_TIMEOUT_SECONDS = 30.0
@@ -154,6 +187,7 @@ FTS_TABLE = "search_documents_fts"
 KEY_SCHEMA_VERSION = "schema_version"
 KEY_INDEX_VERSION = "index_version"
 KEY_TOKENIZER = "tokenizer"
+KEY_SEGMENTATION = "segmentation"
 KEY_TEXT_SOURCE = "text_source"
 KEY_DOCUMENT_COUNT = "document_count"
 KEY_EMPTY_TEXT_COUNT = "empty_text_count"
@@ -165,6 +199,7 @@ KEY_INDEX_BUILT = "index_built"
 _META_KEYS = (
     KEY_INDEX_VERSION,
     KEY_TOKENIZER,
+    KEY_SEGMENTATION,
     KEY_TEXT_SOURCE,
     KEY_DOCUMENT_COUNT,
     KEY_EMPTY_TEXT_COUNT,
@@ -188,6 +223,8 @@ CREATE TABLE IF NOT EXISTS {META_TABLE} (
 );
 
 -- 文档级投影：RawRecord 元数据 + T-104 归一化文本。**一文档一行**，不分块（T-206 负责分块）。
+-- `text` 是**原始**归一化文本（对外展示 + 摘要的原文来源）；
+-- `text_index` 是**内部**索引列 = segment_cjk(text)（汉字逐字切分），只进 FTS5 倒排索引。
 CREATE TABLE IF NOT EXISTS {DOCS_TABLE} (
     doc_rowid      INTEGER PRIMARY KEY,
     raw_id         TEXT NOT NULL UNIQUE,
@@ -199,6 +236,7 @@ CREATE TABLE IF NOT EXISTS {DOCS_TABLE} (
     fetched_at     TEXT NOT NULL,
     http_status    INTEGER,
     text           TEXT NOT NULL,
+    text_index     TEXT NOT NULL,
     text_sha256    TEXT NOT NULL,
     text_length    INTEGER NOT NULL
 );
@@ -208,8 +246,10 @@ CREATE INDEX IF NOT EXISTS idx_search_documents_industry ON {DOCS_TABLE}(industr
 CREATE INDEX IF NOT EXISTS idx_search_documents_fetched  ON {DOCS_TABLE}(fetched_at);
 
 -- 外部内容表：倒排索引只此一份，正文仍由 search_documents 提供（不重复存文本）。
+-- 列名必须与内容表列名一致（FTS5 外部内容表的硬要求），因此这里只有 `text_index` 一列。
+-- 注意：外部内容表不会自动跟随内容表变化，写入后必须显式 `'rebuild'`（rebuild() 里已做）。
 CREATE VIRTUAL TABLE IF NOT EXISTS {FTS_TABLE} USING fts5(
-    text,
+    text_index,
     content='{DOCS_TABLE}',
     content_rowid='doc_rowid',
     tokenize="{TOKENIZER}"
@@ -218,11 +258,11 @@ CREATE VIRTUAL TABLE IF NOT EXISTS {FTS_TABLE} USING fts5(
 
 _DOC_COLUMNS = (
     "doc_rowid, raw_id, channel_id, endpoint, industry, content_sha256, "
-    "byte_length, fetched_at, http_status, text, text_sha256, text_length"
+    "byte_length, fetched_at, http_status, text, text_index, text_sha256, text_length"
 )
 _INSERT_SQL = (
     f"INSERT INTO {DOCS_TABLE} ({_DOC_COLUMNS}) "
-    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
 )
 
 _SELECT_COLUMNS = (
@@ -230,6 +270,10 @@ _SELECT_COLUMNS = (
     f"{DOCS_TABLE}.industry, {DOCS_TABLE}.content_sha256, {DOCS_TABLE}.byte_length, "
     f"{DOCS_TABLE}.fetched_at, {DOCS_TABLE}.http_status"
 )
+
+#: 摘要还原需要的两列：**原始文本**（对外片段来源）与**内部索引列**（定位插入的分隔符）。
+#: 两者都不进 `SearchHit`，`text_index` 因此没有任何对外返回路径。
+_SNIPPET_COLUMNS = f"{DOCS_TABLE}.text, {DOCS_TABLE}.text_index"
 
 _PathLike = Union[str, Path]
 
@@ -311,6 +355,7 @@ class IndexReport:
     corpus_sha256: str
     index_version: str
     tokenizer: str
+    segmentation: str
     text_source: str
     industry_source: str
     built_at: datetime
@@ -322,6 +367,7 @@ class IndexReport:
             "corpus_sha256": self.corpus_sha256,
             "index_version": self.index_version,
             "tokenizer": self.tokenizer,
+            "segmentation": self.segmentation,
             "text_source": self.text_source,
             "industry_source": self.industry_source,
             "built_at": self.built_at.isoformat(),
@@ -521,6 +567,7 @@ class SqliteSearchIndex:
                     {
                         KEY_INDEX_VERSION: INDEX_VERSION,
                         KEY_TOKENIZER: TOKENIZER,
+                        KEY_SEGMENTATION: SEGMENTATION,
                         KEY_TEXT_SOURCE: TEXT_SOURCE,
                         KEY_DOCUMENT_COUNT: str(len(rows)),
                         KEY_EMPTY_TEXT_COUNT: str(empty_text_count),
@@ -542,6 +589,7 @@ class SqliteSearchIndex:
             corpus_sha256=corpus_sha256,
             index_version=INDEX_VERSION,
             tokenizer=TOKENIZER,
+            segmentation=SEGMENTATION,
             text_source=TEXT_SOURCE,
             industry_source=industry_source,
             built_at=moment.astimezone(timezone.utc),
@@ -644,8 +692,10 @@ class SqliteSearchIndex:
         if int(row["value"]) != SCHEMA_VERSION:
             raise IndexVersionError(
                 f"库文件 {self._path} 的检索索引 schema 版本为 {row['value']}，"
-                f"本代码只认 {SCHEMA_VERSION}；索引是可重建派生物，"
-                "补救路径是 drop_search_index(db_path) 删掉后重建，不做静默兼容"
+                f"本代码只认 {SCHEMA_VERSION}（T-205 修订：schema 2 增加了"
+                " search_documents.text_index，汉字逐字切分后才能被检索）；"
+                "索引是可重建派生物，补救路径是 drop_search_index(db_path) 删掉后"
+                " rebuild() 重建，不做静默兼容"
             )
 
     def _assert_usable(self) -> None:
@@ -659,8 +709,10 @@ class SqliteSearchIndex:
         if stored != INDEX_VERSION:
             raise IndexVersionError(
                 f"索引版本不符：库内 {stored!r}，本代码 {INDEX_VERSION!r}"
-                f"（tokenizer={meta.get(KEY_TOKENIZER)!r}）；"
-                "索引可全量重建，请 drop() 后 rebuild()，不做静默兼容"
+                f"（tokenizer={meta.get(KEY_TOKENIZER)!r}, "
+                f"segmentation={meta.get(KEY_SEGMENTATION)!r}）；"
+                "索引可全量重建，请 drop() 后 rebuild()"
+                "（跨进程请用 drop_search_index(db_path)），不做静默兼容"
             )
 
     def _write_meta(self, values: Mapping[str, str]) -> None:
@@ -689,7 +741,7 @@ class SqliteSearchIndex:
         limit: int,
     ) -> List[SearchHit]:
         sql = (
-            f"SELECT {_SELECT_COLUMNS}, "
+            f"SELECT {_SELECT_COLUMNS}, {_SNIPPET_COLUMNS}, "
             f"-bm25({FTS_TABLE}) AS fts_score, "
             f"snippet({FTS_TABLE}, 0, ?, ?, ?, ?) AS snippet "
             f"FROM {FTS_TABLE} "
@@ -698,10 +750,12 @@ class SqliteSearchIndex:
             f"ORDER BY {_order_by(query)} "
             "LIMIT ?"
         )
+        # 摘要用**私用区哨兵**做标记：`snippet()` 作用在切分后的列（text_index）上，
+        # 返回的是带插入分隔符的文本，必须还原成原始文本上的摘要（见 snippet.restore_snippet）。
         args: List[Any] = [
-            HIGHLIGHT_OPEN,
-            HIGHLIGHT_CLOSE,
-            SNIPPET_ELLIPSIS,
+            SNIPPET_SENTINEL_OPEN,
+            SNIPPET_SENTINEL_CLOSE,
+            SNIPPET_SENTINEL_ELLIPSIS,
             query.snippet_tokens,
             expression,
             *params,
@@ -780,6 +834,7 @@ def _document_row(
         canonical_utc_iso(record.fetched_at),
         None if record.http_status is None else int(record.http_status),
         document.text,
+        segment_cjk(document.text),
         document.text_sha256,
         document.text_length,
     )
@@ -845,7 +900,10 @@ def _row_to_hit(row: sqlite3.Row) -> SearchHit:
         http_status=None if row["http_status"] is None else int(row["http_status"]),
         score=score,
         fts_score=score,
-        snippet=row["snippet"],
+        # 原始文本上的摘要：全文不出现 segment_cjk 插入的分隔符（判据 C5）。
+        snippet=restore_snippet(
+            row["snippet"], indexed_text=row["text_index"], original_text=row["text"]
+        ),
     )
 
 

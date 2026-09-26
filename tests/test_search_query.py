@@ -27,11 +27,13 @@ A4 **排序确定性**：`relevance` = `(score desc, fetched_at desc, raw_id asc
    `raw_id` 唯一 ⇒ 全序。同一查询连续两次、以及重建前后顺序必须相同；
    分数并列时顺序必须由次级键决定（用同长度同词频的语料构造真并列）。
 
-A5 **查询健壮性**：用户输入**永不**作为 FTS5 表达式使用——先切词、去重、逐词加引号、
+A5 **查询健壮性**：用户输入**永不**作为 FTS5 表达式使用——先切词、去重、逐组加引号、
    以 `AND` 连接；操作符（`"` `*` `-` `:` `NEAR` `AND` `OR` `NOT` `^` `( )`）只按字面词
    处理。任何用户输入都不得让 `sqlite3.Error` 穿透到调用方。切词后为空 → `EmptyQueryError`
    （明确错误，不静默全空）；合法但无命中 → `total=0` 的明确空结果（不是错误）。
    超长文本 / 词元过多 → 明确拒绝，不截断。
+   **T-205 修订**：连续汉字归为一个"短语组"（`中文分词` → `"中 文 分 词"`），
+   而不是逐字 `AND`；判据与可执行证明见 `tests/test_search_cjk.py`（C1–C6）。
 
 A6 **越界参数**：`limit ∈ [1, 200]`（默认 50），越界**拒绝不截断**（与 SPEC §2.13 的
    T-106 裁决一致）；`offset ≥ 0`；`snippet_tokens ∈ [1, 64]`；筛选值非空且 ≤ 200 个；
@@ -83,11 +85,16 @@ BASE = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
 # A5：关键词 → 安全表达式
 # --------------------------------------------------------------------------- #
 def test_tokenize_splits_on_non_alphanumeric_and_drops_underscore() -> None:
-    """切词规则必须与 unicode61 的分隔规则一致：非字母数字（含 `_`）都是分隔符。"""
+    """切词规则必须与 unicode61 的分隔规则一致：非字母数字（含 `_`）都是分隔符。
+
+    **T-205 修订**：汉字先过 `segment_cjk`（与索引侧同一个函数），因此一个汉字就是一个
+    词元（原来是整段汉字连写成一个词元——那正是"查不到中文"的根因）。
+    """
     assert tokenize("foo-bar") == ("foo", "bar")
     assert tokenize("snake_case_name") == ("snake", "case", "name")
     assert tokenize("C++ 17") == ("C", "17")
-    assert tokenize("混合 text 与中文") == ("混合", "text", "与中文")
+    assert tokenize("混合 text 与中文") == ("混", "合", "text", "与", "中", "文")
+    assert tokenize("中文分词测试") == ("中", "文", "分", "词", "测", "试")
     assert tokenize("café") == ("café",)
 
 

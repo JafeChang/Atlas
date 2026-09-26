@@ -8,6 +8,8 @@
 | 模块 | 职责 |
 |---|---|
 | `query` | 关键词 → 安全 FTS5 表达式、筛选、排序、分页（**纯逻辑，零 I/O**） |
+| `cjk` | 汉字逐字切分与逆切分（纯函数、**可逆**；T-205 修订） |
+| `snippet` | 把 FTS5 摘要从切分后的文本还原到**原始文本**（禁止泄漏插入的分隔符） |
 | `documents` | 索引输入单元：`DocumentText`（`RawRecord` + T-104 归一化文本） |
 | `sqlite_index` | FTS5 索引的持久化：探测、重建、删除、查询（只写自己的三张表） |
 | `source` | 只读来源适配：`raw`（T-103）+ `normalize`（T-104）→ `DocumentText` |
@@ -25,7 +27,16 @@
    **不引入向量检索**（T-201）。
 3. **响亮失败**：FTS5 不可用、查询切词后为空、索引未构建或版本不符、
    参数越界——一律抛显式异常，**不**降级成 `LIKE`、**不**静默返回全空、
-    **不**静默截断。
+   **不**静默截断。
+
+汉字检索（T-205 修订）
+----------------------
+
+`unicode61` 不切分连续汉字，因此索引列存 `segment_cjk(text)`（`中 文 分 词`），
+对外正文仍是原始 `text`。查询侧把连续汉字拼成 FTS5 **短语**
+（`中文分词` → `"中 文 分 词"`，不是逐字 `AND`——后者会命中"人民工作智慧能力"），
+摘要侧把插入的分隔符还原掉。索引版本因此升到 `atlas.search.index/2`、
+schema 升到 `2`；**旧索引必须删除后重建**（读路径响亮失败并给出补救路径）。
 
 最小用法::
 
@@ -50,6 +61,14 @@
 
 from __future__ import annotations
 
+from .cjk import (
+    CJK_RANGES,
+    SEGMENTATION_VERSION,
+    desegment,
+    is_cjk,
+    is_inserted_space,
+    segment_cjk,
+)
 from .documents import DocumentText, text_sha256
 from .errors import (
     EmptyQueryError,
@@ -75,6 +94,7 @@ from .query import (
     ORDERS,
     SNIPPET_ELLIPSIS,
     Boost,
+    Group,
     SearchHit,
     SearchQuery,
     SearchResult,
@@ -82,8 +102,15 @@ from .query import (
     canonical_utc_iso,
     match_expression,
     parse_canonical_utc,
+    phrase_groups,
     rank_hits,
     tokenize,
+)
+from .snippet import (
+    SNIPPET_SENTINEL_CLOSE,
+    SNIPPET_SENTINEL_ELLIPSIS,
+    SNIPPET_SENTINEL_OPEN,
+    restore_snippet,
 )
 from .source import ArchiveDocumentSource, DocumentSource, Normalizer
 from .sqlite_index import (
@@ -98,6 +125,7 @@ from .sqlite_index import (
     MAX_DOCUMENTS,
     META_TABLE,
     SCHEMA_VERSION,
+    SEGMENTATION,
     TEXT_SOURCE,
     TOKENIZER,
     IndexReport,
@@ -109,6 +137,13 @@ from .sqlite_index import (
 )
 
 __all__ = [
+    # cjk（T-205 修订）
+    "CJK_RANGES",
+    "SEGMENTATION_VERSION",
+    "desegment",
+    "is_cjk",
+    "is_inserted_space",
+    "segment_cjk",
     # documents
     "DocumentText",
     "text_sha256",
@@ -120,6 +155,11 @@ __all__ = [
     "SearchIndexError",
     "SearchQueryError",
     "SearchSourceError",
+    # snippet（T-205 修订）
+    "SNIPPET_SENTINEL_CLOSE",
+    "SNIPPET_SENTINEL_ELLIPSIS",
+    "SNIPPET_SENTINEL_OPEN",
+    "restore_snippet",
     # query
     "DEFAULT_LIMIT",
     "DEFAULT_SNIPPET_TOKENS",
@@ -135,6 +175,7 @@ __all__ = [
     "ORDERS",
     "SNIPPET_ELLIPSIS",
     "Boost",
+    "Group",
     "SearchHit",
     "SearchQuery",
     "SearchResult",
@@ -142,6 +183,7 @@ __all__ = [
     "canonical_utc_iso",
     "match_expression",
     "parse_canonical_utc",
+    "phrase_groups",
     "rank_hits",
     "tokenize",
     # source
@@ -160,6 +202,7 @@ __all__ = [
     "MAX_DOCUMENTS",
     "META_TABLE",
     "SCHEMA_VERSION",
+    "SEGMENTATION",
     "TEXT_SOURCE",
     "TOKENIZER",
     "IndexReport",

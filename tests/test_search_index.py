@@ -642,22 +642,33 @@ def test_diacritics_are_folded_in_both_directions(harness: Harness) -> None:
     assert harness.index.search(SearchQuery(text="naïve")).total == 1
 
 
-def test_cjk_runs_are_not_segmented_by_unicode61(harness: Harness) -> None:
-    """**已知限制**（钉死在这里，不让它变成"看起来支持中文"的假象）。
+def test_cjk_runs_are_segmented_so_han_queries_hit(harness: Harness) -> None:
+    """T-205 修订：汉字逐字切分后，`中文` **能**命中 `中文分词测试与检索`。
 
-    FTS5 的 `unicode61` 把连续汉字当成**一个词元**（没有词典分词，标准库也没有），
-    因此 `中文` 查不到 `中文分词测试与检索`：只有整段汉字连写才能命中。
-    要支持中文子串检索需要换分词器（如 FTS5 `trigram`）或引入分词依赖——
-    那会改变 `TOKENIZER` / `index_version` 并使旧索引失效，属于需要显式裁决的变更。
+    这条测试原来叫 `test_cjk_runs_are_not_segmented_by_unicode61`，把"查不到中文"这一
+    **错误行为**钉死成期望（T-205 当时只能如实记录缺口）。缺口修复后它断言的是
+    **正确行为**——不是删掉、也不是放松断言。完整判据见 `tests/test_search_cjk.py`（C1–C6）。
     """
     harness.add("ch-a", "https://x.invalid/1", "中文分词测试与检索 mixed english")
     harness.rebuild()
+    # 整段连写照旧命中
     assert harness.index.search(SearchQuery(text="中文分词测试与检索")).total == 1
-    assert harness.index.search(SearchQuery(text="中文")).total == 0
-    assert harness.index.search(SearchQuery(text="分词")).total == 0
-    # 拉丁词仍按词元匹配，不受影响
+    # 修复点：子串汉字现在命中（原来是 0）
+    assert harness.index.search(SearchQuery(text="中文")).total == 1
+    assert harness.index.search(SearchQuery(text="分词")).total == 1
+    assert harness.index.search(SearchQuery(text="中文分词")).total == 1
+    assert harness.index.search(SearchQuery(text="测试与检索")).total == 1
+    assert harness.index.search(SearchQuery(text="检索")).total == 1
+    # 查询表达式是**短语**（逐字 AND 会带来大量假阳性）
+    assert SearchQuery(text="中文分词").match_expression() == '"中 文 分 词"'
+    # 摘要不得露出切分器插入的分隔符
+    snippet = harness.index.search(SearchQuery(text="中文", limit=1)).items[0].snippet
+    assert "[中文]" in snippet and "中 文" not in snippet
+    # 拉丁词仍按词元匹配，不受影响（前后缀行为不变）
     assert harness.index.search(SearchQuery(text="english")).total == 1
     assert harness.index.search(SearchQuery(text="eng")).total == 0
+    # 顺序敏感：倒过来的串不命中（短语而非逐字 AND）
+    assert harness.index.search(SearchQuery(text="分词中文")).total == 0
 
 
 def test_search_text_is_the_normalized_text_not_the_raw_bytes(harness: Harness) -> None:

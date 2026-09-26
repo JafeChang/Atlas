@@ -21,8 +21,18 @@
 数据不在时跳过
 --------------
 
-`data/` **不进 git**（SPEC §8.1），所以干净 worktree 里没有它——此时本测试
+`data/` **不进 git**（SPEC §8.1），所以干净 worktree 里没有它——此时**真实数据那几条**
 `skip`（而不是失败），真实证据由主工作区的那次运行给出。
+**链路证据（合成中文文档）不依赖 `data/`，任何检出里都会真的跑**。
+
+T-205 修订（汉字逐字切分）的额外证据
+------------------------------------
+
+真实语料里的 CJK 规模**如实报数**（实测 **0 篇**——534 个 JSON 里 474 篇有正文，
+没有任何一篇含汉字）。因此"中文查询命中 + 排序 + 摘要"这条证据必须由
+**一份真实的中文文档**走完整链路产生：raw 字节 → T-103 归档 → T-104 归一化 →
+T-205 索引 → 查询。产出里所有数字都带前缀 `[T-205CJK 真实]` / `[T-205CJK 合成]`，
+**明确区分**来源，不用编造数据充数。
 """
 
 from __future__ import annotations
@@ -39,10 +49,16 @@ from atlas.archive import ArchiveStore, open_archive
 from atlas.contracts import RawRecord
 from atlas.contracts.ids import content_sha256, raw_id_for
 from atlas.search import (
+    DOCS_TABLE,
+    FTS_TABLE,
     MAX_LIMIT,
+    SNIPPET_ELLIPSIS,
     ArchiveDocumentSource,
+    HIGHLIGHT_CLOSE,
+    HIGHLIGHT_OPEN,
     SearchQuery,
     SqliteSearchIndex,
+    is_cjk,
     open_index,
 )
 
@@ -60,7 +76,24 @@ REAL_QUERIES = (
     "machine learning",
 )
 
-pytestmark = pytest.mark.skipif(
+#: 实测的真实语料中文规模（2026-09-26 快照）。语料变了就**响亮失败**，
+#: 逼操作者重新测量而不是沿用陈旧数字。
+MEASURED_REAL_CJK_DOCUMENTS = 0
+
+#: 合成中文文档：真实语料里没有中文，因此这条链路证据必须自己造一份**真实的中文文档**
+#: （不是从真实语料里抄的），并单独标注。
+SYNTHETIC_ZH_ARTICLE = (
+    "<html><head><title>中文分词测试</title>"
+    "<style>styleonlytoken</style></head><body>"
+    "<script>scriptonlytoken</script>"
+    "<h1>中文分词测试与检索</h1>"
+    "<p>检索系统需要把连续汉字切成单字，再以短语查询保证顺序。</p>"
+    "<p>向量数据库与关键词检索是两条互补的技术路线。</p>"
+    "<p>mixed english tokens with BM25 ranking</p>"
+    "</body></html>"
+)
+
+requires_real_data = pytest.mark.skipif(
     not (LEGACY_RAW.is_dir() and any(LEGACY_RAW.rglob("*.json"))),
     reason="本地真实归档数据缺失（data/ 不进 git，见 SPEC §8.1）",
 )
@@ -172,6 +205,7 @@ def real_store(tmp_path_factory: pytest.TempPathFactory):
 # --------------------------------------------------------------------------- #
 # 证据
 # --------------------------------------------------------------------------- #
+@requires_real_data
 def test_real_archive_indexing_and_real_queries(real_store) -> None:
     """真实数据流：raw（真实抓取正文）→ 归一化 → FTS 索引 → 真实查询 → 删→重建。"""
     legacy_before = _tree_digest(LEGACY_RAW)
@@ -286,6 +320,7 @@ def test_real_archive_indexing_and_real_queries(real_store) -> None:
     assert _db_digest() == db_before
 
 
+@requires_real_data
 def test_real_corpus_is_not_tiny() -> None:
     """真实数据规模下限（防止"数据没了但测试还绿"）。"""
     documents = _load_legacy_documents()
@@ -294,3 +329,244 @@ def test_real_corpus_is_not_tiny() -> None:
     assert len(channels) >= 3, f"真实频道只有 {len(channels)} 个：{sorted(channels)}"
     assert all(len(content) > 0 for *_, content, _ in documents)
     assert all(isinstance(moment, datetime) for *_, moment in documents)
+
+
+# =========================================================================== #
+# T-205 修订（汉字逐字切分）的真实数据流证据
+# =========================================================================== #
+def _corpus_cjk_stats() -> Tuple[int, int, int, Dict[str, int]]:
+    """真实语料的中文规模：`(有正文篇数, 含 CJK 篇数, CJK 码点总数, 每频道含 CJK 篇数)`。
+
+    判定用**与索引同一个函数** `atlas.search.is_cjk`——统计口径不能和实现口径分家。
+    只读，不写 `data/`。
+    """
+    with_body = 0
+    with_cjk = 0
+    cjk_chars = 0
+    per_channel: Dict[str, int] = {}
+    for path in sorted(LEGACY_RAW.rglob("*.json")):
+        try:
+            payload = json.loads(path.read_bytes().decode("utf-8", "replace"))
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        content = payload.get("raw_content")
+        if not isinstance(content, str) or not content.strip():
+            continue
+        with_body += 1
+        count = sum(1 for character in content if is_cjk(character))
+        if count:
+            with_cjk += 1
+            cjk_chars += count
+            per_channel[path.parent.name] = per_channel.get(path.parent.name, 0) + 1
+    return with_body, with_cjk, cjk_chars, per_channel
+
+
+@requires_real_data
+def test_real_corpus_cjk_scale_is_reported_and_pinned() -> None:
+    """**如实报数**真实语料的中文规模，并把测到的值钉住（变了就响亮失败）。
+
+    首次测量（本次修订）：534 个 JSON / 474 篇有正文，**含 CJK 的文档 0 篇**。
+    也就是说"真实中文内容规模"目前是 0——所以中文检索的证据必须由合成链路提供
+    （见 `test_synthetic_chinese_document_goes_through_the_whole_pipeline`）。
+    """
+    with_body, with_cjk, cjk_chars, per_channel = _corpus_cjk_stats()
+    print(
+        f"\n[T-205CJK 真实] 真实语料：{len(list(LEGACY_RAW.rglob('*.json')))} 个 JSON，"
+        f"{with_body} 篇有正文，**含 CJK 的 {with_cjk} 篇**，CJK 码点总数 {cjk_chars}"
+    )
+    for channel in sorted(per_channel):
+        print(f"[T-205CJK 真实]   频道 {channel}: 含 CJK {per_channel[channel]} 篇")
+    assert with_body >= 100, f"真实有正文的文档只有 {with_body} 篇，数据可能已缺失"
+    assert with_cjk == MEASURED_REAL_CJK_DOCUMENTS, (
+        f"真实语料的中文规模变了：实测含 CJK {with_cjk} 篇，"
+        f"记录值是 {MEASURED_REAL_CJK_DOCUMENTS} 篇。请重新测量并更新 "
+        "MEASURED_REAL_CJK_DOCUMENTS（以及交付报告里的数字），不要沿用陈旧数字。"
+    )
+
+
+@requires_real_data
+def test_real_corpus_has_no_han_run_so_english_queries_are_the_real_regression_net(
+    real_store,
+) -> None:
+    """真实语料全英文 ⇒ "英文行为不变"这条回归在**真实数据**上也可验证（判据 C6）。
+
+    关键结构性事实：0 篇含 CJK ⇒ `text_index == text`（切分是恒等变换）⇒
+    进倒排索引的字节与 T-205 完全一致 ⇒ BM25 分数与排序不可能变化。
+    """
+    root, archive, channels = real_store
+    index = open_index(root)
+    try:
+        index.rebuild(ArchiveDocumentSource(archive).iter_documents(), industry_of=channels)
+
+        with index.lock:
+            rows = index.connection.execute(
+                f"SELECT raw_id, text, text_index FROM {DOCS_TABLE} ORDER BY raw_id"
+            ).fetchall()
+        assert rows
+        different = [row["raw_id"] for row in rows if row["text_index"] != row["text"]]
+        assert different == [], (
+            f"{len(different)} 篇文档的切分文本与原文不同；但真实语料实测没有汉字，"
+            "这说明数据变了或切分器不是恒等变换"
+        )
+        print(
+            f"[T-205CJK 真实] {len(rows)} 篇真实文档：text_index == text（切分恒等）⇒"
+            " 倒排索引字节与 T-205 相同"
+        )
+
+        for text in REAL_QUERIES:
+            query = SearchQuery(text=text, limit=MAX_LIMIT)
+            result = index.search(query)
+            keys = [(-hit.score, -hit.fetched_at.timestamp(), hit.raw_id) for hit in result.items]
+            assert keys == sorted(keys)
+            for hit in result.items:
+                original = index.get(hit.raw_id).text
+                for piece in _raw_snippet_pieces(index, query, hit.raw_id):
+                    assert piece in original, f"英文摘要片段不是原文子串：{piece!r}"
+            print(
+                f"[T-205CJK 真实] 英文查询 {text!r}: 命中 {result.total}，"
+                f"前 {min(3, result.total)} 条 = "
+                + ", ".join(
+                    f"{hit.raw_id[4:14]}…(score={hit.score:.4g})" for hit in result.items[:3]
+                )
+            )
+    finally:
+        index.close()
+
+
+def _raw_snippet_pieces(index, query: SearchQuery, raw_id: str) -> List[str]:
+    """在**不带高亮标记**的原始摘要上切片。
+
+    公开的 `hit.snippet` 用 `[` / `]` 当高亮标记，而正文里也可能有字面的方括号
+    （真实语料里就有 `List[Example]`），因此不能用"去掉方括号"来做结构性断言。
+    这里直接让 FTS5 用空标记渲染，再按省略号切片——每一段都必须逐字符来自原文。
+    """
+    with index.lock:
+        row = index.connection.execute(
+            f"SELECT snippet({FTS_TABLE}, 0, '', '', ?, ?) AS piece FROM {FTS_TABLE} "
+            f"WHERE {FTS_TABLE} MATCH ? AND {FTS_TABLE}.rowid = "
+            f"(SELECT doc_rowid FROM {DOCS_TABLE} WHERE raw_id = ?)",
+            (SNIPPET_ELLIPSIS, query.snippet_tokens, query.match_expression(), raw_id),
+        ).fetchone()
+    assert row is not None, f"{raw_id} 在 MATCH {query.match_expression()!r} 上没有行"
+    return [piece for piece in row["piece"].split(SNIPPET_ELLIPSIS) if piece]
+
+
+def _synthetic_zh_record(content: bytes) -> RawRecord:
+    digest = content_sha256(content)
+    return RawRecord(
+        raw_id=raw_id_for("zh-synthetic", "https://example.invalid/zh-1", digest),
+        channel_id="zh-synthetic",
+        endpoint="https://example.invalid/zh-1",
+        content_sha256=digest,
+        byte_length=len(content),
+        fetched_at=BASE,
+        http_status=200,
+    )
+
+
+def _snippet_pieces(snippet: str) -> List[str]:
+    plain = snippet.replace(HIGHLIGHT_OPEN, "").replace(HIGHLIGHT_CLOSE, "")
+    return [piece for piece in plain.split(SNIPPET_ELLIPSIS) if piece]
+
+
+def test_synthetic_chinese_document_goes_through_the_whole_pipeline(tmp_path: Path) -> None:
+    """**合成链路证据**：raw 字节 → 归档 → 归一化 → 索引 → 查询（真实语料无中文）。
+
+    所有数字都属于**合成**来源，打印前缀是 `[T-205CJK 合成]`，
+    与 `[T-205CJK 真实]` 的数字严格分开。
+    """
+    content = SYNTHETIC_ZH_ARTICLE.encode("utf-8")
+    root = tmp_path / "zh-store"
+    archive = open_archive(root)
+    index = open_index(root)
+    try:
+        record = archive.put(_synthetic_zh_record(content), content)
+        print(
+            f"\n[T-205CJK 合成] raw 字节 {len(content)}B（UTF-8 HTML）→ 归档 raw_id="
+            f"{record.raw_id[:12]}… content_sha256={record.content_sha256[:12]}…"
+        )
+        assert archive.verify() == []
+
+        report = index.rebuild(ArchiveDocumentSource(archive).iter_documents())
+        document = index.get(record.raw_id)
+        assert document is not None
+        normalized = document.text
+        print(
+            f"[T-205CJK 合成] 归一化文本 {len(normalized)} 字符：{normalized!r}"
+        )
+        assert "中文分词测试与检索" in normalized
+        assert "scriptonlytoken" not in normalized and "styleonlytoken" not in normalized
+
+        # 查询：命中数 + 排序 + 摘要
+        for text in ("中文分词", "向量数据库", "检索", "中文字", "分词中文", "bm25"):
+            result = index.search(SearchQuery(text=text, limit=MAX_LIMIT))
+            keys = [(-hit.score, -hit.fetched_at.timestamp(), hit.raw_id) for hit in result.items]
+            assert keys == sorted(keys), "结果必须按 (score desc, fetched_at desc, raw_id asc)"
+            print(
+                f"[T-205CJK 合成] 查询 {text!r}: 命中 {result.total}/{report.document_count}，"
+                f"expression={result.expression!r}，"
+                + (
+                    f"snippet={result.items[0].snippet!r}"
+                    if result.items
+                    else "snippet=（无命中）"
+                )
+            )
+
+        # 核心修复：子串汉字命中，且**顺序敏感**
+        assert index.search(SearchQuery(text="中文")).total == 1
+        assert index.search(SearchQuery(text="中文分词")).total == 1
+        assert index.search(SearchQuery(text="向量数据库")).total == 1
+        assert index.search(SearchQuery(text="分词中文")).total == 0, "短语必须顺序敏感"
+        # 合成语料里没有"工人智能"这类字面串，验证逐字 AND 的假阳性在真实链路里也存在
+        assert index.search(SearchQuery(text="数据库与关键")).total == 1
+
+        hit = index.search(SearchQuery(text="中文分词", limit=1)).items[0]
+        assert "[中文分词]" in hit.snippet
+        assert "中 文" not in hit.snippet and "分 词" not in hit.snippet
+        for piece in _snippet_pieces(hit.snippet):
+            assert piece in normalized, f"摘要片段不是原文子串：{piece!r}"
+        print(
+            f"[T-205CJK 合成] 摘要还原后不含插入分隔符；片段均为原文子串："
+            f"{hit.snippet!r}"
+        )
+
+        # 删索引 → 从 raw 全量重建 → 结果逐条相同（判据 C8：索引仍是只读投影）
+        query = SearchQuery(text="中文分词")
+        before = [
+            (h.raw_id, h.score, h.snippet)
+            for h in index.search(SearchQuery(text="中文分词", limit=MAX_LIMIT)).items
+        ]
+        index.drop()
+        assert index.is_built() is False
+        rebuilt = index.rebuild(ArchiveDocumentSource(archive).iter_documents())
+        after = [
+            (h.raw_id, h.score, h.snippet)
+            for h in index.search(SearchQuery(text="中文分词", limit=MAX_LIMIT)).items
+        ]
+        assert before == after and before
+        assert rebuilt.corpus_sha256 == report.corpus_sha256
+        print(
+            f"[T-205CJK 合成] drop → rebuild：命中序列逐条相同，"
+            f"corpus_sha256={rebuilt.corpus_sha256[:16]}…"
+        )
+
+        # `text_index` 内部列确实存在、确实是切分后的文本，但**没有任何对外返回路径**
+        row = index.connection.execute(
+            "SELECT text, text_index FROM search_documents WHERE raw_id = ?",
+            (record.raw_id,),
+        ).fetchone()
+        assert row["text"] == normalized
+        assert row["text_index"] != normalized and "中 文 分 词" in row["text_index"]
+        assert not hasattr(document, "text_index")
+        assert query.match_expression() == '"中 文 分 词"'
+        assert archive.verify() == []
+        print(
+            f"[T-205CJK 合成] text_index（内部列，长度 {len(row['text_index'])}）"
+            f"只进倒排索引，get()/SearchHit 上都没有它"
+        )
+    finally:
+        index.close()
+        archive.close()
+
