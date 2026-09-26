@@ -1,0 +1,15 @@
+{
+  "name": "@atlas/cognition-sidecar",
+  "version": "1.0.0",
+  "private": true,
+  "description": "T-003 PI sidecar: pi-ai with ZERO tools registered (SPEC §2.14 decision 1). Node dependencies are confined to this process; the Python project stays stdlib-only.",
+  "type": "module",
+  "main": "run.mjs",
+  "engines": {
+    "node": ">=20.19"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "@earendil-works/pi-ai": "0.87.1"
+  }
+}
