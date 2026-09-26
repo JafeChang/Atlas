@@ -13,10 +13,29 @@
 
 其它路径 → `404 not_found`；非 GET → `405 method_not_allowed` + `Allow: GET`。
 
+两种粒度（T-109 补完时新增，见 `atlas.feed.query` 的模块 docstring）
+-------------------------------------------------------------------
+
+`?granularity=entry` 时列表项是**条目**而不是文档：容器（feed-Raw）本身不出现，
+它的派生条目出现；本身即条目的 Raw 整篇作为一条出现（SPEC §6.3 裁决 B）。
+条目项的字段是文档项的**超集**：原有字段一个不少，另加
+
+    "entry_id": "ent_…" | null,   "title": "...",  "link": "https://...",
+    "published_at": "2026-01-01T00:00:00.000000+00:00" | null,
+    "char_start": 0, "char_end": 123, "ordinal": 0, "from_feed": true,
+    "raw_sha256": "<64 hex>", "timestamp": "...", "problems": []
+
+其中 `raw_id` + `raw_sha256` + `char_start` + `char_end` 是**锚点四元组**：
+前端据此构造人工标签的锚点。`entry_id` 是**派生**标识，**不得作锚点**（T-130）。
+
+> `contract_version` 因此从 **1 升到 2**（SPEC §2.13：对外契约的改动需升版）。
+> **向后兼容性**：`granularity` 默认 `document`，且默认响应里唯一的差异是
+> `filters` 多了 `"granularity": "document"`；`items` 的字段集与语义**逐字段不变**。
+
 成功响应（`200`）::
 
     {
-      "contract_version": 1,
+      "contract_version": 2,
       "items": [
         {
           "raw_id": "...", "channel_id": "...", "industry": "ai",
@@ -34,11 +53,12 @@
 
 错误响应（`400` / `404` / `405` / `500`）::
 
-    {"contract_version": 1,
+    {"contract_version": 2,
      "error": {"code": "invalid_query", "parameter": "limit", "message": "..."}}
 
 错误码：`invalid_query`（参数非法，**拒绝而不是静默忽略**）、`not_found`、
-`method_not_allowed`、`feed_unavailable`（服务端未接线 / 数据源违约）、`internal_error`。
+`method_not_allowed`、`feed_unavailable`（服务端未接线 / 数据源违约）、
+`internal_error`。
 
 线程与只读
 ----------
@@ -48,7 +68,8 @@
   **不是**因为 `sqlite3` 线程亲和——归档层已用 `check_same_thread=False` + 锁解除了
   该限制（T-103，`70c5a68`），单个归档实例可以安全地跨线程共享。两种都支持，
   见 `atlas.feed.repository.ArchiveFeedSource` 的说明）；
-- 本模块只调用 `list_raw` / `industry_of` / 注入的 `label_lookup`，没有任何写入路径。
+- 本模块只调用 `list_raw` / `industry_of` / 注入的 `label_lookup` / 注入的
+  `entries_of`，没有任何写入路径。
 """
 
 from __future__ import annotations
@@ -62,6 +83,7 @@ from typing import Any, Dict, Mapping
 from urllib.parse import parse_qs, urlsplit
 
 from .query import (
+    FeedEntry,
     FeedQuery,
     FeedQueryError,
     FeedResult,
@@ -77,11 +99,19 @@ __all__ = [
     "FeedRequestHandler",
     "error_payload",
     "feed_payload",
+    "entry_payload",
     "start_feed_server",
 ]
 
 #: 对外 JSON 契约版本。**改形状必须升版本**（SPEC §2.11：换框架不得改契约）。
-CONTRACT_VERSION = 1
+#:
+#: 版本历史：
+#:
+#: - **1**：文档粒度（`granularity="document"`）的原始契约。
+#: - **2**（T-109 补完）：新增**条目粒度**（`?granularity=entry`）。默认响应里
+#:   唯一的差异是 `filters` 多了 `"granularity": "document"`；`items` 的字段集
+#:   与语义逐字段不变，因此既有消费者按 `document` 粒度读仍然正确。
+CONTRACT_VERSION = 2
 
 ERROR_CODES = {
     HTTPStatus.BAD_REQUEST: "invalid_query",
@@ -89,6 +119,8 @@ ERROR_CODES = {
     HTTPStatus.METHOD_NOT_ALLOWED: "method_not_allowed",
     HTTPStatus.INTERNAL_SERVER_ERROR: "internal_error",
 }
+
+#: `error_payload` 的契约版本与响应体一致（错误也是契约的一部分）。
 
 _log = logging.getLogger("atlas.feed.http")
 
@@ -100,7 +132,11 @@ _ALLOWED_METHODS = ("GET",)
 # JSON 契约
 # ---------------------------------------------------------------------- #
 def feed_payload(result: FeedResult) -> Dict[str, Any]:
-    """把查询结果渲染成对外 JSON（**契约的唯一出处**）。"""
+    """把查询结果渲染成对外 JSON（**契约的唯一出处**）。
+
+    条目粒度（`granularity="entry"`）下 `items` 的元素是条目投影，
+    字段是文档投影的**超集**（见模块 docstring）。
+    """
     return {
         "contract_version": CONTRACT_VERSION,
         "items": [_item_payload(item) for item in result.items],
@@ -118,6 +154,8 @@ def feed_payload(result: FeedResult) -> Dict[str, Any]:
 
 
 def _item_payload(item: Any) -> Dict[str, Any]:
+    if isinstance(item, FeedEntry):
+        return entry_payload(item)
     return {
         "raw_id": item.raw_id,
         "channel_id": item.channel_id,
@@ -129,6 +167,39 @@ def _item_payload(item: Any) -> Dict[str, Any]:
         "http_status": item.http_status,
         "labels": list(item.labels),
     }
+
+
+def entry_payload(entry: FeedEntry) -> Dict[str, Any]:
+    """条目粒度的对外形状：文档字段的**超集** + 条目字段 + **锚点四元组**。
+
+    锚点四元组（`raw_id` / `raw_sha256` / `char_start` / `char_end`）必须一起出现，
+    否则前端构造不出 `EvidenceAnchor`（SPEC §6.3）。`entry_id` 是派生标识，
+    不是锚点，`None` 表示"整篇原文本身就是一个条目"。
+    """
+    payload = {
+        "entry_id": entry.entry_id,
+        "raw_id": entry.raw_id,
+        "raw_sha256": entry.raw_sha256,
+        "title": entry.title,
+        "link": entry.link,
+        "published_at": entry.published_at,
+        "char_start": entry.char_start,
+        "char_end": entry.char_end,
+        "ordinal": entry.ordinal,
+        "from_feed": entry.from_feed,
+        "timestamp": entry.timestamp.isoformat(),
+        "problems": list(entry.problems),
+        # 文档上下文（与文档粒度同名同义，便于前端同一套渲染）
+        "channel_id": entry.channel_id,
+        "industry": entry.industry,
+        "endpoint": entry.endpoint,
+        "content_sha256": entry.content_sha256,
+        "byte_length": entry.byte_length,
+        "fetched_at": entry.fetched_at.isoformat(),
+        "http_status": entry.http_status,
+        "labels": list(entry.labels),
+    }
+    return payload
 
 
 def error_payload(
@@ -184,10 +255,13 @@ class FeedRequestHandler(BaseHTTPRequestHandler):
             return
 
         label_lookup: LabelLookup | None = getattr(self.server, "label_lookup", None)
+        entries_of = getattr(self.server, "entries_of", None)
         source: Any = None
         try:
             source = self.server.resolve_source()
-            result = run_query(source, query, label_lookup=label_lookup)
+            result = run_query(
+                source, query, label_lookup=label_lookup, entries_of=entries_of
+            )
         except InvalidQueryError as exc:  # 参数问题（例如区间矛盾）
             self._send_json(
                 HTTPStatus.BAD_REQUEST,
@@ -265,9 +339,11 @@ class FeedHTTPServer(ThreadingHTTPServer):
         *,
         source: Any,
         label_lookup: LabelLookup | None = None,
+        entries_of: Any = None,
     ) -> None:
         self._source = source
         self.label_lookup = label_lookup
+        self.entries_of = entries_of
         super().__init__(server_address, FeedRequestHandler)
 
     def resolve_source(self) -> Any:
@@ -296,10 +372,13 @@ class FeedServer:
         source: Any,
         *,
         label_lookup: LabelLookup | None = None,
+        entries_of: Any = None,
         host: str = "127.0.0.1",
         port: int = 0,
     ) -> None:
-        self._httpd = FeedHTTPServer((host, port), source=source, label_lookup=label_lookup)
+        self._httpd = FeedHTTPServer(
+            (host, port), source=source, label_lookup=label_lookup, entries_of=entries_of
+        )
         self._thread = threading.Thread(
             target=self._serve,
             name="atlas-feed-http",
@@ -346,8 +425,15 @@ def start_feed_server(
     source: Any,
     *,
     label_lookup: LabelLookup | None = None,
+    entries_of: Any = None,
     host: str = "127.0.0.1",
     port: int = 0,
 ) -> FeedServer:
     """便捷入口（语义同 `FeedServer(...)`，已启动）。"""
-    return FeedServer(source, label_lookup=label_lookup, host=host, port=port)
+    return FeedServer(
+        source,
+        label_lookup=label_lookup,
+        entries_of=entries_of,
+        host=host,
+        port=port,
+    )

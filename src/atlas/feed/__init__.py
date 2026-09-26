@@ -4,9 +4,19 @@
 
 | 模块 | 职责 |
 |---|---|
-| `query` | 筛选 / 稳定排序 / 分页（**纯逻辑**，零 I/O、不碰 HTTP） |
+| `query` | 筛选 / 稳定排序 / 分页（**纯逻辑**，零 I/O、不碰 HTTP）+ 两种粒度的投影类型 |
 | `repository` | 数据来源适配：`FeedSource` Protocol + `atlas.archive` 只读适配 |
 | `http` | stdlib `ThreadingHTTPServer` + `json` 的只读 HTTP 服务 + 对外 JSON 契约 |
+
+两种粒度（SPEC §6.3 裁决 B / §6.5）
+-----------------------------------
+
+`FeedQuery.granularity` 取 `"document"`（**默认**，原契约不变）或 `"entry"`（条目粒度：
+一条记录 = 一个可浏览单元）。条目粒度下**容器（feed-Raw）本身不出现**，它的派生条目
+才是列表项；**本身即条目的 Raw（article-Raw）整篇作为一条**出现。
+条目由调用方以 `entries_of=...` 注入（本包不 import `atlas.entries`，见 §4.0）。
+`FeedEntry` 同时输出 `raw_id` + `raw_sha256` + 字符区间 —— 前端据此**构造锚点**，
+而 `entry_id` 只是派生标识、**不作锚点**（T-130）。
 
 三条硬性质
 ----------
@@ -15,8 +25,8 @@
    打标是 T-108 的 Confirmed 契约，与查询通道分离（SPEC §2.11）。
 2. **零新依赖**：只用标准库（`http.server` / `json` / `dataclasses` / `datetime`）
    与已提交的 `atlas.contracts` / `atlas.archive`。
-3. **解耦**：`industry_of` 与 `label_lookup` 都是**注入**的；本包**不 import**
-   `atlas.labels`（T-108 在建）与 `atlas.registry` 的实现（SPEC §4.0）。
+3. **解耦**：`industry_of` / `label_lookup` / `entries_of` 都是**注入**的；本包
+   **不 import** `atlas.labels` / `atlas.registry` / `atlas.entries` 的实现（SPEC §4.0）。
 
 最小用法::
 
@@ -44,15 +54,23 @@ from .http import (
 )
 from .query import (
     DEFAULT_LIMIT,
+    DOCUMENT_GRANULARITY,
+    ENTRY_GRANULARITY,
+    GRANULARITIES,
     MAX_LIMIT,
+    EntriesLookup,
+    EntryView,
+    FeedEntry,
     FeedItem,
     FeedQuery,
     FeedQueryError,
     FeedResult,
     InvalidQueryError,
     LabelLookup,
+    RawEntriesView,
     SourceContractError,
     run_query,
+    title_from_endpoint,
 )
 from .repository import (
     EMPTY_LABEL_LOOKUP,
@@ -74,15 +92,23 @@ __all__ = [
     "start_feed_server",
     # query
     "DEFAULT_LIMIT",
+    "DOCUMENT_GRANULARITY",
+    "ENTRY_GRANULARITY",
+    "GRANULARITIES",
     "MAX_LIMIT",
+    "EntriesLookup",
+    "EntryView",
+    "FeedEntry",
     "FeedItem",
     "FeedQuery",
     "FeedQueryError",
     "FeedResult",
     "InvalidQueryError",
     "LabelLookup",
+    "RawEntriesView",
     "SourceContractError",
     "run_query",
+    "title_from_endpoint",
     # repository
     "EMPTY_LABEL_LOOKUP",
     "ArchiveFeedSource",

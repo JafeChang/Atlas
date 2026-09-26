@@ -4,16 +4,27 @@
 --------------------------
 
 `SPEC.md` §4.0 规定跨包只允许依赖 `atlas.contracts` 与 `atlas.registry.schema`（类型）。
-T-106 需要三类数据：
+T-106 需要四类数据：
 
 | 数据 | 来源 | 本包的取法 |
 |---|---|---|
 | 原文元数据 | `atlas.archive`（T-103，已提交） | `ArchiveFeedSource` 适配（只读） |
 | 渠道 → 行业 | `atlas.registry` 的配置（T-101） | **注入** `industry_of(channel_id)` 可调用对象 |
 | 是否已打标 / 标签 | `atlas.labels`（T-108，**正在写**） | **注入** `LabelLookup`（`raw_id -> 标签键`） |
+| 派生条目（SPEC §6.3 裁决 B） | `atlas.entries`（T-130） | **注入** `EntriesLookup`（在 `atlas.feed.query`） |
 
-因此本包**不 import** `atlas.labels`，也不 import `atlas.registry` 的实现；
-`tests/test_feed_http.py::test_feed_package_does_not_import_labels` 用 AST 静态守住这条边界。
+因此本包**不 import** `atlas.labels` / `atlas.registry` / `atlas.entries`；
+`tests/test_feed_http.py::test_feed_package_does_not_import_labels_or_registry_impl`
+用 AST 静态守住这条边界。
+
+`entry_kind` 的注入（T-109 补完时新增）
+---------------------------------------
+
+SPEC §6.3 把 raw 分成"容器 / 本身即条目 / 无内容"三类，而**当前 `raw_records`
+表没有这一列**（加列会牵动 T-103 的物理表，超出本次范围）。因此分类由调用方
+**注入**：`entry_kind_of(raw_id) -> str | None`，默认恒为 `None`
+（= 不是容器）。真实数据上的分类由 `atlas.webapp` 的启动装配，
+按"内容能否解析成 feed"算出来（确定性、可重建）。
 
 只读性
 ------
@@ -109,9 +120,11 @@ class ArchiveFeedSource:
         archive: ArchiveStore,
         *,
         industry_of: Callable[[str], str | None] | Mapping[str, str] | None = None,
+        entry_kind_of: Callable[[str], str | None] | Mapping[str, str] | None = None,
     ) -> None:
         self._archive = archive
         self._industry_of = _as_industry_lookup(industry_of)
+        self._entry_kind_of = _as_entry_kind_lookup(entry_kind_of)
 
     @property
     def archive(self) -> ArchiveStore:
@@ -123,10 +136,49 @@ class ArchiveFeedSource:
         if offset < 0:
             raise ValueError(f"offset 必须 ≥ 0（收到 {offset}）")
         raw_ids = self._archive.all_raw_ids()[offset : offset + limit]
-        return [self._archive.get(raw_id) for raw_id in raw_ids]
+        records = [self._archive.get(raw_id) for raw_id in raw_ids]
+        return [_with_entry_kind(record, self._entry_kind_of) for record in records]
 
     def industry_of(self, channel_id: str) -> str | None:
         return self._industry_of(channel_id)
+
+    def get_raw(self, raw_id: str) -> RawRecord:
+        """按 id 取一条（带注入的 `entry_kind`）——供 `/entry` 这类单条页面用。"""
+        return _with_entry_kind(self._archive.get(raw_id), self._entry_kind_of)
+
+    def content(self, raw_id: str) -> bytes:
+        """原始字节（只读）。条目页面要高亮区间，必须有原文。"""
+        return self._archive.get_content(raw_id)
+
+
+def _with_entry_kind(
+    record: RawRecord, lookup: Callable[[str], str | None]
+) -> RawRecord:
+    """把注入的 `entry_kind` 合并进记录。
+
+    **必须显式构造新记录**：`RawRecord` 是 pydantic 契约记录（`frozen=True`），
+    `model_copy(update=...)` 被 `atlas.contracts.base` 显式封死（那是"写入即不可变"
+    的硬约束），所以这里逐字段重建。
+
+    - 记录自己已经带分类（非 `None`）⇒ **以记录为准**，注入只是给"没这一列"的来源兜底；
+    - 注入也算不出分类 ⇒ 原样返回：否则每条记录都会被复制一遍，
+      白白丢掉"同一个 `RawRecord` 实例"这个便宜的相等性。
+    """
+    if record.entry_kind is not None:
+        return record
+    kind = lookup(record.raw_id)
+    if kind is None or kind == record.entry_kind:
+        return record
+    return RawRecord(
+        raw_id=record.raw_id,
+        channel_id=record.channel_id,
+        endpoint=record.endpoint,
+        content_sha256=record.content_sha256,
+        byte_length=record.byte_length,
+        fetched_at=record.fetched_at,
+        http_status=record.http_status,
+        entry_kind=kind,
+    )
 
 
 class StaticFeedSource:
@@ -141,9 +193,11 @@ class StaticFeedSource:
         records: Iterable[RawRecord],
         *,
         industry_of: Callable[[str], str | None] | Mapping[str, str] | None = None,
+        entry_kind_of: Callable[[str], str | None] | Mapping[str, str] | None = None,
     ) -> None:
         self._records: Tuple[RawRecord, ...] = tuple(records)
         self._industry_of = _as_industry_lookup(industry_of)
+        self._entry_kind_of = _as_entry_kind_lookup(entry_kind_of)
 
     def list_raw(self, limit: int, offset: int) -> Sequence[RawRecord]:
         if limit < 1:
@@ -151,7 +205,8 @@ class StaticFeedSource:
         if offset < 0:
             raise ValueError(f"offset 必须 ≥ 0（收到 {offset}）")
         ordered = sorted(self._records, key=lambda record: record.raw_id)
-        return ordered[offset : offset + limit]
+        page = ordered[offset : offset + limit]
+        return [_with_entry_kind(record, self._entry_kind_of) for record in page]
 
     def industry_of(self, channel_id: str) -> str | None:
         return self._industry_of(channel_id)
@@ -168,6 +223,7 @@ def archive_source_factory(
     root: Any = None,
     *,
     industry_of: Callable[[str], str | None] | Mapping[str, str] | None = None,
+    entry_kind_of: Callable[[str], str | None] | Mapping[str, str] | None = None,
     **archive_kwargs: Any,
 ) -> Callable[[], ArchiveFeedSource]:
     """构造**每请求新开归档连接**的源工厂（返回**零参**可调用对象）。
@@ -181,7 +237,9 @@ def archive_source_factory(
 
     def factory() -> ArchiveFeedSource:
         return ArchiveFeedSource(
-            open_archive(root, **archive_kwargs), industry_of=industry_of
+            open_archive(root, **archive_kwargs),
+            industry_of=industry_of,
+            entry_kind_of=entry_kind_of,
         )
 
     return factory
@@ -200,4 +258,24 @@ def _as_industry_lookup(
 
 def _no_industry(channel_id: str) -> None:
     """默认：没有行业信息源 → 一律 `None`（"未归行业"），绝不编造。"""
+    return None
+
+
+def _as_entry_kind_lookup(
+    source: Callable[[str], str | None] | Mapping[str, str] | None,
+) -> Callable[[str], str | None]:
+    if source is None:
+        return _not_a_container
+    if callable(source):
+        return source
+    mapping: Dict[str, str] = dict(source)
+    return lambda raw_id: mapping.get(raw_id)
+
+
+def _not_a_container(raw_id: str) -> None:
+    """默认：没有任何容器信息源 → 一律 `None`（"不是容器"）。
+
+    方向**必须**是 `None`：反过来会让所有既有记录（显式带上 `entry_kind=None`）
+    从条目列表里消失 —— 那是静默的数据消失，不是分类。
+    """
     return None

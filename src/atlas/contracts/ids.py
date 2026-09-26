@@ -11,6 +11,14 @@
 - `label_id` = f(raw_id, label_key, label_value, actor)
   同一个人重复提交同一判断 → 幂等；改判断 → 新的 label_id（Confirmed 只增不改）。
 
+  **`anchor` 刻意不参与**（T-109 补完时明确下来的）：`label_id` 的内容寻址口径
+  是跨模块一致的——`labels/sqlite_store.py` 的 `_assert_label_id` 与
+  `labels/export.py` 的 `verify_label_id` 都按上面这四个字段重算，导出文件也是
+  按这个口径校验的。把 `anchor` 加进来会让**所有带锚点的既有记录无法再回流**
+  （Confirmed 只增不改 ⇒ 改不回去）。代价是"同一文档同一个人的同维度同取值、
+  锚在不同区间"会撞同一个 `label_id`；这一点必须由写入方**显式检测并响亮拒绝**，
+  不能靠 id 隐式区分（见 `atlas.contracts.states.ConfirmedLabel` 的 docstring）。
+
 非法入参一律抛 `IdError`（不返回空串、不静默纠正）。
 """
 

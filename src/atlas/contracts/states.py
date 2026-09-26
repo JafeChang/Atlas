@@ -12,10 +12,11 @@
 因此本模块所有版本推进都走显式构造（见 `ProposedClaim.with_version`）。
 
 关键不变量：**Confirmed 只能由「证据已校验」的 Proposed 派生**。
-但 1A 决定人工标签是文档级的——人可以直接判断"这条有效"，无需 AI 证据。
-因此提供两个入口，语义不同、要求不同：
+但 1A 决定人工可以直接判断"这条有效"，无需 AI 证据。因此提供两个入口，
+语义不同、要求不同：
 
-- `ConfirmedLabel.human(...)`        人工直判，不要求证据
+- `ConfirmedLabel.human(...)`        人工直判，不要求证据；
+  **文档级**（`anchor=None`，1A）与**条目级**（带该条目的字符区间，2C）两种粒度
 - `ConfirmedLabel.from_proposal(...)` 确认 AI 提议，**必须** VERIFIED + anchor
 
 Store 为契约级实现（内存版）。T-103 用文件系统 + stdlib `sqlite3` 实现同一契约，
@@ -54,7 +55,30 @@ def _utcnow() -> datetime:
 
 
 class RawRecord(ContractModel):
-    """原文元数据。内容本身由 blob 存储（T-103 落盘）。"""
+    """原文元数据。内容本身由 blob 存储（T-103 落盘）。
+
+    `entry_kind`（T-109 补完时新增，**可选、不参与 `raw_id`**）
+    ------------------------------------------------------------
+
+    SPEC §6.3 裁决 B 把 raw 分成三类：**feed-Raw 是容器**（它的派生条目才是条目），
+    **article-Raw 本身就是条目**，无内容的既不是容器也不是条目。
+    这个分类必须能被消费者机器可判，否则 feed 前端只能靠"试着解析一下"来猜。
+
+    | 值 | 含义 |
+    |---|---|
+    | `None`（默认） | 未标定 ⇒ **不当作容器**：整篇原文就是一个条目 |
+    | `"feed"` | 容器：内容是一份 feed，条目由 `atlas.entries` 派生 |
+
+    为什么用 `Optional[str]` 而不是 `bool`：将来可能出现第三种容器形态
+    （例如 JSON API 响应），枚举比布尔好扩展；而**默认 `None` 必须解释成
+    "不是容器"**——反过来会让所有既有记录（默认 `None`）突然从 feed 里消失，
+    那是静默的数据消失，不是分类。
+
+    为什么**不参与 `raw_id`**：`raw_id = f(channel_id, endpoint, content_sha256)`
+    是内容寻址的。把分类掺进 id 会让"同一条原文按不同 `entry_kind` 写入"
+    变成两条 Raw，而 Raw 只增不改 ⇒ 改分类等于新建 Raw。分类因此是
+    **元数据**，不是身份的一部分。
+    """
 
     raw_id: str = Field(min_length=1)
     channel_id: str = Field(min_length=1)
@@ -63,6 +87,7 @@ class RawRecord(ContractModel):
     byte_length: int = Field(ge=0)
     fetched_at: datetime
     http_status: Optional[int] = None
+    entry_kind: Optional[str] = None
 
     @classmethod
     def create(
@@ -73,6 +98,7 @@ class RawRecord(ContractModel):
         content: bytes,
         fetched_at: Optional[datetime] = None,
         http_status: Optional[int] = None,
+        entry_kind: Optional[str] = None,
     ) -> "RawRecord":
         digest = content_sha256(content)
         return cls(
@@ -83,6 +109,7 @@ class RawRecord(ContractModel):
             byte_length=len(content),
             fetched_at=fetched_at or _utcnow(),
             http_status=http_status,
+            entry_kind=entry_kind,
         )
 
 
@@ -241,7 +268,34 @@ class ProposedStore:
 
 
 class ConfirmedLabel(ContractModel):
-    """人工产出。文档级（1A），只增不改。"""
+    """人工产出。**文档级（1A）+ 条目级（2C 字符区间）**，只增不改。
+
+    两种粒度，同一个内存形状（SPEC §2.1 按 §6.3 裁决 B 更新后的表述）：
+
+    | 粒度 | 入口 | `anchor` | 依附对象 |
+    |---|---|---|---|
+    | **文档级**（1A 人工直判） | `human(..., anchor=None)` | `None` | 整份 `raw_id` |
+    | **条目级**（2C 字符区间） | `human(..., anchor=<该条目区间>)` | 非空 | `raw_id` 上的 `[char_start, char_end)` |
+
+    为什么条目级只要一个可选参数就够：存储层的四个锚点列**早就在读写**
+    （`labels/sqlite_store.py`，含 `CHECK (anchor_raw_id IS NULL OR anchor_raw_id = raw_id)`
+    与"要么全空要么全有"），`Entry.anchor()` 也已经产出合法 `EvidenceAnchor`。
+    缺的只有内存契约这一环。
+
+    **`anchor` 必须与 `label.raw_id` 锚在同一份原文上**：否则一条标签会有两个依附对象
+    （文档级 vs 条目级）。`human()` 在工厂层直接拦（`AnchorError`），存储层另有对称的
+    SQL `CHECK` 与 `AnchorError` —— 两条入口都拦得住。**字段级直接构造**（例如
+    `ConfirmedLabel(...)` / 导出的回流）故意不拦：那是 T-108 已登记的有意单向差异
+    （存储层 ⊇ 契约，见 SPEC §2.13 与 `tests/test_labels_store.py`）。
+
+    **`label_id` 刻意不含 `anchor`**（详见 `atlas.contracts.ids.label_id_for`）：
+    `label_id` 的内容寻址口径在本项目里是**跨模块一致的**——`labels/sqlite_store.py`
+    的 `_assert_label_id` 与 `labels/export.py` 的 `verify_label_id` 都按
+    `(raw_id, label_key, label_value, actor)` 重算。把它改成含 `anchor` 会让
+    **已落库的标签无法再导出/回流**（Confirmed 只增不改，改不回去）。
+    代价是"同一文档上同一个人的同维度同取值、锚在不同区间"会撞同一个 `label_id`；
+    因此这类撞击必须**显式可见**（前端拒绝静默丢弃），而不是靠 id 隐式区分。
+    """
 
     label_id: str = Field(min_length=1)
     raw_id: str = Field(min_length=1)
@@ -254,15 +308,42 @@ class ConfirmedLabel(ContractModel):
 
     @classmethod
     def human(
-        cls, *, raw_id: str, label_key: str, label_value: str, actor: str
+        cls,
+        *,
+        raw_id: str,
+        label_key: str,
+        label_value: str,
+        actor: str,
+        anchor: Optional[EvidenceAnchor] = None,
     ) -> "ConfirmedLabel":
-        """人工直判：文档级判断，不要求 AI 证据（1A）。"""
+        """人工直判，不要求 AI 证据。
+
+        - `anchor=None`（默认）⇒ **文档级**判断，行为与 1A 完全一致；
+        - `anchor=<条目区间>` ⇒ **条目级**判断：锚定 `raw_id` 上的
+          `(raw_sha256, char_start, char_end)`，即 SPEC §2.2 的真值形状。
+          条目区间请用 `atlas.entries.Entry.anchor()` 产出，
+          **绝不要**把 `entry_id` 塞进来（ID 是派生量，换解析器会漂移）。
+
+        Raises:
+            AnchorError: `anchor.raw_id` 与 `raw_id` 不同 —— 一条标签只能有一个
+                依附对象（文档级**或**它的一个字符区间）。存储层的 SQL `CHECK`
+                与 `AnchorError` 会做同一件事；这里在**进存储层之前**就拦，
+                让错误离调用点更近（`test_labels_store.py` 钉死的"存储层更严"那条
+                指的是**字段级构造**路径，不是本工厂路径）。
+        """
+        if anchor is not None and anchor.raw_id != raw_id:
+            raise AnchorError(
+                f"证据锚点锚在 {anchor.raw_id}，而标签锚在 {raw_id}："
+                "人工标签只锚 raw_id（文档级）或它的一个字符区间（条目级），"
+                "不得锚到别的原文 / 解析产物 / 块 ID / 归一化偏移（SPEC §2.1）"
+            )
         return cls(
             label_id=label_id_for(raw_id, label_key, label_value, actor),
             raw_id=raw_id,
             label_key=label_key,
             label_value=label_value,
             actor=actor,
+            anchor=anchor,
         )
 
     @classmethod
