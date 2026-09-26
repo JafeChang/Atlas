@@ -674,6 +674,47 @@ T-105 做批量分类时必须先量这个数字再决定是否关推理 / 换�
 
 ---
 
+### 2.16 旧语料导入的契约值（T-131）
+
+包 `src/atlas/migrate/`。下游只有 `atlas.archive` 与 `atlas.contracts`；**不** import
+`registry` / `labels` / `feed` / `search` / `normalize`（有 AST 测试钉住）。
+
+| 项 | 值 |
+|---|---|
+| `channel_id` | 旧频道目录名 → 注册表渠道 id（实测 5 个真频道 **1:1 精确匹配**）；映射不到**不猜**，记为失败 |
+| `endpoint` | 旧记录的 `source_url` = **文章地址**（⚠️ 与新采集记录的 feed 地址**语义不同**，见下） |
+| `content` | 旧记录 `raw_content` 的 UTF-8 字节（**原样**，不做归一化、不解码） |
+| `raw_id` | `raw_id_for(channel_id, endpoint, content_sha256)`（未改） |
+| `fetched_at` 来源 | `collected_at` → `created_at` → `stored_at` → `updated_at`（实测 474/474 走 `collected_at`）；`published_at` **不用**（那是发布时间，且实测恒空）；naive 按 UTC 解释；**任何情况下不回退 `now()`** |
+| `http_status` | 恒 `200`（`LEGACY_HTTP_STATUS`——旧记录没有响应体状态） |
+| 布局规则 | 频道 = `data/raw/` 下**第一段目录名**，文件须直接位于频道目录下（嵌套 → 记失败 `nested_layout`） |
+| **对账不变量** | `scanned = skipped + articles`；`articles = imported + deduplicated + failed`；`records_after == records_before + imported` |
+| `strict` | 默认 `False`（逐条记账）；`True` 时首条失败即抛，异常文本带**完整对账表** |
+| 默认渠道映射 | `resolve_nothing`（**一律未映射**）—— 忘记注入必须**响亮可见** |
+| 实测收敛 | 534 JSON → 60 个非文档 + 474 篇文档 → **65** 条不同 Raw（与 §6.2 预测的 65 精确吻合） |
+
+#### ⚠️ `endpoint` 有两种语义（T-131 确认这是**有意**的）
+
+`raw_records.endpoint` 现在同时承载两种含义：
+
+| 来源 | `endpoint` 是 |
+|---|---|
+| **新采集**的记录 | **feed 地址**（如 `https://www.kdnuggets.com/feed`） |
+| **导入**的记录 | **文章地址**（旧记录的 `source_url`，如 `…/b-well-launches-…-ai-assistants/`） |
+
+理由有实证：`raw_id = f(channel_id, endpoint, content_sha256)`，只有把**文章地址**放进 `endpoint`
+才能得到**逐篇身份**；塞 feed 地址会让 65 篇**塌回 5 条**，等于把 §6.3 的缺口原样复制进旧语料。
+
+> **因此 `endpoint` 不可用于**：去重、「这份 feed 是否已采过」、当作 feed 标识。
+> 做溯源 / 展示 / 去重之前**必须先区分来源**。已用测试钉住
+> （`test_criterion_1_endpoint_is_article_url_not_feed_url`）。
+
+> 处理方式：**没有**加 `endpoint_kind` 列——加列会牵动 T-103 的物理表与 T-106/T-205 的消费者，
+> 超出 T-131 的范围。现在以「文档事实 + 消费者纪律 + 测试钉住」登记；
+> 将来若出现**第二个需要机器可判**的消费者，再加列并升 `raw_store_meta.schema_version`。
+
+---
+
 ## 3. 任务规范（引擎可替换的前提）
 
 ```
