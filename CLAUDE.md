@@ -42,6 +42,18 @@
    - 提交后**立刻**核对：`git show --name-only --format='%H %s' HEAD` 只能包含你改的文件。发现混入**停下来报告**，不要自行 amend 或 reset。
    - 主代理编排时：**git 写操作串行化**——同一时刻只允许一个代理处于"提交中"。
 
+## 测试目录约定
+
+- **`tests/__init__.py` 是允许的、且已被采用**：跨测试文件复用辅助模块用显式包名导入
+  （`from tests.<module> import ...`）。目前 **9 个测试文件**这样做（T-003 的 6 个 + T-131 的 3 个）。
+  它同时消除了"不同目录下同名测试模块"的隐式解析问题。
+- **辅助模块不要用 `test_` 前缀**——pytest 会去收集它。用 `_` 前缀（如 `tests/_migrate_fixtures.py`，正确做法）
+  或放进 `conftest.py`。`tests/test_cognition_support.py` 是反例：它纯是辅助模块却没有测试函数，
+  收集结果是 0 个用例（无害，但会让人误以为有覆盖）。
+- 真实数据测试**必须自跳过**：`data/` 不进 git，所以干净 worktree 里没有它。
+  照 `tests/test_search_realdata.py` 的先例（`pytest.mark.skipif` / 模块级 `pytest.skip`），
+  并在主工作区真的跑出真实数字。
+
 ## 环境
 
 开发在 WSL 内进行（Windows PowerShell 无法执行项目 venv）。**WSL 是镜像网络模式**，外网必须走宿主代理：
