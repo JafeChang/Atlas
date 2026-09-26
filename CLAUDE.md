@@ -32,6 +32,15 @@
    ```
    （`PYTHONPATH` 必须指向该检出，否则可编辑安装仍会导入主工作区的 `src`。
    **worktree 路径必须带任务号**——固定用 `/tmp/atlas-verify` 在多个代理并行时会被互相抢占。）
+   **⚠️ 绝不要把 pytest 的输出管道给 `tail`/`head`**：那样拿到的是 `tail` 的退出码。
+   实测栽过一次——`pytest tests -q | tail -12` 报 exit 0，而 pytest 其实是 1，
+   差一点把红的说成绿的。**正确做法：先重定向到文件，再单独取退出码**：
+   ```bash
+   ... -m pytest tests -q > /tmp/wt.txt 2>&1
+   echo "PYTEST_EXIT=$?"; tail -20 /tmp/wt.txt
+   ```
+   **复核完就删掉 worktree**（`git worktree remove --force <路径>`，再 `git worktree prune`）。
+   攒着会同时占磁盘与注意力——实测一次攒到 **10 个**已完工的检出。
    **否定性断言必须有"活对照"**：断言"X 被拒绝"时，必须有同一调用路径对**合法输入成功**的对照。
    否则**签名不匹配 / 异常类型不对**会伪装成"拒绝成功"——实测两次栽在这里
    （`build_anchor()` 参数名不对导致的 `TypeError`，看起来像"chunk_id 被拒绝"，其实什么都没验证）。
