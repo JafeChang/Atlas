@@ -558,51 +558,186 @@ def test_real_no_extra_tables_or_triggers_were_created(real_run: RealRun) -> Non
 # 判据 9：不变量（触发器 + 活对照）
 # --------------------------------------------------------------------------- #
 @requires_real_data
-def test_real_raw_records_are_still_append_only_with_live_controls() -> None:
-    """判据 9：`raw_records` 仍受 append-only 触发器保护（**活对照 + 否定**）。
+def test_real_raw_records_are_still_append_only_with_live_controls(tmp_path: Path) -> None:
+    """判据 9：`raw_records` 仍受 append-only 触发器保护（**真活对照 + 否定**）。
 
     硬规则 4：断言"X 被拒绝"之前，必须先用同一调用路径证明**合法输入成功**。
+
+    ⚠️ **本测试的活对照曾是假的（2026-09-26 主代理独立实测发现，已修）**
+    ------------------------------------------------------------------
+
+    原先那句"合法 INSERT 必须成功"插入的行**从未提交**：`sqlite3.connect()` 的
+    `isolation_level` 默认是 `""`（不是 `None`），此时 DML 会自动开启一个**隐式事务**；
+    测试没有 `commit()`，`close()` 把未提交事务**回滚**。于是那句
+    `COUNT(*) == count + 1` 只证明了"**同一连接**看得见自己未提交的写"，
+    与"触发器是否生效""合法写入是否真的成功"**都无关**。
+
+    实测证据（在副本上做，真实库未动）：
+
+    | 检查 | 结果 |
+    |---|---|
+    | 同一连接内 `COUNT(*) == count + 1` | True（原测试据此"通过"） |
+    | `connection.in_transaction` | True |
+    | **另开一个连接**看得见这一行吗 | **False** |
+    | `close()` 之后另开连接看得见吗 | **False** |
+    | 外部口径行数 | 75 → **75**（没变）⇒ INSERT 从未提交 |
+
+    修法（本测试现在的做法）：**先提交，再另开连接确认可见**——
+    跨连接可见才是"真的写进去了"。这才是活对照；同一连接的自我可见不是。
+
+    **为什么写副本而不写真实库**
+    ---------------------------
+
+    `raw_records` 是 append-only，在真实库里插入一行探针**永远删不掉**，
+    而 `data/store` 是用户的真实数据、不是测试夹具。因此：
+
+    - 真实库上只做**只读**断言（其中 `UPDATE` 是会被触发器拒绝的那条否定断言）；
+    - "合法 INSERT 跨连接可见"这条**写**操作在副本上做（副本的行数先与真实库对齐，
+      证据才有意义）；
+    - `UPDATE` / `DELETE` 的否定断言**两处都测**（副本 + 真实库），
+      副本上顺带证明"被拒之后行数没变"。
+
+    ⚠️ 因此本测试**不再往真实库写任何东西**（原版也没写进去，但那是靠回滚"侥幸"，
+    不是设计）。
     """
-    connection = sqlite3.connect(str(STORE_DB))
-    connection.row_factory = sqlite3.Row
+    import shutil
+
+    probe_raw_id = "raw_" + "1" * 32  # 刻意与真实语料无关、也不与旧探针 id 相同
+
+    def _connect(path: Path):  # type: ignore[no-untyped-def]
+        connection = sqlite3.connect(str(path))
+        connection.row_factory = sqlite3.Row
+        return connection
+
+    def _count(path: Path) -> int:
+        connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        try:
+            return int(
+                connection.execute("SELECT COUNT(*) AS n FROM raw_records").fetchone()[0]
+            )
+        finally:
+            connection.close()
+
+    def _visible(path: Path, raw_id: str) -> bool:
+        """**另开一个连接**看这一行在不在（跨连接可见 = 真的提交了）。"""
+        connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        try:
+            return (
+                int(
+                    connection.execute(
+                        "SELECT COUNT(*) AS n FROM raw_records WHERE raw_id = ?",
+                        (raw_id,),
+                    ).fetchone()[0]
+                )
+                == 1
+            )
+        finally:
+            connection.close()
+
+    insert_sql = (
+        "INSERT INTO raw_records (raw_id, channel_id, endpoint, content_sha256,"
+        " byte_length, fetched_at, http_status) VALUES (?, ?, ?, ?, ?, ?, ?)"
+    )
+    insert_args = (
+        probe_raw_id,
+        "t131-probe",
+        "https://example.invalid/probe",
+        "0" * 64,
+        0,
+        "2026-01-01T00:00:00+00:00",
+        None,
+    )
+
+    real_count_before = _count(STORE_DB)
+
+    # ---- 副本：可写的活对照 + 否定断言 -------------------------------------
+    copy_db = tmp_path / "atlas-copy.db"
+    shutil.copy2(STORE_DB, copy_db)
+    assert _count(copy_db) == real_count_before, (
+        "副本行数与真实库不符 —— 下面那条活对照的证据就不成立了"
+    )
+
+    # 活对照 1：合法 SELECT（副本）
+    connection = _connect(copy_db)
     try:
-        # 活对照 1：合法 SELECT 必须成功
-        count = connection.execute("SELECT COUNT(*) AS n FROM raw_records").fetchone()["n"]
-        assert count >= MEASURED_EXISTING_RAW_RECORDS + MEASURED_DISTINCT_RAW_IDS
-        # 活对照 2：合法 INSERT（新的 Raw）必须成功 —— 用一条与真实语料无关的记录
-        connection.execute(
-            "INSERT INTO raw_records (raw_id, channel_id, endpoint, content_sha256,"
-            " byte_length, fetched_at, http_status) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (
-                "raw_" + "0" * 32,
-                "t131-probe",
-                "https://example.invalid/probe",
-                "0" * 64,
-                0,
-                "2026-01-01T00:00:00+00:00",
-                None,
-            ),
-        )
-        assert (
-            connection.execute(
-                "SELECT COUNT(*) AS n FROM raw_records WHERE raw_id = ?", ("raw_" + "0" * 32,)
-            ).fetchone()["n"]
-            == 1
-        )
-        # 否定断言：改 / 删必须被触发器拒绝，原因文本可辨认
-        with pytest.raises(sqlite3.DatabaseError) as update_error:
-            connection.execute("UPDATE raw_records SET endpoint = 'x' WHERE raw_id = ?", ("raw_" + "0" * 32,))
-        assert "append-only" in str(update_error.value)
-        with pytest.raises(sqlite3.DatabaseError) as delete_error:
-            connection.execute("DELETE FROM raw_records WHERE raw_id = ?", ("raw_" + "0" * 32,))
-        assert "append-only" in str(delete_error.value)
-        # 活对照（收尾）：被拒之后行数没变
-        assert (
-            connection.execute("SELECT COUNT(*) AS n FROM raw_records").fetchone()["n"] == count + 1
-        )
-        print(f"[T-131 真实] raw_records 仍为 append-only（UPDATE/DELETE 被拒，SELECT/INSERT 通过）")
+        assert connection.execute(
+            "SELECT COUNT(*) AS n FROM raw_records"
+        ).fetchone()["n"] == real_count_before
     finally:
         connection.close()
+
+    # 活对照 2：合法 INSERT **必须真的写进去**。用 autocommit（isolation_level=None）
+    # 显式表达"这一次写要落盘"，再用**另一个连接**确认可见。
+    writer = sqlite3.connect(str(copy_db), isolation_level=None)
+    writer.row_factory = sqlite3.Row
+    try:
+        assert writer.in_transaction is False, "autocommit 连接不应处于事务中"
+        writer.execute(insert_sql, insert_args)
+    finally:
+        writer.close()
+
+    assert _visible(copy_db, probe_raw_id), (
+        "合法 INSERT 之后**另一个连接**看不到这一行 —— 活对照没有真的写进去，"
+        "那么它对该路径的'合法输入成功'什么都没证明（硬规则 4）"
+    )
+    assert _count(copy_db) == real_count_before + 1, "活对照：行数必须 +1"
+
+    # 否定断言（副本）：UPDATE / DELETE 必须被触发器拒绝，原因文本可辨认
+    connection = _connect(copy_db)
+    try:
+        with pytest.raises(sqlite3.DatabaseError) as update_error:
+            connection.execute(
+                "UPDATE raw_records SET endpoint = 'x' WHERE raw_id = ?", (probe_raw_id,)
+            )
+        assert "append-only" in str(update_error.value)
+        with pytest.raises(sqlite3.DatabaseError) as delete_error:
+            connection.execute(
+                "DELETE FROM raw_records WHERE raw_id = ?", (probe_raw_id,)
+            )
+        assert "append-only" in str(delete_error.value)
+        # 活对照（收尾）：被拒之后行数没变
+        assert connection.execute(
+            "SELECT COUNT(*) AS n FROM raw_records"
+        ).fetchone()["n"] == real_count_before + 1
+    finally:
+        connection.close()
+
+    # ---- 真实库：只读 + 只做否定断言（不写入任何东西）----------------------
+    connection = _connect(STORE_DB)
+    try:
+        # 活对照 1（真实库）：合法 SELECT 必须成功
+        real_rows = connection.execute(
+            "SELECT COUNT(*) AS n FROM raw_records"
+        ).fetchone()["n"]
+        assert real_rows == real_count_before
+        # 取一行**真实存在**的记录，对它做 UPDATE —— 必须被拒（不能靠不存在的 id 蒙混）
+        existing = connection.execute(
+            "SELECT raw_id FROM raw_records ORDER BY raw_id LIMIT 1"
+        ).fetchone()
+        assert existing is not None, "真实归档里应有记录"
+        existing_id = str(existing["raw_id"])
+        with pytest.raises(sqlite3.DatabaseError) as real_update_error:
+            connection.execute(
+                "UPDATE raw_records SET endpoint = 'x' WHERE raw_id = ?", (existing_id,)
+            )
+        assert "append-only" in str(real_update_error.value)
+        with pytest.raises(sqlite3.DatabaseError) as real_delete_error:
+            connection.execute("DELETE FROM raw_records WHERE raw_id = ?", (existing_id,))
+        assert "append-only" in str(real_delete_error.value)
+        # 活对照（收尾）：真实库行数一个都没变
+        assert connection.execute(
+            "SELECT COUNT(*) AS n FROM raw_records"
+        ).fetchone()["n"] == real_count_before
+    finally:
+        connection.close()
+
+    assert _count(STORE_DB) == real_count_before, "真实库行数不得改变（本测试不写真实库）"
+
+    print(
+        "[T-131 真实] raw_records 仍为 append-only："
+        f"合法 INSERT 跨连接可见（副本 {real_count_before} → {real_count_before + 1}），"
+        f"UPDATE/DELETE 被拒（副本与真实库各验一次，真实库保持 {real_count_before} 行）"
+    )
 
 
 # --------------------------------------------------------------------------- #
