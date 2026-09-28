@@ -181,14 +181,8 @@ def test_cli_classify_without_archive_fails_loudly(tmp_path: Path) -> None:
 # --------------------------------------------------------------------------- #
 
 
-def test_cli_plan_reports_the_classify_switch_but_never_calls_the_model(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # 只要有人去构造认知层端口就直接失败：`plan` 必须一个模型都不碰。
-    def exploding_factory():  # pragma: no cover - 被调用即失败
-        raise AssertionError("plan 不得构造认知层端口")
-
-    monkeypatch.setattr(pipeline_module, "default_cognition_port", exploding_factory)
+def test_cli_plan_reports_the_classify_switch(tmp_path: Path) -> None:
+    """`plan` 必须**只读地**报出"这一轮会不会调模型"，且真的能接受 `--classify`。"""
     root = make_store_root(tmp_path)
 
     off = run_cli("plan", "--store-root", str(root))
@@ -202,9 +196,36 @@ def test_cli_plan_reports_the_classify_switch_but_never_calls_the_model(
     assert {node["name"] for node in payload["nodes"]} >= {"classify", "evidence"}
     dependencies = {node["name"]: node["depends_on"] for node in payload["nodes"]}
     assert dependencies["classify"] == ["normalize"]
-    assert payload["nodes"].index({"name": "classify", "depends_on": ["normalize"]}) < (
-        payload["nodes"].index({"name": "evidence", "depends_on": ["normalize"]})
-    )
+    names = [node["name"] for node in payload["nodes"]]
+    assert names.index("classify") < names.index("evidence")
+
+
+def test_cli_plan_never_constructs_the_cognition_port(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """**进程内**跑 `plan`（含 `--classify`）：认知层端口一次都不许被构造。
+
+    为什么这条必须是**进程内**调用：`monkeypatch` 只作用于本进程，用
+    `run_cli`（子进程）打这个桩的话，桩根本不会生效 —— 那样断言就成了空转
+    （"不会失败的测试不是测试"）。子进程侧的"CLI 真的接受 `--classify`"由
+    上一个用例覆盖，两者分工明确。
+    """
+    calls = {"n": 0}
+
+    def exploding_factory():  # pragma: no cover - 被调用即失败
+        calls["n"] += 1
+        raise AssertionError("plan 不得构造认知层端口（那会读凭据 / 起边车）")
+
+    monkeypatch.setattr(pipeline_module, "default_cognition_port", exploding_factory)
+    root = make_store_root(tmp_path)
+
+    assert main(["plan", "--store-root", str(root)]) == 0
+    off = json.loads(capsys.readouterr().out)
+    assert main(["plan", "--store-root", str(root), "--classify"]) == 0
+    on = json.loads(capsys.readouterr().out)
+    assert calls["n"] == 0
+    assert off["classify_enabled"] is False
+    assert on["classify_enabled"] is True
 
 
 def test_cli_run_still_requires_live_opt_in_and_touches_nothing(
