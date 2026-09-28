@@ -324,10 +324,29 @@ C8 的配置来自前端 / API，不依赖手工编辑文件。
 | `proposal_runs` | T-105 | **"这个单元在本配置下跑过没有"**——降级单元**没有 claim 但跑过了**，没有这张表就无法区分，会导致降级单元每次重跑都被重复调用模型。`UNIQUE(unit_id, plan_digest)`，append-only 双触发器。契约值见 §2.17 |
 | `cognition_store_meta` | T-105 | 认知域的元数据（照 T-103 `raw_store_meta` 先例），`key`/`value` 两列，记 `schema_version` |
 | `confirmed_labels` | T-108 | 人工标签（**Confirmed，只增不改**） |
-| `evidence_spans` | T-107 | 证据锚点索引（真值仍在 `raw` 偏移上）。`(claim_id, claim_version)` 唯一；**只增不改**双触发器。✅ **代码与 DAG 节点已落地**（`c9f004f`）；真实库里的表在**第一次真正跑证据节点时**才创建（`CREATE TABLE IF NOT EXISTS`），截至本轮**仍未创建**——因为还没有对真实 store 跑过该节点 |
+| `evidence_spans` | T-107 | 证据锚点索引（真值仍在 `raw` 偏移上）。`(claim_id, claim_version)` 唯一；**只增不改**双触发器。✅ 代码与 DAG 节点已落地（`c9f004f` / `41398da`）。**建立时机：由 T-107 首次以写入模式运行时创建**（`CREATE TABLE IF NOT EXISTS`）；真实库中现已存在（**0 行**） |
 | `search_meta` / `search_documents` / `search_documents_fts`（+ FTS5 影子表 `search_documents_fts_{data,idx,content,docsize,config}`） | T-205 | 检索索引（**派生物**：可整体 `drop` 后由 raw 全量重建；**刻意不加 append-only 触发器**——加触发器与"可删除重建"自相矛盾） |
 
 **命名要求**：跨域共用 DB 的表名必须带领域前缀（如 `registry_`），避免语义误导与后续静默冲突。
+
+> ⚠️ **"只读"必须在文件层成立，不只是"不插行"**（2026-09-28 实测教训）
+>
+> 任何声称**只读**的命令/路径，打开 `atlas.db` 时必须用 URI `file:...?mode=ro`，且
+> **不得执行任何 DDL**。理由是一条真实发生过的副作用：T-107 的第一版
+> `SqliteEvidenceStore` 在构造函数里**无条件** `executescript(CREATE TABLE IF NOT EXISTS evidence_spans …)`，
+> 于是 `--read-only` 虽然一行都没插，**仍然改动了真实库文件**
+> （SHA256 `31286241b688…` → `b4a0c0730d64…`，多出一张空表 + 2 个触发器）。
+> 表与触发器都是 append-only / DDL 已落盘 ⇒ **不可撤销**。
+> 数据本身未受损（0 行、schema 合法、§2.10 本来就登记了这张表），但"只做只读核对却改了用户的库"
+> 是必须从机制上杜绝的。
+>
+> 已修（`41398da`）：只读模式用 `mode=ro` 连接 + **不执行 DDL**；表不存在时把
+> `no such table` **如实**解释成"0 行"，而不是去创建它。已接受的代价：
+> **对一个还没有 `evidence_spans` 的库做只读打开会 `FileNotFoundError`**
+> —— 因为"只读不创建"正是这条路径的意义所在（缺什么、怎么补要写在错误消息里）。
+>
+> 由此追加一条通用判据：**"只读"类命令的验收必须比对库文件字节摘要（sha256）前后一致**，
+> 而不能只看"有没有插行"。
 
 ---
 
@@ -887,6 +906,24 @@ plan_digest  = stable_digest([unit_digest, code_version, config_version, model_v
 `reduce` = 解实体 → 按空白切词再单空格拼回（与 `atlas.entries.sanitize_for_quote` 同一口径）。
 因此"模型看到的文字"与"折回单元的判据所用文字"**是同一份**，`unit_digest` 就是它的指纹
 ⇒ 换 reduce 规则必然改变幂等键，**不会**出现"文本变了但幂等键没变"。
+
+#### 证据锚点必须落在它自己的单元区间内（T-107 落地时定的不变量）
+
+`proposed_claims` 的每个单元行带真值区间 `[unit_char_start, unit_char_end)`（§2.2 的形状）。
+T-107 由 quote 重算出的锚点**必须**满足：
+
+```
+unit_char_start <= anchor.char_start < anchor.char_end <= unit_char_end
+```
+
+**违反即响亮失败**（`EvidenceStageError`），**且在任何写入之前判定** ——
+因为 `evidence_spans` 是 append-only，一条越界的锚点写进去就**永远删不掉**。
+这条不变量把"证据属于哪个单元"从"调用方自觉"变成"机器可判"，
+也是 `proposed_claims` 必须同时存 `unit_id` 与两个字符列（而不只存 `unit_id`）的直接原因。
+
+> 它同时解释了**为什么 `unit_id` 只是派生量**（§2.1/§2.2）：`unit_id` 换解析器会漂移，
+> 而 `(raw_id, char_start, char_end)` 是稳定的真值。判定"这条证据属于哪个单元"因此是
+> **纯整数比较**，不需要任何新映射。
 
 #### 索引与触发器
 
