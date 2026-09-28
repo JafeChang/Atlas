@@ -507,7 +507,12 @@ class Pipeline:
         self.registry = registry
 
         if evidence is None:
-            evidence = open_evidence_store(config.evidence_path)
+            # T-107 的 `--read-only`：证据库用 SQLite 的**只读连接**打开。
+            # 默认模式会 `CREATE TABLE IF NOT EXISTS`（改库文件），那与"只读"矛盾；
+            # 对 `data/store/atlas.db` 这种用户真实数据尤其不可接受。
+            evidence = open_evidence_store(
+                config.evidence_path, read_only=config.evidence_read_only
+            )
             self._owned.append(evidence)
         self.evidence = evidence
 

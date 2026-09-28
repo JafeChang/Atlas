@@ -103,23 +103,63 @@ def _utcnow() -> datetime:
 
 
 class SqliteEvidenceStore:
-    """`evidence_spans` 的 SQLite 持久化（只有"插入 + 查询"，没有 update/delete）。"""
+    """`evidence_spans` 的 SQLite 持久化（只有"插入 + 查询"，没有 update/delete）。
+
+    `read_only=True`（T-107 的 `--read-only` 复核路径）
+    ---------------------------------------------------
+
+    只读打开的**唯一**目的是：让"只校验不落库"在**文件层**也成立。
+    默认模式下构造函数会 `executescript(_DDL)`（`CREATE TABLE IF NOT EXISTS`），
+    这会**改动库文件**（哪怕一条数据都没写）。对 `data/store/atlas.db` 这种
+    多域共用、且是用户真实数据的库，一个声称"只读"的命令**不得**留下任何字节改动。
+
+    因此只读模式：用 URI 的 `mode=ro` 连接（SQLite 层拒绝一切写入，不建文件、
+    不建表、不写 journal），且**不执行任何 DDL**。代价是库/表不存在时读不到 ——
+    这里把 `no such table` 如实解释成"0 行"（并保持可读性），而**不**去创建它。
+    """
 
     def __init__(
         self,
         db_path: Optional[_PathLike] = None,
         *,
         clock: Optional[Callable[[], datetime]] = None,
+        read_only: bool = False,
     ) -> None:
         self._path = DEFAULT_DB_PATH if db_path is None else Path(db_path)
+        self._clock = clock or _utcnow
+        self._read_only = bool(read_only)
+        if self._read_only and str(self._path) == ":memory:":
+            raise ValueError("read_only=True 不能配 ':memory:'（内存库没有既存数据可读）")
+        if self._read_only:
+            if not self._path.is_file():
+                raise FileNotFoundError(
+                    f"只读打开 {self._path} 失败：文件不存在。"
+                    "只读模式**不创建**任何东西（那正是它的意义）；"
+                    "先跑一次写入模式（不要传 read_only=True）建立证据表"
+                )
+            uri = f"file:{self._path}?mode=ro"
+            self._conn = sqlite3.connect(uri, isolation_level=None, uri=True)
+            self._conn.row_factory = sqlite3.Row
+            self._has_table = self._table_exists()
+            return
         if str(self._path) != ":memory:":
             parent = self._path.parent
             if str(parent) not in ("", "."):
                 parent.mkdir(parents=True, exist_ok=True)
-        self._clock = clock or _utcnow
         self._conn = sqlite3.connect(str(self._path), isolation_level=None)
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(_DDL)
+        self._has_table = True
+
+    @property
+    def read_only(self) -> bool:
+        return self._read_only
+
+    def _table_exists(self) -> bool:
+        row = self._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'evidence_spans'"
+        ).fetchone()
+        return row is not None
 
     # ------------------------------------------------------------------
     # 基础
@@ -156,6 +196,11 @@ class SqliteEvidenceStore:
         """
         if outcome.status is not VerificationStatus.VERIFIED:
             return None
+        if self._read_only:
+            raise ImmutabilityError(
+                "只读打开的 SqliteEvidenceStore 不得写入（read_only=True）；"
+                "需要落库请用默认的写入模式打开"
+            )
 
         span = EvidenceSpan.from_outcome(outcome, verified_at=self._clock())
         existing = self.span_for(span.claim_id, span.claim_version)
@@ -212,6 +257,8 @@ class SqliteEvidenceStore:
     # 读
     # ------------------------------------------------------------------
     def span_for(self, claim_id: str, claim_version: int) -> Optional[EvidenceSpan]:
+        if not self._has_table:
+            return None
         row = self._conn.execute(
             f"SELECT {_COLUMNS} FROM evidence_spans WHERE claim_id = ? AND claim_version = ?",
             (claim_id, claim_version),
@@ -219,6 +266,8 @@ class SqliteEvidenceStore:
         return None if row is None else _row_to_span(row)
 
     def spans_for_claim(self, claim_id: str) -> List[EvidenceSpan]:
+        if not self._has_table:
+            return []
         rows = self._conn.execute(
             f"SELECT {_COLUMNS} FROM evidence_spans WHERE claim_id = ? "
             "ORDER BY claim_version",
@@ -227,6 +276,8 @@ class SqliteEvidenceStore:
         return [_row_to_span(row) for row in rows]
 
     def spans_for_raw(self, raw_id: str) -> List[EvidenceSpan]:
+        if not self._has_table:
+            return []
         rows = self._conn.execute(
             f"SELECT {_COLUMNS} FROM evidence_spans WHERE raw_id = ? "
             "ORDER BY claim_id, claim_version",
@@ -235,6 +286,8 @@ class SqliteEvidenceStore:
         return [_row_to_span(row) for row in rows]
 
     def count(self) -> int:
+        if not self._has_table:
+            return 0
         row = self._conn.execute("SELECT COUNT(*) AS n FROM evidence_spans").fetchone()
         return int(row["n"])
 
@@ -278,6 +331,10 @@ def open_evidence_store(
     db_path: Optional[_PathLike] = None,
     *,
     clock: Optional[Callable[[], datetime]] = None,
+    read_only: bool = False,
 ) -> SqliteEvidenceStore:
-    """便捷入口：打开（必要时创建）库文件并返回证据存储。"""
-    return SqliteEvidenceStore(db_path, clock=clock)
+    """便捷入口：打开（必要时创建）库文件并返回证据存储。
+
+    `read_only=True` 时**不创建任何东西**（文件 / 表都不建，连接用 SQLite 的 `mode=ro`）。
+    """
+    return SqliteEvidenceStore(db_path, clock=clock, read_only=read_only)

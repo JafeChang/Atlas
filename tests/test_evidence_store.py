@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -350,6 +351,91 @@ def test_default_path_is_not_written_by_tests(tmp_path):
     assert store.db_path == tmp_path / "nested" / "atlas.db"
     assert store.db_path.exists()
     store.close()
+
+
+# --------------------------------------------------------------------------- #
+# 只读打开（T-107 的 `--read-only`）：**文件层**也不得改动
+# --------------------------------------------------------------------------- #
+
+
+def _digest(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def test_read_only_open_does_not_touch_the_file(tmp_path):
+    """`read_only=True` 打开一个**已有**库：文件逐字节不变、行数照样数得出来。
+
+    （默认模式会 `CREATE TABLE IF NOT EXISTS` ⇒ 改库文件。对 `data/store/atlas.db`
+    这种用户真实数据，一个声称只读的命令不得留下任何字节改动。）
+    """
+    db_path = tmp_path / "atlas.db"
+    store = SqliteEvidenceStore(db_path)
+    claim = make_claim()
+    outcome = verify_and_record(store, claim, RAW_BYTES, content_type="text/plain")
+    assert outcome.status is VerificationStatus.VERIFIED
+    store.close()
+
+    before = _digest(db_path)
+    before_mtime = db_path.stat().st_mtime_ns
+    reader = SqliteEvidenceStore(db_path, read_only=True)
+    try:
+        assert reader.count() == 1
+        assert reader.span_for(claim.claim_id, claim.version) is not None
+        assert reader.span_for("pcl_" + "0" * 32, 1) is None
+    finally:
+        reader.close()
+    assert _digest(db_path) == before, "只读打开改动了库文件"
+    assert db_path.stat().st_mtime_ns == before_mtime
+    assert not list(tmp_path.glob("atlas.db-*")), "只读打开留下了 journal / wal"
+
+
+def test_read_only_open_refuses_to_create_or_write(tmp_path):
+    """活对照 + 负路径：不存在的文件不创建；已存在的文件写不进去。"""
+    missing = tmp_path / "nope.db"
+    with pytest.raises(FileNotFoundError):
+        SqliteEvidenceStore(missing, read_only=True)
+    assert not missing.exists(), "只读打开创建了文件"
+
+    # 活对照：同一路径用**写入模式**打开必须成功创建（所以"没创建"不是路径不通）
+    store = SqliteEvidenceStore(missing)
+    store.close()
+    assert missing.exists()
+
+    # 负路径：只读 store 的 record() 必须响亮失败（不是静默丢掉这次写入）
+    reader = SqliteEvidenceStore(missing, read_only=True)
+    try:
+        claim = make_claim()
+        outcome = verify_claim(claim, RAW_BYTES, content_type="text/plain")
+        assert outcome.status is VerificationStatus.VERIFIED  # 活对照：这次校验是成功的
+        with pytest.raises(ImmutabilityError):
+            reader.record(outcome)
+    finally:
+        reader.close()
+
+
+def test_read_only_open_reports_zero_when_table_is_absent(tmp_path):
+    """只读 + 表不存在 ⇒ 如实报 0，**不**去创建它（这正是"只读"的意义）。"""
+    db_path = tmp_path / "other-domain.db"
+    connection = sqlite3.connect(str(db_path))
+    connection.execute("CREATE TABLE other (x INTEGER)")
+    connection.commit()
+    connection.close()
+    before = _digest(db_path)
+
+    reader = SqliteEvidenceStore(db_path, read_only=True)
+    try:
+        assert reader.count() == 0
+        assert reader.span_for("pcl_" + "0" * 32, 1) is None
+        assert reader.spans_for_raw("raw_" + "0" * 32) == []
+    finally:
+        reader.close()
+    assert _digest(db_path) == before
+    check = sqlite3.connect(str(db_path))
+    try:
+        names = {row[0] for row in check.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    finally:
+        check.close()
+    assert names == {"other"}, "只读模式建了表"
 
 
 # --------------------------------------------------------------------------- #

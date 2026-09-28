@@ -658,6 +658,43 @@ def test_read_only_mode_verifies_without_writing(tmp_path: Path) -> None:
     assert evidence_db_rows(root / "atlas.db") == []
 
 
+def test_read_only_pipeline_does_not_touch_the_shared_db_file(tmp_path: Path) -> None:
+    """`evidence_read_only=True` 时 **库文件逐字节不变**（不只是"没插行"）。
+
+    这是一条真实缺陷的回归测试：默认模式下打开证据库会执行
+    `CREATE TABLE IF NOT EXISTS evidence_spans`，所以"只读"命令照样**改动了库文件**。
+    对 `data/store/atlas.db`（用户真实数据 + 多域共用）这是不能接受的。
+    """
+    import hashlib
+
+    root = make_store_root(tmp_path)
+    with evidence_pipeline(root) as pipeline:
+        report = pipeline.run()
+        raw_id = _collect_identity(report)["raw_id"]
+        pipeline.proposed.record_claim(
+            classified_row(
+                raw_id=raw_id,
+                quote=QUOTE_A,
+                unit_char_start=0,
+                unit_char_end=len(RAW_TEXT),
+            )
+        )
+
+    db_path = root / "atlas.db"
+    before = hashlib.sha256(db_path.read_bytes()).hexdigest()
+    before_mtime = db_path.stat().st_mtime_ns
+
+    with evidence_pipeline(root, evidence_read_only=True) as pipeline:
+        report = pipeline.run()
+        assert pipeline.evidence.read_only is True
+
+    after = hashlib.sha256(db_path.read_bytes()).hexdigest()
+    assert _evidence_observed(report)["verified"] == 1, "活对照：只读模式下校验照样成功"
+    assert after == before, "只读模式改动了共享库文件"
+    assert db_path.stat().st_mtime_ns == before_mtime
+    assert not list(root.glob("atlas.db-*")), "只读模式留下了 journal / wal"
+
+
 # --------------------------------------------------------------------------- #
 # 判据 9：组合根不得把 claims 漏出快照（否则新 claim 永远等不到校验）
 # --------------------------------------------------------------------------- #
