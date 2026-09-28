@@ -65,7 +65,7 @@ node:fs         # 只用于 readFileSync 读自身源码；唯一一处 fs 用�
     "baseUrl": "https://api.deepseek.com",
     "apiKey": "…",                // 密钥只在这里出现，绝不进环境变量
     "timeoutMs": 60000,
-    "maxOutputTokens": 2048,
+    "maxOutputTokens": 4096,
     "temperature": 0.0,
     "reasoning": false,
     "noProxy": "127.0.0.1,localhost,::1",

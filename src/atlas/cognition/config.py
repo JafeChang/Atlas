@@ -162,7 +162,21 @@ class CognitionConfig:
     api_key_env: str = DS_API_KEY_ENV
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS
     temperature: float = 0.0
-    max_output_tokens: int = 2048
+    #: 单次调用的输出预算（经 `max_completion_tokens` 真正发到 HTTP 请求体）。
+    #:
+    #: **4096 是实测标定的，不是拍的**（SPEC §2.17 / `tools/t105_yield_probe.py`）：
+    #: `deepseek-flash` 的 reasoning token 与 JSON 答案**共用**这一份预算，
+    #: 实测 reasoning 占 output 的 **87–92%**。在 **2048** 下 25 次真实调用里有
+    #: **4 次**被截断（`output_tokens == reasoning_tokens == 2048`、
+    #: `stopReason=length`、内容为 0 ⇒ 降级 `empty_completion`），
+    #: 单元级产出率 **10/25 = 40%**；抬到 **4096** 后同样 25 个单元
+    #: **0 次截断**、产出率 **14/25 = 56%**；抬到 **8192** 是 **15/25 = 60%**
+    #: （只多 1 个单元，单轮 25 个样本里不构成差异）。
+    #: 允许跑完的调用里最大一次 output 是 **2384** token ⇒ 4096 留了约 1.7× 余量，
+    #: 因此取**最小且实测零截断**的那个值，而不是越大越好。
+    #: ⚠️ 这个字段**不进** `plan_digest`（见 `versions()`），改它**不会**让已跑过的
+    #: 单元重跑；改它必须重跑 `tools/t105_real_evidence.py`。
+    max_output_tokens: int = 4096
     reasoning_enabled: bool = False
     proxy_url: str = field(default="", repr=False)
     no_proxy: str = DEFAULT_NO_PROXY

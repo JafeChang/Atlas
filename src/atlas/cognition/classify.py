@@ -118,15 +118,20 @@ ARTICLE_ID_RE = re.compile(r"^art_[0-9a-f]{32}$")
 #:    与单元数无关。因此把单元塞进同一次调用能摊薄这笔钱（实测：`deepseek-flash`
 #:    一次调用的墙钟约 6–16 s，其中相当一部分是启动）。
 #: 2. **输出预算被推理 token 吃掉**：`deepseek-flash` 是推理型，实测一次调用
-#:    的 reasoning token 常达 1000–2000，而单次调用的输出预算是有限的。
+#:    的 reasoning token 常达 1500–2200，而单次调用的输出预算是有限的。
 #:    ⚠️ **本注释原先写错了，2026-09-26 由主代理更正并实测**：原文称
 #:    "T-003 的 `max_output_tokens` 字段**没有**被 adapter 送进边车"——**这是假的**。
 #:    真实链路（端到端，已实测）：`adapter._build_job()` 放进 `call.maxOutputTokens`
 #:    → 边车 `run.mjs` 以 `{...base, maxTokens: call.maxOutputTokens}` 覆盖默认 4096
 #:    → OpenAI SDK 以 **`max_completion_tokens`** 发到 HTTP 请求体。
 #:    实测证据：配置 1234 → mock 收到的请求体 `max_completion_tokens: 1234`（另试 777/2048 亦跟随）。
-#:    **所以生效的预算是配置值**（`CognitionConfig.max_output_tokens` 默认 2048），不是 4096。
+#:    **所以生效的预算是配置值**（`CognitionConfig.max_output_tokens`，现为 **4096**）。
 #:    误判成因：只读了 `run.mjs` 里 `?? 4096` 那一行默认值，没有往下读覆盖它的那一行。
+#:    ⚠️ **2048 太小，已由实测否定**（2026-09-28，`tools/t105_yield_probe.py`）：
+#:    25 次真实单单元调用里 **4 次**被截断 —— `output_tokens == reasoning_tokens == 2048`、
+#:    `stopReason=length`、内容为 0 ⇒ 降级 `empty_completion`，单元级产出率 **10/25 = 40%**；
+#:    抬到 **4096** 后同样 25 个单元 **0 次截断**、产出率 **14/25 = 56%**（8192 为 15/25）。
+#:    reasoning 占 output 的 **87–92%** ⇒ 预算被吃掉的速度比原先估计的更快。
 #:    一批塞得越多，模型越容易把预算全花在推理上、
 #:    最终返回空或被截断（实测：一批 5–10 个长单元时 `empty_completion` 明显增多）。
 #:
