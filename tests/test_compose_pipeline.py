@@ -4,7 +4,8 @@
 --------------
 
 1. 完整数据流一次跑通：注册渠道 → 采集（注入假 fetcher，**零网络**）→ 归档 →
-   归一化 → feed → 打标，每一阶段都有**可核对的真实产物**。
+   归一化 → feed → 打标 → **分类（T-105，默认关闭：只记账不调模型）** → 证据校验，
+   每一阶段都有**可核对的真实产物**。
 2. 不变量在系统级成立：`raw_records` 无重复、`confirmed_labels` 只增不改、
    归一化可由 raw 重算且结果一致。
 3. 幂等：同输入再跑一次 → 不产生重复 raw / 重复标签，且跳过有明确原因；
@@ -100,7 +101,19 @@ HTML_BODY = (
     "</body></html>"
 ).encode("utf-8")
 
-EXPECTED_NODES = ("collect", "archive", "normalize", "feed", "label", "evidence")
+EXPECTED_NODES = ("collect", "archive", "normalize", "feed", "label", "classify", "evidence")
+
+#: 每个节点的先决条件（SPEC §4.5 的边）。**加强而不是放宽**：
+#: 新节点 `classify` 必须带来它自己的依赖断言（`T-104→T-105`）。
+EXPECTED_DEPENDENCIES = {
+    "collect": [],
+    "archive": ["collect"],
+    "normalize": ["archive"],
+    "feed": ["normalize"],
+    "label": ["normalize"],
+    "classify": ["normalize"],
+    "evidence": ["normalize"],
+}
 
 
 # --------------------------------------------------------------------------- #
@@ -224,6 +237,30 @@ def _pipeline(store_root: Path, fetcher=None, **kwargs):
     )
 
 
+def _proposed_rows(store_root: Path) -> list:
+    """从**另一个连接**读 `proposed_claims`（表不存在 ⇒ 空列表）。"""
+    import sqlite3
+
+    connection = sqlite3.connect(str(store_root / "atlas.db"), isolation_level=None)
+    try:
+        return connection.execute("SELECT claim_key, status FROM proposed_claims").fetchall()
+    except sqlite3.OperationalError:
+        return []
+
+
+def _proposed_table_exists(store_root: Path) -> bool:
+    import sqlite3
+
+    connection = sqlite3.connect(str(store_root / "atlas.db"), isolation_level=None)
+    try:
+        row = connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='proposed_claims'"
+        ).fetchone()
+    finally:
+        connection.close()
+    return row is not None
+
+
 # --------------------------------------------------------------------------- #
 # 判据 1：完整数据流一次跑通，每阶段产物可核对
 # --------------------------------------------------------------------------- #
@@ -249,6 +286,10 @@ def test_end_to_end_dataflow_produces_verifiable_artifacts(store_root: Path) -> 
     assert report.order.index("archive") < report.order.index("normalize")
     assert report.order.index("normalize") < report.order.index("feed")
     assert report.order.index("normalize") < report.order.index("label")
+    # T-105：分类消费归一化（SPEC §4.5 的 T-104→T-105），并**先于**证据校验
+    # （同一层里按声明顺序执行：classify 写的 proposed_claims 必须先进 evidence 的快照）
+    assert report.order.index("normalize") < report.order.index("classify")
+    assert report.order.index("classify") < report.order.index("evidence")
     # T-107：证据校验是图里的一个节点，依赖归一化（SPEC §4.5 的 T-104→T-107）
     assert report.order.index("normalize") < report.order.index("evidence")
     # 假 fetcher 一共只被打到两次（每个渠道一次），没有重试、更没有真实网络
@@ -356,7 +397,18 @@ def test_end_to_end_dataflow_produces_verifiable_artifacts(store_root: Path) -> 
         assert labels.count() == 1
         assert len(labels.all_for(expected_raw_id)) == 1
 
-    # ---- 阶段 6：证据校验（T-107；本用例没有分类 claim，因此如实是"0 条"）----
+    # ---- 阶段 6：机器分类（T-105；默认关闭，但必须**明确记账**）---------------
+    classify = report.result("classify").output.artifacts["observed"]
+    assert classify["enabled"] is False
+    assert classify["reason"] == "model_calls_disabled"
+    assert classify["units_seen"] == 0 and classify["rows_written"] == 0
+    assert classify["claims_in_store"] == 0
+    # 既有 `run` 行为不变：一个模型都不调、一行 proposed_claims 都不写。
+    # 表**存在**（组合根打开仓储时建）⇒ 这条否定断言不是空转：写是能写的，只是没写。
+    assert _proposed_table_exists(store_root), "组合根应打开 proposed 仓储（表由它建）"
+    assert _proposed_rows(store_root) == []
+
+    # ---- 阶段 7：证据校验（T-107；本用例没有分类 claim，因此如实是"0 条"）----
     evidence = report.result("evidence").output.artifacts["observed"]
     assert evidence["raws_in_scope"] == 2
     assert evidence["classified_claims"] == 0
@@ -584,6 +636,7 @@ def test_channel_failure_fails_the_whole_run_and_names_the_failing_node(
         "normalize",
         "feed",
         "label",
+        "classify",
         "evidence",
     }
     for item in partial.blocked:
@@ -844,13 +897,11 @@ def test_cli_plan_prints_dag_offline(tmp_path: Path) -> None:
     plan = json.loads(proc.stdout)
     assert [node["name"] for node in plan["nodes"]] == list(EXPECTED_NODES)
     dependencies = {node["name"]: node["depends_on"] for node in plan["nodes"]}
-    assert dependencies["collect"] == []
-    assert dependencies["archive"] == ["collect"]
-    assert dependencies["normalize"] == ["archive"]
-    assert dependencies["feed"] == ["normalize"]
-    assert dependencies["label"] == ["normalize"]
-    assert dependencies["evidence"] == ["normalize"]
+    # 逐条对着 SPEC §4.5 的边断言（含新节点 classify 的 T-104→T-105）
+    assert dependencies == EXPECTED_DEPENDENCIES
     assert plan["channels"] == []
+    # 模型调用默认关闭，且这个开关在干跑里一眼可见
+    assert plan["classify_enabled"] is False
 
 
 def test_cli_register_then_plan_lists_channel(tmp_path: Path) -> None:

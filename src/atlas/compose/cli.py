@@ -1,17 +1,27 @@
 """T-120 瘦命令行入口：`python -m atlas.compose ...`。
 
-四条子命令，全部只做"调用组合根"这一件事：
+五条子命令，全部只做"调用组合根"这一件事：
 
 | 命令 | 作用 | 需要联网？ |
 |---|---|---|
 | `plan` | 打印将要执行的 DAG 与本轮渠道（**干跑**），每个渠道附 `due` / `last_collected_at` | 否 |
-| `run` | 真实跑一次流水线（采集 → 归档 → 归一化 → feed → 打标 → 证据校验） | 是（且需 `ATLAS_LIVE=1`） |
+| `run` | 真实跑一次流水线（采集 → 归档 → 归一化 → feed → 打标 → 分类 → 证据校验） | 是（且需 `ATLAS_LIVE=1`） |
+| `classify` | **只做机器分类**（T-105）：不采集，把归档里的 raw 分类成 `proposed_claims` 的行 | 否（但会调用模型） |
 | `evidence` | **只做证据校验**（T-107）：不采集，把 `proposed_claims` 的分类行校验成锚点 | 否 |
 | `register` | 往注册表里配一个行业 + 渠道 | 否 |
 
 **真实抓取默认关闭**：`run` 要求环境变量 `ATLAS_LIVE=1`，否则以退出码 2 明确拒绝
 （SPEC §2.12 的合规默认值是"不主动抓"，而不是"默默抓了"）。该模式下走的是
 `atlas.collect` 的真实实现，因此 robots 检查与同域限速**照常生效**，不存在旁路。
+
+**模型调用也默认关闭**（T-105 的成本：边车每次调用 4.2–8.2 s 启动开销 + 真实 token，
+895 个单元的语料 ≈ 334 次调用 ≈ 64 min，见 SPEC §2.14 / §2.17）：
+
+- `run`：只有 `--classify`（或 `ATLAS_COGNITION=1`）才让 `classify` 节点真的调用模型；
+  否则该节点照常出现在报告里，但明确记账"没有调用模型、没有产出任何行"。
+  **既有 `run` 调用因此一字不变。**
+- `classify`：子命令本身就是显式选择（与 `--raw-id` 配合可只跑一条 raw，
+  不必为整个语料付钱）。它**不要求** `ATLAS_LIVE=1`：一个网络字节都不抓。
 
 **T-207 due-only 模式（默认关闭）**
 
@@ -43,6 +53,20 @@
 2. **校验失败的行不落库**，但**必须在报告里可见**（`render_evidence` / `render_evidence_report`
    会逐条打印），绝不"报成功然后把未验证的证据藏起来"；
 3. `--read-only` 只校验不落库（`wrote_to_store=false`），用于复核既有结论。
+
+**T-105 的机器分类（`classify` 子命令）**
+
+`classify` 也是**离线**的（不采集字节），但会**调用模型**（那是它的全部内容）：
+它把归档里的 raw 分流成分类单元（feed 条目 / 整篇文档），分批调用认知层端口，
+把结果与降级逐单元写进 `proposed_claims` / `proposal_runs`。三条边界：
+
+1. **候选标签只来自注册表**（SPEC §2.5 的 C8 闭环）：空标签空间**响亮失败**，
+   绝不用空集合跑出一堆无意义的分类；
+2. **降级不是异常，但必须可见**：`render_classify` 逐条打印降级批次（原因码 +
+   受影响单元 + 耗时）与未分类行的原因分布 —— 只报计数会让"整批超时"看起来像
+   "一切正常"（SPEC §7.3 失败模式 3）；
+3. `--raw-id` 收窄（可重复）：运维可以只跑一条 raw，不必为整个语料付钱；
+   写错的 raw_id **响亮失败**，不静默取交集。
 """
 
 from __future__ import annotations
@@ -54,18 +78,27 @@ import sys
 from datetime import datetime
 from typing import Any, List, Mapping, Optional, Sequence
 
+from atlas.cognition.errors import CognitionError
 from atlas.contracts import ContractError
 from atlas.registry.schema import Channel, FetchSpec, FetchType, Industry
 from atlas.runner import RunReport, TaskFailedError
 from atlas.runner.runner import STATUS_FAILED, STATUS_SKIPPED
 from atlas.schedule import ScheduleError
 
-from .pipeline import NODE_EVIDENCE, LabelAssignment, NothingDueError, build_pipeline
+from .pipeline import (
+    NODE_CLASSIFY,
+    NODE_EVIDENCE,
+    LabelAssignment,
+    NothingDueError,
+    build_pipeline,
+)
 from .tasks import PipelineError, parse_raw_ids
 
 __all__ = [
     "build_parser",
     "main",
+    "render_classify",
+    "render_classify_report",
     "render_evidence",
     "render_evidence_report",
     "render_failure",
@@ -74,6 +107,9 @@ __all__ = [
 ]
 
 LIVE_ENV_VAR = "ATLAS_LIVE"
+#: 让 `run` 显式开启 T-105 的模型调用（与 `--classify` 等价）。默认关闭的理由是成本：
+#: 边车每次调用 4.2–8.2 s 启动开销 + 真实 token（SPEC §2.14 / §2.17）。
+CLASSIFY_ENV_VAR = "ATLAS_COGNITION"
 
 
 def _store_root_default() -> str:
@@ -128,13 +164,28 @@ def build_parser() -> argparse.ArgumentParser:
             help="调度判定用的当前时刻（ISO-8601；naive 按 UTC 解释，默认取系统时钟）",
         )
 
+    def add_classify_flag(target: argparse.ArgumentParser) -> None:
+        target.add_argument(
+            "--classify",
+            action="store_true",
+            help=(
+                "T-105：让 classify 节点真的调用模型（默认关闭）。"
+                f"等价于环境变量 {CLASSIFY_ENV_VAR}=1。"
+                "成本：边车每次调用 4.2–8.2 s 启动 + 真实 token；"
+                "整份语料（895 个单元）≈ 334 次调用 ≈ 64 min。"
+                "只跑少量原文请用 classify 子命令 + --raw-id"
+            ),
+        )
+
     plan = sub.add_parser("plan", help="干跑：打印 DAG 与本轮渠道（含到期判定），不采集")
     add_common(plan)
     add_schedule_flags(plan)
+    add_classify_flag(plan)
 
     run = sub.add_parser("run", help="真实跑一次流水线（需 ATLAS_LIVE=1）")
     add_common(run)
     add_schedule_flags(run)
+    add_classify_flag(run)
     run.add_argument(
         "--window",
         default=None,
@@ -206,6 +257,26 @@ def build_parser() -> argparse.ArgumentParser:
         "--read-only",
         action="store_true",
         help="只校验不落库（报告里 wrote_to_store=false）；缺省 = 真的写 evidence_spans",
+    )
+
+    classify = sub.add_parser(
+        "classify",
+        help=(
+            "T-105：把归档里的 raw 机器分类成 proposed_claims 的行（离线：不采集；"
+            "但会调用模型，因此这是本命令的全部内容）"
+        ),
+    )
+    add_common(classify)
+    classify.add_argument(
+        "--raw-id",
+        action="append",
+        default=[],
+        metavar="RAW_ID",
+        help=(
+            "只分类这些原文（可重复）；缺省 = 归档里的全部原文（**很贵**："
+            "整份语料 ≈ 334 次调用 ≈ 64 min）。"
+            "指定的 raw_id 不在归档里会**响亮失败**（不静默取交集）"
+        ),
     )
 
     return parser
@@ -313,6 +384,147 @@ def render_evidence(observed: Any) -> List[str]:
     return lines
 
 
+def render_classify(observed: Any) -> List[str]:
+    """把 T-105 分类的**关键计数、降级与跳过逐条**打出来。
+
+    为什么必须单独渲染（本项目已实测过的缺陷形态，见 `render_observed` 的注释）：
+    `identity` 里只有"产出了哪些分类行"，**不含**降级与跳过。若只打印 identity，
+    "整批超时、一个 claim 都没抽到"会显示成"一切正常" —— 与 SPEC §7.3 失败模式 3
+    （静默失效）完全同形。因此这里显式打印：
+
+    - 计数：范围内的 raw / 有单元的 raw / 看到的单元 / 实跑 / 分类 / 未分类 /
+      **已跑过而跳过** / 批次 / 调用（成功 / 降级）/ token；
+    - 每一条**降级批次**（原因码 + 受影响的单元 + 耗时）；
+    - 未分类行的**原因分布**（"未分类"必须可审计，不能只有一个总数）；
+    - 分流层跳过的 raw（理由码来自 T-105 的 `SkipReason` 闭集）；
+    - 两条"看起来没事、其实什么都没发生"的显式告警：全部单元被幂等跳过、
+      以及一次成功调用都没有。
+    """
+    if not isinstance(observed, Mapping):
+        return []
+    if "units_seen" not in observed and "units_classified" not in observed:
+        return []
+
+    if observed.get("enabled") is False:
+        # 关闭态：一条计数都不该被误读成"跑过了但没结果"。
+        return [
+            "  观察 classify：enabled=False（模型调用未启用）——"
+            f"{observed.get('note') or observed.get('reason')}",
+            f"    库里现有 proposed_claims {observed.get('claims_in_store')} 行"
+            f"／proposal_runs {observed.get('runs_in_store')} 行"
+            f"（{observed.get('proposed_db')}）",
+        ]
+
+    lines: List[str] = [
+        "  观察 classify："
+        f"raws_in_scope={observed.get('raws_in_scope')}"
+        f" raws_with_units={observed.get('raws_with_units')}"
+        f" units_seen={observed.get('units_seen')}"
+        f" units_run={observed.get('units_run')}"
+        f" units_classified={observed.get('units_classified')}"
+        f" units_unclassified={observed.get('units_unclassified')}"
+        f" units_skipped_already_run={observed.get('units_skipped_already_run')}"
+        f" batches={observed.get('batches')}"
+        f" calls_ok={observed.get('calls_ok')}"
+        f" calls_degraded={observed.get('calls_degraded')}"
+        f" rows_written={observed.get('rows_written')}"
+        f" rows_unchanged={observed.get('rows_unchanged')}"
+        f" tokens_in={observed.get('input_tokens')}"
+        f" tokens_out={observed.get('output_tokens')}"
+        f" reasoning={observed.get('reasoning_tokens')}"
+        f" elapsed_ms={observed.get('elapsed_ms')}"
+    ]
+    if str(observed.get("proposed_db")):
+        lines.append(
+            f"    分类库：{observed.get('proposed_db')}"
+            f"（库里 proposed_claims {observed.get('claims_in_store')} 行"
+            f"／proposal_runs {observed.get('runs_in_store')} 行）"
+        )
+    space = observed.get("label_space")
+    if isinstance(space, Mapping):
+        lines.append(
+            f"    标签空间（来自注册表）：{list(space.get('labels') or [])}"
+            f"｜config_version={space.get('config_version')}"
+        )
+
+    degraded = list(observed.get("degraded_calls") or [])
+    if degraded:
+        lines.append(
+            f"    ⚠️ {len(degraded)} 个批次**降级**（模型不可用 / 输出不可用）："
+            "这些单元已按 SPEC §2.14 决策四写成 unclassified 行，**没有**编造结果"
+        )
+        for item in degraded:
+            units = item.get("unit_ids") or []
+            lines.append(
+                f"      [降级] {item.get('reason')}  raw={item.get('raw_id')} "
+                f"批次={item.get('batch_id')} 单元={len(units)} "
+                f"耗时={item.get('elapsed_ms')}ms  tokens="
+                f"in {item.get('input_tokens')}/out {item.get('output_tokens')}"
+            )
+            if item.get("detail"):
+                lines.append(f"        原因：{str(item['detail'])[:200]}")
+
+    reasons = observed.get("unclassified_reasons") or {}
+    if reasons:
+        lines.append(f"    [未分类] 原因分布：{json.dumps(reasons, ensure_ascii=False, sort_keys=True)}")
+
+    skipped_raws = list(observed.get("raws_skipped") or [])
+    if skipped_raws:
+        lines.append(
+            f"    [分流跳过] {len(skipped_raws)} 条 raw 没有可分类内容"
+            "（理由码来自 T-105 的闭集，**不进模型**）："
+        )
+        for item in skipped_raws:
+            lines.append(
+                f"      [跳过] {item.get('skip_reason')}  raw={item.get('raw_id')}  "
+                f"{str(item.get('detail') or '')[:120]}"
+            )
+
+    conflicts = list(observed.get("content_type_conflicts") or [])
+    if conflicts:
+        # 这条差异**必须**显式呈现：它决定"整份 feed 是 830 个条目还是 1 篇文章"。
+        lines.append(
+            f"    ⚠️ {len(conflicts)} 条 raw 的 T-104 Content-Type 与 T-130 按字节的判定"
+            "**不一致**（生产路径按字节判定；差异在此如实呈现，不是静默选一个）："
+        )
+        for item in conflicts:
+            dispatched = item.get("dispatched") or {}
+            alternative = item.get("if_content_type_used") or {}
+            lines.append(
+                f"      [CT 冲突] raw={item.get('raw_id')} "
+                f"normalize={item.get('normalize_content_type')!r} → "
+                f"按字节：{dispatched.get('kind')}/{dispatched.get('unit_count')} 单元；"
+                f"用它则会：{alternative.get('kind')}/{alternative.get('unit_count')} 单元"
+            )
+
+    seen = int(observed.get("units_seen") or 0)
+    run = int(observed.get("units_run") or 0)
+    if seen > 0 and run == 0:
+        lines.append(
+            f"    ⚠️ 看到的 {seen} 个单元**全部被幂等跳过**（proposal_runs 的 plan_digest "
+            "命中）：这不是'没有输入'，而是'这些单元在本配置下已经跑过'。"
+            "⚠️ 注意 `max_output_tokens` **不在** `plan_digest` 里"
+            "（`config_version` 是静态常量）：已经耗尽重试预算的可重试降级"
+            "**不会**因为改预算而重跑，改标签空间才会（它在 plan_digest 里）"
+        )
+    if int(observed.get("calls_degraded") or 0) > 0 and int(observed.get("calls_ok") or 0) == 0:
+        lines.append(
+            "    ⚠️ 本轮**没有任何一次成功的模型调用**：一条分类行都没产出，"
+            "上面的降级原因就是全部产出（不是'没有可分类的东西'）"
+        )
+    if run > 0 and int(observed.get("units_classified") or 0) == 0:
+        lines.append(
+            "    ⚠️ 本轮跑了模型，但**没有分类出任何单元**："
+            "候选标签空间可能覆盖不足（见 `label_space`），或模型/传输在降级"
+        )
+    if int(observed.get("rows_out_of_space") or 0) > 0:
+        lines.append(
+            f"    ⚠️ {observed.get('rows_out_of_space')} 行 `out_of_space` 审计行："
+            "模型给出的取值落在当前标签空间之外（不计入分类结果，SPEC §2.5 的 C8 闭环）"
+        )
+    return lines
+
+
 def render_report(report: RunReport) -> str:
     lines: List[str] = ["执行汇总（拓扑序）："]
     for name in report.order:
@@ -338,6 +550,9 @@ def render_report(report: RunReport) -> str:
         lines.append(f"产物 {name}：{json.dumps(identity, ensure_ascii=False, sort_keys=True)}")
         observed = result.output.artifacts.get("observed")
         lines.extend(render_observed(name, observed))
+        if name == NODE_CLASSIFY:
+            # T-105 的降级与跳过**不在** identity 里，必须单独渲染（见 render_classify）。
+            lines.extend(render_classify(observed))
         if name == NODE_EVIDENCE:
             # T-107 的失败与跳过**不在** identity 里，必须单独渲染（见 render_evidence）。
             lines.extend(render_evidence(observed))
@@ -413,9 +628,18 @@ def _parse_assignment(text: str, *, kind: str, actor: str) -> LabelAssignment:
     return LabelAssignment(raw_id=target, label_key=key, label_value=value, actor=actor)
 
 
+def _classify_requested(args: argparse.Namespace) -> bool:
+    """T-105 的模型调用是否被显式开启（`--classify` 或 `ATLAS_COGNITION=1`）。"""
+    return bool(getattr(args, "classify", False)) or os.environ.get(CLASSIFY_ENV_VAR) == "1"
+
+
 def _cmd_plan(args: argparse.Namespace) -> int:
     now = _parse_now(args.now)
-    with build_pipeline(store_root=args.store_root, actor=args.actor or args.author) as pipe:
+    with build_pipeline(
+        store_root=args.store_root,
+        actor=args.actor or args.author,
+        classify=_classify_requested(args),
+    ) as pipe:
         plan = pipe.plan(due_only=args.due_only, now=now)
         print(json.dumps(plan, ensure_ascii=False, indent=2, sort_keys=True))
         if args.due_only:
@@ -468,6 +692,15 @@ def _cmd_run(args: argparse.Namespace) -> int:
 
     actor = args.actor or args.author
     now = _parse_now(args.now)
+    classify = _classify_requested(args)
+    if classify:
+        # 花钱的动作必须**先说清楚**（不是拒绝，只是不让人在不知情时付钱）。
+        print(
+            "已启用模型调用（classify，T-105）：本轮会对整份归一化产物调用模型"
+            "（边车每次调用 4.2–8.2 s 启动开销 + 真实 token）。"
+            "只跑少量原文请用 `python -m atlas.compose classify --raw-id <RAW_ID>`",
+            file=sys.stderr,
+        )
     assignments = [
         _parse_assignment(text, kind="channel", actor=actor)
         for text in args.label_channel
@@ -480,6 +713,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         label_assignments=assignments,
         on_channel_failure="report" if args.allow_partial else "fail",
         max_retries=args.max_retries,
+        classify=classify,
     )
     with pipeline:
         if args.due_only:
@@ -557,6 +791,49 @@ def render_evidence_report(output: Any) -> str:
     return "\n".join(lines)
 
 
+def _cmd_classify(args: argparse.Namespace) -> int:
+    """T-105：把归档里的 raw 分类成 `proposed_claims` 的行（**离线**，不采集字节）。
+
+    走的不是 `TaskRunner`，而是组合根给出的**同一份**输入快照 + 同一个阶段实例
+    （与 `evidence` 子命令完全同形）：分类的输入是"归档里已有的字节 + 注册表里的标签
+    空间"，重跑采集既不必要、也会让这条命令变成"必须有网才能用一次"。代价是失去执行器
+    的重试与执行记录，因此这里显式打印阶段自己算出的幂等键，让"同输入同输出"仍可核对；
+    而"不重复调用模型"由 T-105 自己的运行账（`proposal_runs.plan_digest`）保证 ——
+    第二次跑同一份输入会报 `units_skipped_already_run == units_seen`、一行都不新写。
+
+    **本命令会调用模型**（那就是它的全部内容），因此它本身就是那个显式开关；
+    但它**不要求** `ATLAS_LIVE=1`：一个网络字节都不抓。
+    """
+    pipeline = build_pipeline(
+        store_root=args.store_root,
+        actor=args.actor or args.author,
+        raw_ids=parse_raw_ids(args.raw_id),
+        classify=True,
+    )
+    with pipeline:
+        stage, inputs, config = pipeline.collect_classify_input()
+        output = stage.execute(inputs, config)
+        print(render_classify_report(output))
+        observed = output.artifacts["observed"]
+        if observed.get("enabled") is not True:
+            # 不可能状态：本命令就是为了开启分类。
+            print("分类未启用但走的是 classify 子命令：这是接线错误", file=sys.stderr)
+            return 1
+    return 0
+
+
+def render_classify_report(output: Any) -> str:
+    """渲染一次离线分类的产物（计数 + 降级逐条 + 幂等键）。"""
+    lines: List[str] = [
+        f"机器分类（T-105，离线）：任务 {output.task_name}",
+        f"  幂等键：{output.idempotency_key}",
+        "产物 identity："
+        + json.dumps(output.artifacts.get("identity", {}), ensure_ascii=False, sort_keys=True),
+    ]
+    lines.extend(render_classify(output.artifacts.get("observed")))
+    return "\n".join(lines)
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(list(argv) if argv is not None else None)
@@ -564,6 +841,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "plan": _cmd_plan,
         "run": _cmd_run,
         "register": _cmd_register,
+        "classify": _cmd_classify,
         "evidence": _cmd_evidence,
     }
     handler = handlers[args.command]
@@ -573,6 +851,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # 领域错误：如实报错并非零退出，不吞、不降级。
         # 注意 `NothingDueError` 是 `PipelineError` 的子类，但**不会**走到这里：
         # "没有到期的渠道"由上面的 `is_idle` 分支 / 专门的 `except` 处理成退出码 0。
+        print(f"{type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
+    except CognitionError as exc:
+        # 认知层的配置 / 环境错误（缺凭据、node 不可用、边车依赖没装）：同样是
+        # "本层不接受"的输入错误，必须**响亮但可读**地退出，而不是甩一个 traceback。
         print(f"{type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
 

@@ -6,11 +6,18 @@
 ```
 collect ──▶ archive ──▶ normalize ──┬──▶ feed
 （T-102）   （T-103）    （T-104）    ├──▶ label（T-108，人工产物）
+                          │         ├──▶ classify（T-105：写 proposed_claims 的行）
                           │         └──▶ evidence（T-107，证据锚点）
                           │                      ▲
-                          └── atlas.contracts 的  │ proposed_claims（T-105 的分类行，
+                          └── atlas.contracts 的  │ proposed_claims（T-105 的行，
                               三态类型在阶段之间传递 │ 由组合根投影进输入快照）
 ```
+
+> **`classify` 节点是"系统自己产出 claim"的唯一入口**：在它接进来之前，流水线能
+> 采集 / 归档 / 归一化 / 打标 / 校验证据，却**永远不会**写 `proposed_claims`，
+> 于是 `evidence` 在任何新 store 上都只能报 `classified_claims=0`。
+> 它的模型调用**默认关闭**（`run --classify` / `ATLAS_COGNITION=1` /
+> 离线的 `classify` 子命令），因为那是真金白银（SPEC §2.14 / §2.17）。
 
 接线方式
 --------
@@ -50,6 +57,7 @@ from __future__ import annotations
 from .cli import main
 from .pipeline import (
     NODE_ARCHIVE,
+    NODE_CLASSIFY,
     NODE_COLLECT,
     NODE_EVIDENCE,
     NODE_FEED,
@@ -63,10 +71,14 @@ from .pipeline import (
     Pipeline,
     PipelineConfig,
     build_pipeline,
+    default_cognition_port,
 )
 from .tasks import (
     COMPOSE_CODE_VERSION,
+    DISPATCH_CONTENT_TYPE,
     ArchiveStage,
+    ClassifyStage,
+    ClassifyStageError,
     CollectStage,
     CollectionFailedError,
     EvidenceStage,
@@ -79,15 +91,23 @@ from .tasks import (
     StageInputError,
     StageLabelError,
     claim_verification_requests,
+    classify_archived_document,
+    classify_plan_for_content,
+    classify_plan_projection,
+    content_type_conflict,
+    label_space_from_snapshot,
     parse_raw_ids,
     parse_window,
+    policy_from_snapshot,
     proposed_claim_from_snapshot,
     utc_hour_window,
 )
 
 __all__ = [
     "COMPOSE_CODE_VERSION",
+    "DISPATCH_CONTENT_TYPE",
     "NODE_ARCHIVE",
+    "NODE_CLASSIFY",
     "NODE_COLLECT",
     "NODE_EVIDENCE",
     "NODE_FEED",
@@ -102,8 +122,11 @@ __all__ = [
     "Pipeline",
     "PipelineConfig",
     "build_pipeline",
+    "default_cognition_port",
     # tasks
     "ArchiveStage",
+    "ClassifyStage",
+    "ClassifyStageError",
     "CollectStage",
     "CollectionFailedError",
     "EvidenceStage",
@@ -116,8 +139,14 @@ __all__ = [
     "StageInputError",
     "StageLabelError",
     "claim_verification_requests",
+    "classify_archived_document",
+    "classify_plan_for_content",
+    "classify_plan_projection",
+    "content_type_conflict",
+    "label_space_from_snapshot",
     "parse_raw_ids",
     "parse_window",
+    "policy_from_snapshot",
     "proposed_claim_from_snapshot",
     "utc_hour_window",
     # cli

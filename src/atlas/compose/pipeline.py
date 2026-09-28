@@ -4,7 +4,30 @@ DAG（边方向：`A depends_on=[B]` ⇒ B → A）::
 
     collect ──▶ archive ──▶ normalize ──┬──▶ feed
                                         ├──▶ label
+                                        ├──▶ classify ──▶ proposed_claims（T-105 的行）
                                         └──▶ evidence ◀── proposed_claims（T-105 的行）
+
+**`classify` 节点的接线（T-105 接进流水线）**
+
+`classify` 声明依赖 `normalize`（SPEC §4.5 的边 `T-104→T-105`）：它按归一化产物确定
+"本轮要分类哪些 raw"、并用上游记录的 `content_sha256` 校验归档字节确实就是被归一化的
+那一份。**但它刻意不把 T-104 记下来的 Content-Type 喂进 T-105 的分流** —— 真实数据上
+这条差异会让 18 个单元（895 → 877）静默消失：`normalize()` 把 2 份良构 RSS 嗅探成
+`text/html`，而 T-130 看到 `text/html` 会**一律拒绝**条目化，于是整份 feed 会被判成
+一篇文章。判据、实测数字与"为什么两个答案都要看见"见
+`atlas.compose.tasks.DISPATCH_CONTENT_TYPE` 与 `content_type_conflict()`；
+冲突逐条进 `observed.content_type_conflicts` 并由 `render_classify()` 打印。
+
+`evidence` **不**把 `classify` 声明成依赖，理由是 SPEC §4.5 的边 `T-105→T-107`
+是一条**数据边**（T-105 的行，不是某个节点的产物快照）：离线复核入口
+（`collect_evidence_input()`）根本没有 `classify` 的执行记录，把边声明成
+节点依赖就只能靠"造一条上游记录"绕过 —— 那等于伪造上游产物。
+真正让新 claim 必然被校验的机制是**投影进快照**（`_evidence_claims`），
+它比"声明一条边"更强：数据变了键就变。
+"classify 先于 evidence"由此靠**声明顺序**保证（`DEFAULT_NODES` 里 classify 在前，
+同一层的相对顺序即声明顺序，见 `atlas.runner`），并由测试钉死
+（`tests/test_classify_wiring.py` 在**同一轮**里断言 `classify` 写的行被 `evidence`
+校验成锚点 —— 这条闭环由测试而不是由文档保证）。
 
 **`evidence` 节点的接线（T-107）**
 
@@ -17,6 +40,15 @@ DAG（边方向：`A depends_on=[B]` ⇒ B → A）::
 > 的摘要（`AtlasTask.idempotency_key`）。若快照里不含 claims 投影，T-105 之后再跑出
 > 新 claim 时幂等键**不变** ⇒ 节点被幂等跳过 ⇒ 新 claim 永远等不到校验。
 > 把投影放进快照，"有新 claim / 新版本 / 新归一化 ⇒ 重跑"就是结构性成立的。
+
+**`classify` 的模型调用默认关闭（成本）**
+
+T-105 每次调用要付边车进程启动（实测 4.2–8.2 s）+ 真实 token；895 个单元的语料
+≈ 334 次调用 ≈ 64 min（SPEC §2.17）。因此 `classify` 节点**照常出现在 DAG 里**
+（可见、可计划、可幂等），但 `PipelineConfig.classify` 默认 `False`：
+此时它明确记账"没有调用模型、没有产出任何行"，`run` 的既有行为**一字不变**。
+开关由组合根写进该节点的**输入快照**（`enabled`），于是"关→开"必然改变幂等键
+⇒ 节点真的会重跑，不会被上一次的关闭态执行记录跳过。
 
 **T-207 的接线位置（调度器决定"采哪些渠道"）**
 
@@ -71,6 +103,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 from collections.abc import Iterator, Mapping as MappingABC
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -78,6 +111,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from atlas.archive import ArchiveStore, open_archive
+from atlas.cognition import ClassificationError, LabelSpace, ProposalPolicy
 from atlas.cognition.store import CLAIM_STATUS_CLASSIFIED, open_proposed_store
 from atlas.contracts import ContractError, Snapshot, TaskVersions, content_sha256
 from atlas.evidence import open_evidence_store
@@ -101,6 +135,8 @@ from atlas.schedule import (
 from .tasks import (
     COMPOSE_CODE_VERSION,
     ArchiveStage,
+    ClassifyStage,
+    ClassifyStageError,
     CollectStage,
     ComposeDependencies,
     EvidenceStage,
@@ -109,12 +145,15 @@ from .tasks import (
     NormalizeStage,
     PipelineError,
     StageInputError,
+    classify_plan_for_content,
+    classify_plan_projection,
     parse_raw_ids,
     parse_window,
 )
 
 __all__ = [
     "NODE_ARCHIVE",
+    "NODE_CLASSIFY",
     "NODE_COLLECT",
     "NODE_EVIDENCE",
     "NODE_FEED",
@@ -128,6 +167,7 @@ __all__ = [
     "Pipeline",
     "PipelineConfig",
     "build_pipeline",
+    "default_cognition_port",
 ]
 
 NODE_COLLECT = "collect"
@@ -135,7 +175,11 @@ NODE_ARCHIVE = "archive"
 NODE_NORMALIZE = "normalize"
 NODE_FEED = "feed"
 NODE_LABEL = "label"
+NODE_CLASSIFY = "classify"
 NODE_EVIDENCE = "evidence"
+
+#: `classify` 节点快照里的开关键（关闭态的理由码）。
+CLASSIFY_DISABLED_REASON = "model_calls_disabled"
 
 
 class NothingDueError(PipelineError):
@@ -161,14 +205,37 @@ class NothingDueError(PipelineError):
 
 
 #: 节点声明顺序即"同层相对顺序"，因此拓扑序可复现。
+#: ⚠️ `classify` **必须**排在 `evidence` 之前：同一层里 `classify` 先跑，
+#: 它写的 `proposed_claims` 行才会出现在随后计算的 `evidence` 输入快照里
+#: （`NodeInputs` 是按节点惰性计算的，见 `_snapshot`）。
 DEFAULT_NODES: Tuple[str, ...] = (
     NODE_COLLECT,
     NODE_ARCHIVE,
     NODE_NORMALIZE,
     NODE_FEED,
     NODE_LABEL,
+    NODE_CLASSIFY,
     NODE_EVIDENCE,
 )
+
+
+def default_cognition_port() -> Any:
+    """默认的认知层端口：T-003 的 PI 边车适配器（SPEC §2.14 决策二）。
+
+    **惰性构造**：本函数只在 `classify` 节点真的被启用时才被调用一次，因此
+    "没有 node / 没有凭据"不会影响任何关闭分类的路径（`plan` / 默认 `run`）。
+
+    `node_bin` 取 `shutil.which("node")`：它**可能**解析到 DSH 的占位文件，
+    但 `atlas.cognition.node.resolve_node` 会逐个候选**真的执行 `--version` 验证**，
+    不过关的候选被跳过并列出原因，最终回退到已知布局（例如 nvm）。因此这里给一个
+    可能无效的候选是安全的，**不是**"把机器的专有路径硬编码进来"。
+    """
+    from atlas.cognition import CognitionConfig, PiSidecarCognitionPort
+
+    config = CognitionConfig.from_env(
+        route="deepseek", node_bin=shutil.which("node") or ""
+    )
+    return PiSidecarCognitionPort(config)
 
 
 # --------------------------------------------------------------------------- #
@@ -406,6 +473,14 @@ class PipelineConfig:
     require_nonempty_text: bool = True
     evidence_read_only: bool = False
     raw_ids: Tuple[str, ...] = ()
+    #: T-105 的模型调用开关。**默认关闭**：它花钱（边车每次调用 4.2–8.2 s 启动开销 +
+    #: 真实 token），因此必须显式开启（`run --classify` / `ATLAS_COGNITION=1` /
+    #: 离线的 `classify` 子命令）。关闭时 `classify` 节点照常出现在 DAG 与报告里，
+    #: 但明确记账"没有调用模型、没有产出任何行"。
+    classify: bool = False
+    #: T-105 的批次 / 重试策略（默认 = SPEC §2.17 的登记值）。它进 `classify` 节点的
+    #: 输入快照，因此改它必然改变幂等键 ⇒ 重跑（而不是"改了没用"）。
+    classify_policy: Optional[ProposalPolicy] = None
 
     def __post_init__(self) -> None:
         if not str(self.store_root).strip():
@@ -418,7 +493,16 @@ class PipelineConfig:
             )
         if self.max_retries < 0:
             raise PipelineError(f"max_retries 必须 >= 0，收到 {self.max_retries}")
+        if not isinstance(self.classify, bool):
+            raise PipelineError(
+                f"classify 必须是布尔开关，收到 {type(self.classify).__name__}"
+            )
         object.__setattr__(self, "raw_ids", parse_raw_ids(self.raw_ids))
+
+    @property
+    def policy(self) -> ProposalPolicy:
+        """T-105 的批次策略（未注入时用 SPEC §2.17 的默认值）。"""
+        return self.classify_policy or ProposalPolicy()
 
     @property
     def root(self) -> Path:
@@ -476,6 +560,8 @@ class Pipeline:
         registry: Optional[RegistryService] = None,
         evidence: Optional[Any] = None,
         proposed: Optional[Any] = None,
+        cognition: Optional[Any] = None,
+        cognition_factory: Optional[Callable[[], Any]] = None,
     ) -> None:
         self.config = config
         self.dependencies = dependencies or ComposeDependencies.real()
@@ -517,9 +603,18 @@ class Pipeline:
         self.evidence = evidence
 
         if proposed is None:
+            # T-105 的 `proposed_claims` / `proposal_runs`（**只增不改**）。
+            # 归属纪律与其它句柄完全一致：由本类打开、由本类关闭；测试可注入自己的
+            # 实例（`build_pipeline(proposed=...)`），此时不重复打开、也不关别人的句柄。
             proposed = open_proposed_store(config.proposed_path)
             self._owned.append(proposed)
         self.proposed = proposed
+
+        # 认知层端口（T-003）**不在这里构造**：它要么由调用方注入（测试用哑端口），
+        # 要么在 `classify` 节点真的被启用时经工厂惰性构造一次。因此"没装 node /
+        # 没放凭据"不会影响任何关闭分类的路径。
+        self._cognition = cognition
+        self._cognition_factory = cognition_factory or default_cognition_port
 
         self._last_inputs: Optional[NodeInputs] = None
 
@@ -549,6 +644,37 @@ class Pipeline:
             config_version=self.registry.config_version,
         )
 
+    def cognition_port(self) -> Any:
+        """认知层端口（T-003 `CognitionPort`）：注入的优先，否则**惰性**构造一次。
+
+        惰性是有意的：只有 `classify` 节点被启用时才会有人调用本方法，
+        因此默认路径（`plan` / 默认 `run` / 全部既有测试）不依赖 node 与凭据。
+        """
+        if self._cognition is None:
+            self._cognition = self._cognition_factory()
+        return self._cognition
+
+    def label_space(self) -> LabelSpace:
+        """从**注册表**读标签空间后注入（SPEC §2.5 的 C8 闭环；§2.9 外部契约）。
+
+        与 `feed` 的 `industry_of` 是同一种做法：**组合根**读注册表，把结果交给阶段；
+        `atlas.cognition` 自己不 import `atlas.registry`（SPEC §4.0 的跨包规则）。
+
+        **空标签空间响亮失败**（转成 `ClassifyStageError`）：候选标签集合必须来自
+        当前启用的行业配置，绝不用空集合产出"看起来成功"的空标签分类。
+        """
+        labels = self.registry.label_space()
+        try:
+            return LabelSpace.of(
+                labels, config_version=self.registry.config_version, source="registry"
+            )
+        except ClassificationError as exc:
+            raise ClassifyStageError(
+                f"注册表里没有可用的分类标签（当前启用行业的 label_space 为空）：{exc}；"
+                "SPEC §2.5 的 C8 闭环要求候选标签集合来自**当前启用的行业配置**，"
+                "因此这里响亮失败，而不是产出空标签的分类结果"
+            ) from exc
+
     @property
     def last_inputs(self) -> Optional[NodeInputs]:
         """最近一次 `run()` 用过的输入快照（诊断用；`None` 表示还没跑过）。"""
@@ -560,7 +686,13 @@ class Pipeline:
         versions: Optional[TaskVersions] = None,
         industry_of: Optional[Mapping[str, str]] = None,
     ) -> TaskGraph:
-        """装配 DAG。阶段的依赖全部构造注入（默认实现见 `ComposeDependencies.real()`）。"""
+        """装配 DAG。阶段的依赖全部构造注入（默认实现见 `ComposeDependencies.real()`）。
+
+        **本方法刻意不读注册表**：`plan` 对"空注册表"也必须能打印（只读查询对任何
+        状态都成立），而组合根的读取动作放在**节点输入快照**里（`_classify_input` /
+        `_evidence_claims` / `_resolve_assignments`）—— 那里的读取是"真的要跑这个节点"
+        的入口，空配置在那里响亮失败才有意义。
+        """
         versions = versions or self.versions()
         industry_of = dict(industry_of or {})
 
@@ -594,6 +726,18 @@ class Pipeline:
                 ),
                 NODE_LABEL: (
                     LabelStage(versions, archive=self.archive, labels=self.labels),
+                    (NODE_NORMALIZE,),
+                ),
+                NODE_CLASSIFY: (
+                    # SPEC §4.5 的边 `T-104→T-105`：分类消费归一化产物
+                    # （归一化文本对应的 raw、以及它的 Content-Type）。
+                    ClassifyStage(
+                        versions,
+                        archive=self.archive,
+                        proposed=self.proposed,
+                        port=self._cognition,
+                        port_factory=self.cognition_port,
+                    ),
                     (NODE_NORMALIZE,),
                 ),
                 NODE_EVIDENCE: (
@@ -673,6 +817,10 @@ class Pipeline:
                 {"name": name, "depends_on": list(graph.dependencies(name))}
                 for name in graph.topological_order()
             ],
+            # 模型调用是否被启用必须能一眼看出来：它是"这一轮会不会花钱"的唯一开关，
+            # 藏在 `PipelineConfig` 里就等于没有告诉操作者。
+            "classify_enabled": bool(self.config.classify),
+            "classify_gate": "run --classify / ATLAS_COGNITION=1（默认关闭）",
             "channels": [
                 {
                     "id": channel.id,
@@ -783,10 +931,16 @@ class Pipeline:
             max_retries=self.config.max_retries,
         )
         if targets is None and self.config.raw_ids:
-            # `raw_ids` 是**证据校验的收窄输入**（T-107 的取证 / 复核路径）：此时只跑
-            # 归一化及其上游 + evidence，不跑与本轮取证无关的 feed / label。
-            # 无 `raw_ids` 时 targets 保持原样（默认整图 = T-120 的行为）。
-            targets = (NODE_NORMALIZE, NODE_EVIDENCE)
+            # `raw_ids` 是**取证 / 复核路径的收窄输入**（T-107 的 `evidence` / T-105 的
+            # `classify`）：此时只跑归一化及其上游 + 这一轮被收窄的两个下游节点，
+            # 不跑与本轮取证无关的 feed / label。
+            # `classify` 只在真的启用时进目标集：关闭时它谁也不依赖、也不产出，
+            # 把它拖进目标集只会让报告多一行噪音。
+            targets = (
+                (NODE_NORMALIZE, NODE_CLASSIFY, NODE_EVIDENCE)
+                if self.config.classify
+                else (NODE_NORMALIZE, NODE_EVIDENCE)
+            )
         return runner.run(inputs, targets=targets)
 
     # ------------------------------------------------------------------
@@ -875,10 +1029,61 @@ class Pipeline:
             "content_type": normalized.content_type,
         }
 
+    def collect_classify_input(self) -> Tuple[Any, Snapshot, Snapshot]:
+        """装配 T-105 的**离线分类**输入：`(阶段, 输入快照, 配置快照)`。
+
+        与 `collect_evidence_input()` 完全同形（这也是"一条命令就能拿到 claim"的入口）：
+        归一化的输入快照由**归档现状**重建（`content_type` 由真的跑一遍
+        `atlas.normalize.normalize` 得到，与 `NormalizeStage` 同一份实现），
+        其余全部交给 `_classify_input()` —— 与流水线内运行**同一份实现**，
+        因此两条入口看到的标签空间、策略与单元集合不会漂移。
+
+        为什么分类也需要离线入口：`classify` 在 DAG 里依赖 `normalize`，而 `normalize`
+        依赖 `archive`、`archive` 依赖 `collect` —— 若"分类一条 raw"必须重跑采集，
+        那么运维为了省 token 而收窄范围时反而要先付一次联网采集。字节已经在归档里，
+        分类是归档字节 + 标签空间的纯函数（模型调用是唯一的外部副作用）。
+
+        Raises:
+            PipelineError: 归档里没有任何 raw 可分类（"没有输入"不伪装成"分类成功"）。
+        """
+        versions = self.versions()
+        graph = self.build_graph(versions=versions)
+        raw_ids = self.archive.all_raw_ids()
+        if not raw_ids:
+            raise PipelineError(
+                f"归档（{self.archive.raw_dir}）里没有任何 raw，分类没有输入；"
+                "先跑一次采集入库（ATLAS_LIVE=1 python -m atlas.compose run）"
+            )
+        scoped = self._scope_raw_ids(raw_ids, covered="归档")
+        records = [self._evidence_record(raw_id) for raw_id in scoped]
+        config_snapshot = self._config_snapshot()
+        inputs = NodeInputs(
+            graph,
+            self._store,
+            config_snapshot,
+            extra=self._extra_payload,
+            extras={
+                # 同 `collect_evidence_input`：归一化这一步的快照直接由归档现状构造，
+                # 因此 `_classify_input()` 经 `identity_of(NODE_NORMALIZE)` 读到的
+                # 就是"归档现在长什么样"，而不是"上一次流水线跑过什么"。
+                NODE_NORMALIZE: {"identity": {"records": records}},
+            },
+        )
+        return graph.task(NODE_CLASSIFY), inputs[NODE_CLASSIFY], config_snapshot
+
     def _extra_payload(self, node: str, inputs: NodeInputs) -> Mapping[str, Any]:
-        """按节点补充输入快照里"组合根才知道"的部分（人工打标 / T-105 的 claims）。"""
+        """按节点补充输入快照里"组合根才知道"的部分。
+
+        三处，全都是**同一形状**（节点自己不查库、不读配置，只消费快照）：
+
+        - `label`：人工判断解析后的目标（`assignments`）；
+        - `classify`：T-105 的开关 / 标签空间 / 批次策略 / 单元投影（`_classify_input`）；
+        - `evidence`：`proposed_claims` 的分类行投影（`_evidence_claims`）。
+        """
         if node == NODE_LABEL:
             return {"assignments": self._resolve_assignments(inputs)}
+        if node == NODE_CLASSIFY:
+            return self._classify_input(inputs)
         if node == NODE_EVIDENCE:
             return self._evidence_claims(inputs)
         return {}
@@ -902,12 +1107,78 @@ class Pipeline:
             )
         return sorted(self.config.raw_ids)
 
+    def _normalize_records(self, inputs: NodeInputs) -> List[Dict[str, Any]]:
+        """本轮归一化产物的记录列表（T-105 / T-107 共同的"消费归一化"入口）。"""
+        identity = inputs.identity_of(NODE_NORMALIZE)
+        records = identity.get("records", [])
+        if not isinstance(records, list):
+            raise PipelineError(
+                f"normalize 节点的 identity.records 必须是列表，收到 {type(records).__name__}"
+            )
+        return [dict(item) for item in records]
+
+    def _classify_input(self, inputs: NodeInputs) -> Mapping[str, Any]:
+        """把 T-105 需要的**全部输入**装配进 `classify` 节点的快照。
+
+        关闭时（默认）：只写"关掉了"这件事本身，**不读注册表、不读归档、不构造端口**。
+        因此默认路径与 T-107 之前的行为一字不差（既有测试与既有 `run` 调用全部不变）。
+
+        开启时写进四样东西，每一样都有它非进不可的理由：
+
+        | 键 | 为什么必须进快照（= 进幂等键） |
+        |---|---|
+        | `enabled` | "关→开"必须改变幂等键，否则节点会被上一次的关闭态记录**幂等跳过** |
+        | `label_space` | 候选标签**决定送进模型的输入**（SPEC §2.5 的 C8 闭环）：换标签空间必须重跑 |
+        | `policy` | 批次大小同样改变模型看到的输入（SPEC §2.17：策略进配置指纹） |
+        | `plans` | 单元级指纹投影：换分流/归约规则 ⇒ 单元文本变 ⇒ 必须重跑（否则新单元永远等不到分类） |
+
+        `raw_ids` 是 `--raw-id` 收窄后的范围（与 `evidence` 同一条纪律：指定的 raw
+        不在本轮归一化产物里就**响亮失败**，绝不静默取交集）。
+
+        标签空间从 `self.registry` 读（与 feed 的 `industry_of` 同一种注入方式）；
+        空标签空间在这里就**响亮失败**（`label_space()`），不会走到阶段里。
+        """
+        if not self.config.classify:
+            return {"enabled": False, "reason": CLASSIFY_DISABLED_REASON}
+
+        records = self._normalize_records(inputs)
+        by_raw = {str(item["raw_id"]): item for item in records}
+        scoped = self._scope_raw_ids(by_raw, covered="本轮归一化产物")
+        space = self.label_space()
+        policy = self.config.policy
+        plans: List[Dict[str, Any]] = []
+        for raw_id in scoped:
+            item = by_raw[raw_id]
+            plans.append(
+                classify_plan_projection(
+                    classify_plan_for_content(
+                        self.archive.get_content(raw_id),
+                        raw_id=raw_id,
+                        channel_id=str(item.get("channel_id") or ""),
+                        endpoint=str(item.get("endpoint") or ""),
+                    )
+                )
+            )
+        return {
+            "enabled": True,
+            "label_space": space.as_dict(),
+            "policy": policy.as_dict(),
+            "raw_ids": scoped,
+            "plans": plans,
+        }
+
     def _evidence_claims(self, inputs: NodeInputs) -> Mapping[str, Any]:
         """把 T-105 `proposed_claims` 的**分类行**投影成 `evidence` 节点的输入。
 
-        SPEC §4.5 的边 `T-105→T-107` 是一条**数据边**：T-105 的行不是本图里某个节点的
-        产物（`propose` 由 `python -m atlas.cognition` 按需调用模型产出），因此这条边
-        由组合根注入快照补齐，而不是声明一条指向不存在节点的依赖。
+        SPEC §4.5 的边 `T-105→T-107` 是一条**数据边**：进快照的是 T-105 的**行**
+        （`classify` 节点在库里的产出），不是 `classify` 节点的产物快照。这条边由组合根
+        注入补齐，而不是声明一条节点依赖 —— 离线复核入口（`collect_evidence_input()`）
+        没有 `classify` 的执行记录，声明成节点依赖就只能靠"造一条上游记录"绕过，
+        那等于伪造上游产物。而"投影进快照"比声明依赖更强：
+
+        - 库里的分类行变了 ⇒ 投影变 ⇒ 幂等键变 ⇒ `evidence` 必然重跑；
+        - `classify` 与 `evidence` 的**先后**由 `DEFAULT_NODES` 的声明顺序保证
+          （同层相对顺序 = 声明顺序），两种机制各管一件事。
 
         **投影里刻意不含**时刻与调用账（`created_at` / `batch_id` / token / `elapsed_ms`）
         —— 它们变化不代表证据该重算；但 `quote` / `value` / `claim_version` /
@@ -920,11 +1191,7 @@ class Pipeline:
         分类过）。但一旦库里有分类行而投影漏了它，幂等键就会失真，所以两者都在
         `observed` 里如实呈现（`raws_without_claims`）。
         """
-        records = inputs.identity_of(NODE_NORMALIZE).get("records", [])
-        if not isinstance(records, list):
-            raise PipelineError(
-                f"normalize 节点的 identity.records 必须是列表，收到 {type(records).__name__}"
-            )
+        records = self._normalize_records(inputs)
         scoped = self._scope_raw_ids(
             (str(item["raw_id"]) for item in records), covered="本轮归一化产物"
         )
@@ -1019,6 +1286,8 @@ def build_pipeline(
     max_retries: int = 1,
     evidence_read_only: bool = False,
     raw_ids: Sequence[str] = (),
+    classify: bool = False,
+    classify_policy: Optional[ProposalPolicy] = None,
     dependencies: Optional[ComposeDependencies] = None,
     execution_store: Optional[ExecutionRecordStore] = None,
     archive: Optional[ArchiveStore] = None,
@@ -1026,8 +1295,18 @@ def build_pipeline(
     registry: Optional[RegistryService] = None,
     evidence: Optional[Any] = None,
     proposed: Optional[Any] = None,
+    cognition: Optional[Any] = None,
+    cognition_factory: Optional[Callable[[], Any]] = None,
 ) -> Pipeline:
-    """便捷装配入口（组合根的唯一公开构造方式）。"""
+    """便捷装配入口（组合根的唯一公开构造方式）。
+
+    `classify=False`（默认）时模型调用被显式关闭：`classify` 节点照常出现在 DAG 里，
+    但只记账"没有调用模型、没有产出任何行"。开启它需要显式传 `classify=True`
+    （CLI 上是 `run --classify` / `ATLAS_COGNITION=1` / 离线的 `classify` 子命令）。
+
+    `cognition=` 注入认知层端口（测试用哑端口，不联网）；缺省时由
+    `default_cognition_port()` 在**真的要用**的那一刻惰性构造。
+    """
     config = PipelineConfig(
         store_root=Path(store_root),
         actor=actor,
@@ -1037,6 +1316,8 @@ def build_pipeline(
         max_retries=max_retries,
         evidence_read_only=evidence_read_only,
         raw_ids=tuple(raw_ids),
+        classify=classify,
+        classify_policy=classify_policy,
     )
     return Pipeline(
         config,
@@ -1047,4 +1328,6 @@ def build_pipeline(
         registry=registry,
         evidence=evidence,
         proposed=proposed,
+        cognition=cognition,
+        cognition_factory=cognition_factory,
     )
