@@ -966,6 +966,47 @@ unit_char_start <= anchor.char_start < anchor.char_end <= unit_char_end
    远低于 `BATCH_MAX_UNITS=4` 的配置。这既解释了调用次数偏高，
    也说明"上限是 4"与"实际能用 4"是两件事——**上限是配置，退化是观测**。
 
+> ⚠️ **上面第 1 条当时的归因已被 2026-09-28 的分离实验修正**（见本节"产出率的真实构成"）：
+> 那 13 行 `timeout` **不是**推理吃预算，而是 `input_tokens=0` / `output_tokens=0` 的**传输层故障**
+> （散布 <200 ms、集中在 2.5 分钟窗口内）。推理吃预算**确实存在**，但它表现为
+> `empty_completion`（`output == reasoning == 上限`、`stopReason=length`），是**另一条**原因。
+> 两者不可混为一谈：前者改预算无用，后者改预算有效。
+
+#### 组合根接线（T-105 / T-107 接进 `atlas.compose`，`223da32`）
+
+| 项 | 值 |
+|---|---|
+| 新节点 | `classify`（T-105）、`evidence`（T-107），**声明顺序**排在 `normalize` 之后、`classify` 在 `evidence` 之前 |
+| 依赖 | `classify` 声明 `depends_on=(normalize,)`（§4.5 的 `T-104→T-105`）。`evidence` **只**声明 `(normalize,)` |
+| **`T-105→T-107` 是数据边，不是节点依赖** | 离线入口（`collect_evidence_input()`）没有 `classify` 的执行记录，把边声明成节点依赖就只能伪造上游产物。真正保证"新 claim 必被校验"的是**把 claims 投影进 `evidence` 的输入快照**（`_evidence_claims`），并由**同层声明顺序**保证 `classify` 先跑 |
+| **模型调用默认关闭** | `run` 需要 `--classify` 或 `ATLAS_COGNITION=1`；关闭时 `classify` 节点照常出现在 DAG 与报告里、`observed` 明确记账 `enabled=false`，且**端口一次都不构造** |
+| 离线一条命令 | `python -m atlas.compose classify --store-root <root> [--raw-id …]`（不采集、不打网络，**但会调用模型**——这是该命令的全部内容） |
+| 标签空间 | 组合根读注册表 → `LabelSpace.of(labels, config_version=…)` → 写进节点输入快照；**空标签空间响亮失败且一行不写**（§2.5 闭环） |
+| 成本 | 全量语料 ≈ 334 次调用 ≈ 64 min（§2.17 的批次策略）；`--raw-id` 用于收窄 |
+
+> 🔴 **一条必须记住的实测缺陷：不要把 T-104 嗅探出的 `Content-Type` 喂进 T-105 的分流**
+>
+> 实测（真实 `data/store` 的 75 条 raw）：
+>
+> | 分流用的 content_type | 结果 |
+> |---|---|
+> | **字节（`""`，生产口径）** | 8 feed / **830 条目** + 65 文章 + 2 跳过 = **895 单元** |
+> | T-104 的 `normalize().content_type` | 6 feed + 67 文章 = **877 单元** ⇒ **静默丢掉 18 个单元** |
+>
+> 根因：`normalize()` 的兜底嗅探 `looks_like_html()` **只看前 4096 字符**，两份**良构 RSS**
+> （`syncedreview` / `marktechpost`，字节以 `<?xml version="1.0"?><rss version="2.0"` 开头）
+> 因正文里含 `<p>` 被判成 `text/html`；而 T-130 的 `_reject_non_xml` 对 `text/html` **一律拒绝**
+> 条目化 ⇒ **整份 feed 被当成 1 篇文章**（10 个条目塌成 1 条）。
+>
+> 处理：生产路径按**字节**分流（`DISPATCH_CONTENT_TYPE = ""`，与 `test_classify_realdata` /
+> `tools/t105_real_evidence.py` 的实测口径一致），并把不一致作为
+> `observed.content_type_conflicts` **显式打印**（有回归测试）。**未改** T-104 / T-130。
+>
+> ⚠️ **推论（写给下一个人）**：T-104 的 `content_type` 是**嗅探**值，不是声明的 HTTP 类型
+> （`RawRecord` **根本没有** content_type 字段）。**不要**把它当成真值再喂回去——
+> 那会让**同一个 raw 在不同代码路径下产出不同的单元集合**，而 `unit_id` 参与 `plan_digest`，
+> 于是同一个 raw 的两套单元会被当成"都没跑过"而**双份调用、双份写行**。
+
 ---
 
 ## 3. 任务规范（引擎可替换的前提）
@@ -1054,7 +1095,7 @@ unit_char_start <= anchor.char_start < anchor.char_end <= unit_char_end
 | T-109 | 打标前端 | **L** | T-106, T-108（T-107 为增强） | feed 浏览 + 一条一次点击打标；**数据可流转优先于界面精美** |
 | T-110 | 最小任务运行器（DAG 种子） | M | T-002 | 声明式依赖 + 幂等执行 + 重试 + 日志；引擎无关 |
 | T-111 | 目录聚合与保鲜 | M | T-101 | 聚合现成清单（OPML/awesome 列表）→ 去死链 → 分类入库；**定期健康检查** |
-| **T-120** | **端到端集成与接线（组合根）** | **M** | T-102,103,104,106,108,110,101 | 把各包接成**一条可运行的流水线**，并用**真实数据**跑通一次：采集 → 归档 → 归一化 → feed → 打标 |
+| **T-120** | **端到端集成与接线（组合根）** | **M** | T-102,103,104,106,108,110,101,**105,107** | 把各包接成**一条可运行的流水线**，并用**真实数据**跑通一次：采集 → 归档 → 归一化 → feed → 打标 → **机器分类（T-105，默认关闭）** → **证据校验（T-107）**。⚠️ 依赖列在 T-105/T-107 接进组合根后（`223da32`）补齐：组合根现在真的 import `atlas.cognition` 与 `atlas.evidence` |
 | **T-130** | **条目化派生层（feed → 条目）** | **L** | T-103, T-104 | 把一份 feed 拆成**条目**（标题 / 链接 / 时间 / 正文区间）；**纯函数、可重建、带解析器版本**；条目 ID 是**派生**量，**永不作人工/证据锚点**，但必须暴露 §2.2 的真值形状 `(raw_id, raw_sha256, char_start, char_end)`（见 §6.3 裁决 B） |
 | **T-131** | **旧语料导入** | **M** | T-103 | 把旧系统 `data/raw/**/*.json` 按篇导入 `data/store/raw/`（当作新 Raw 写入并生成版本）；内容寻址自然收敛；**不得迁移任何人工标签**（§2.4）；见 §5 登记 #12 |
 | **T-207** | **最小调度器（按 `interval_seconds` 只采到期的渠道）** | **S** | T-101, T-103（状态源） | 纯函数判"这一轮到没到" + 组合根/CLI 接线 + 系统 cron。**不新建表、不建常驻进程**；状态取自 `raw_records.fetched_at` 的 `MAX`。闭合 §6.7 的第四个缺口 |

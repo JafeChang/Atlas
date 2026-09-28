@@ -77,7 +77,6 @@ __all__ = [
     "DISPATCH_CONTENT_TYPE",
     "MAP_SCHEMA",
     "ArchiveStage",
-    "ClaimVerificationRequest",
     "ClassifyStage",
     "ClassifyStageError",
     "CollectStage",

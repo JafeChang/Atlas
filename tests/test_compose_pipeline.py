@@ -30,6 +30,7 @@ import subprocess
 import threading
 import time
 from pathlib import Path
+from typing import List
 
 import pytest
 
@@ -967,3 +968,71 @@ def test_partial_run_surfaces_channel_failures_in_the_rendered_report(
     assert "collected=1" in rendered, rendered
     # 失败原因也要能看见（只报 channel_id 不足以定位）
     assert observed["failures"][0]["reason"] in rendered, rendered
+
+
+# ---------------------------------------------------------------------- #
+# `__all__` 不得写出幽灵名字（真实缺陷的回归测试）
+# ---------------------------------------------------------------------- #
+def test_compose_tasks_dunder_all_names_all_exist() -> None:
+    """`atlas.compose.tasks.__all__` 里的**每个**名字都必须真的存在。
+
+    实测缺陷（本轮发现）：`__all__` 里有 `ClaimVerificationRequest`，而模块里
+    **根本没有这个名字**。后果不是"少导出一点"，而是任何
+    `from atlas.compose.tasks import *` 都会**直接抛**
+    `AttributeError: module 'atlas.compose.tasks' has no attribute 'ClaimVerificationRequest'`
+    —— 一个纯粹的导出清单笔误变成 import 期崩溃。
+
+    `ruff` 未纳入门禁（SPEC §2.13），所以 F822 这类"未定义的名字出现在 `__all__`"
+    **没有**任何自动检查；pytest 是唯一的门禁。这条测试把该检查补进门禁里，
+    范围覆盖本仓所有带 `__all__` 的模块（实测 90 个模块里只有这 1 处）。
+
+    为什么用 AST 静态解析而不是 `import` 全部模块：静态解析**不执行**任何模块代码，
+    因此不会因为某个模块有副作用而误报或卡住；代价是只覆盖 `__all__` 字面量列表
+    （本项目全部如此书写）。
+    """
+    import ast
+
+    package_root = Path(__file__).resolve().parents[1] / "src" / "atlas"
+    problems: List[str] = []
+    checked = 0
+    for path in sorted(package_root.rglob("*.py")):
+        if "node_modules" in path.parts:
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        # 本模块里定义/导入的全部顶层名字
+        defined = set()
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                defined.add(node.name)
+            elif isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        defined.add(target.id)
+            elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+                defined.add(node.target.id)
+            elif isinstance(node, (ast.Import, ast.ImportFrom)):
+                for alias in node.names:
+                    defined.add(alias.asname or alias.name.split(".")[0])
+        exported = None
+        for node in tree.body:
+            if isinstance(node, ast.Assign) and any(
+                isinstance(t, ast.Name) and t.id == "__all__" for t in node.targets
+            ):
+                if isinstance(node.value, (ast.List, ast.Tuple)):
+                    exported = [
+                        elt.value
+                        for elt in node.value.elts
+                        if isinstance(elt, ast.Constant) and isinstance(elt.value, str)
+                    ]
+        if exported is None:
+            continue
+        checked += 1
+        for name in exported:
+            if name not in defined:
+                problems.append(f"{path.relative_to(package_root.parent.parent)}: {name}")
+
+    assert checked > 0, "没有扫到任何 __all__ —— 测试的定位逻辑失效了（活对照）"
+    assert problems == [], (
+        "`__all__` 里出现了模块中不存在的名字（`import *` 会抛 AttributeError）："
+        f"{problems}"
+    )
