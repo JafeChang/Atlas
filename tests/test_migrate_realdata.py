@@ -518,8 +518,15 @@ def test_real_no_extra_tables_or_triggers_were_created(real_run: RealRun) -> Non
     SPEC 建自己的表"表现为 T-131 的失败——那是**假失败**，会把运维注意力引到错的地方。
 
     真正要守的两条（本测试的核心）：
-    1. 每个触发器都必须属于某个**已登记的域**（T-101 配置 / T-103 raw / T-105 提议）；
+    1. 每个触发器都必须属于某个**已登记的域**（T-101 配置 / T-103 raw / T-105 提议 /
+       T-107 证据）；
     2. `raw_records` 的 append-only 触发器必须**还在**（导入不许把它弄丢）。
+
+    ⚠️ **2026-09-28 补 T-107**：`evidence_spans` 及其 2 个触发器在真实库里出现了
+    （T-107 把证据校验接进流水线时由 `atlas.evidence.store` 的 `CREATE TABLE IF NOT EXISTS`
+    建立，0 行）。这不是导入建的，也不是"归属不明"——§2.10 把 `evidence_spans` 登记给了
+    T-107。本测试的写法（逐项归类 + `actual <= allowed`）正是为了在这种情况下**只需补一行
+    域名**，而不是像原先写死集合那样把"后续任务按 SPEC 建自己的表"误报成 T-131 失败。
     """
     t101_t103_triggers = {
         "trg_config_versions_no_delete",
@@ -540,8 +547,13 @@ def test_real_no_extra_tables_or_triggers_were_created(real_run: RealRun) -> Non
         "trg_proposal_runs_no_delete",
         "trg_proposal_runs_no_update",
     }
+    # T-107 的成员（SPEC §2.10 表归属：evidence_spans 归 T-107，只增不改）
+    t107_triggers = {
+        "trg_evidence_spans_no_delete",
+        "trg_evidence_spans_no_update",
+    }
     actual = set(real_run.trigger_names)
-    allowed = t101_t103_triggers | t105_triggers
+    allowed = t101_t103_triggers | t105_triggers | t107_triggers
     assert actual <= allowed, f"出现了归属不明的触发器：{sorted(actual - allowed)}"
     assert t101_t103_triggers <= actual, (
         f"T-101/T-103 的触发器丢了：{sorted(t101_t103_triggers - actual)}"
@@ -550,7 +562,8 @@ def test_real_no_extra_tables_or_triggers_were_created(real_run: RealRun) -> Non
     assert "raw_records" in real_run.table_names and "raw_store_meta" in real_run.table_names
     print(
         f"[T-131 真实] 触发器 {len(actual)} 个 = T-101/T-103 {len(actual & t101_t103_triggers)}"
-        f" + T-105 {len(actual & t105_triggers)}（全部有登记归属）"
+        f" + T-105 {len(actual & t105_triggers)} + T-107 {len(actual & t107_triggers)}"
+        "（全部有登记归属）"
     )
 
 

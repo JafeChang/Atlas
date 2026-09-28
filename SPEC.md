@@ -324,7 +324,7 @@ C8 的配置来自前端 / API，不依赖手工编辑文件。
 | `proposal_runs` | T-105 | **"这个单元在本配置下跑过没有"**——降级单元**没有 claim 但跑过了**，没有这张表就无法区分，会导致降级单元每次重跑都被重复调用模型。`UNIQUE(unit_id, plan_digest)`，append-only 双触发器。契约值见 §2.17 |
 | `cognition_store_meta` | T-105 | 认知域的元数据（照 T-103 `raw_store_meta` 先例），`key`/`value` 两列，记 `schema_version` |
 | `confirmed_labels` | T-108 | 人工标签（**Confirmed，只增不改**） |
-| `evidence_spans` | T-107 | 证据锚点索引（如需；真值仍在 `raw` 偏移上）。⚠️ **截至本轮仍未创建**（T-107 未落地），因此它是一个**已登记但尚不存在**的表名 |
+| `evidence_spans` | T-107 | 证据锚点索引（真值仍在 `raw` 偏移上）。`(claim_id, claim_version)` 唯一；**只增不改**双触发器。✅ **代码与 DAG 节点已落地**（`c9f004f`）；真实库里的表在**第一次真正跑证据节点时**才创建（`CREATE TABLE IF NOT EXISTS`），截至本轮**仍未创建**——因为还没有对真实 store 跑过该节点 |
 | `search_meta` / `search_documents` / `search_documents_fts`（+ FTS5 影子表 `search_documents_fts_{data,idx,content,docsize,config}`） | T-205 | 检索索引（**派生物**：可整体 `drop` 后由 raw 全量重建；**刻意不加 append-only 触发器**——加触发器与"可删除重建"自相矛盾） |
 
 **命名要求**：跨域共用 DB 的表名必须带领域前缀（如 `registry_`），避免语义误导与后续静默冲突。
@@ -743,12 +743,57 @@ T-105 做批量分类时必须先量这个数字再决定是否关推理 / 换�
 | 重试批次规则 | 第 `retry_count` 轮（0 = 首次）：`min(max_units_per_call, retry_max_units_per_call)`，`retry_shrink` 时再 `// 2**(retry_count-1)`，**下界 1** |
 | `ProposalPolicy.fingerprint()` | `sha256("max_units|max_chars|kind|include_link|max_retries|retry_max_units|retry_shrink")[:32]`（**进配置指纹**：批次策略改变模型看到的输入） |
 
-> **为什么是 4 / 6000（实测标定，不是拍的）**：边车**每次调用**的启动开销约 4.5 s（drvfs）且与单元数无关
-> ⇒ 固定成本按**调用次数**计，塞得越多越省；但 `deepseek-flash` 是推理型，实测单次 reasoning token
-> 常达 1000–2000，而单次输出预算是**配置值**（`CognitionConfig.max_output_tokens` 默认 **2048**，
-> 实测经 `max_completion_tokens` 真正生效），一批 5–10 个长单元时 `empty_completion` 明显增多。
+> **为什么是 4 / 6000（实测标定，不是拍的）**：边车**每次调用**的启动开销约 4.2–8.2 s（drvfs）
+> 且与单元数无关 ⇒ 固定成本按**调用次数**计，塞得越多越省；但 `deepseek-flash` 是推理型，
+> 实测 **reasoning 占 `output` 的 87–92%**（早期估的"1000–2000"偏低），而单次输出预算是**配置值**
+> （`CognitionConfig.max_output_tokens`，实测经 `max_completion_tokens` 真正生效）。
 > 两条合起来 ⇒ **中等批量 + 有界重试**，而不是"越大越好"。
-> 改这两个数字**必须重跑** `tools/t105_real_evidence.py`。
+>
+> **输出预算已由实测重标定为 4096（2026-09-28）**，判据是「**在生产标签空间下不再出现截断的最小上限**」：
+>
+> | 上限 | 单元产出率（25 单元确定性样本） | 顶到上限的调用 | `empty_completion` |
+> |---|---|---|---|
+> | 2048（旧值） | 10/25 = **40.0%** | **10/62** | 4 |
+> | **4096（现值）** | 14/25 = **56.0%**（独立复现 14/25） | **0/50** | **0** |
+> | 8192 | 15/25 = 60.0% | 0/25 | 0 |
+>
+> 2048 下被截断的调用特征是 `output_tokens == reasoning_tokens == 上限` 且 `stopReason=length`
+> ⇒ 内容为 0 ⇒ `empty_completion`。**推理把预算吃光**，所以上限本身就是产出率的直接杠杆。
+> **不选 8192**：14 vs 15（分母 25）在单次运行噪声内，成本无可测差异 —— 数据不支持就不声称差异。
+> 残留风险已记录：4096 下 3 次调用落在上限的 97–100%，但失败模式 `empty_completion` **可重试**，
+> 且各次尝试相互独立。复现用 `tools/t105_yield_probe.py`（**只写临时库**，无 `--write-store` 开关）。
+>
+> ⚠️ **一处必须知道的机制（否则会误判"改了没用"）**：`max_output_tokens` **不在** `plan_digest` 里
+> —— `config_version` 是**静态常量** `CONFIG_VERSION="cognition-config/1"`（不是 `public_digest()`）。
+> 因此**改预算不会让已经跑过的单元重跑**（`propose.py` 的 `attempt > policy.max_retries` 会跳过它们）。
+> 实测：真实库里 13 行 `timeout` 的 `retry_count` 已是 2（= 默认 `max_retries`），改预算救不回它们。
+>
+> ⚠️ 改这两个数字**应当重跑** `tools/t105_real_evidence.py`；但注意**它只报告、不断言预算** ——
+> 真正的门禁是 `tools/t105_yield_probe.py`。
+
+#### 产出率的真实构成（2026-09-28 实测，**推翻了原先的单一归因**）
+
+原先把 24 行里 20 行未分类笼统归因为"输出预算"。分离实验（`tools/t105_yield_probe.py`，
+25 单元确定性样本 = 全部 20 个真实失败 unit_id + 5 个按长度分层抽的从未跑过的 unit，**每臂独立临时库**）
+把它拆成三条**互不相同**的原因：
+
+| 原因 | 实测 | 归属 |
+|---|---|---|
+| **输出预算截断** | 2048 下 10/62 次调用顶上限；4096 下 0/50 | ✅ **T-105 的配置**，已修（上限 4096） |
+| **瞬时传输失败**（那 13 行 `timeout`） | `input_tokens=0`、`output_tokens=0`、`elapsed_ms` 11367–11551（**散布 <200 ms**）、全部写在同一个连续 **2.5 分钟**窗口内；新一轮 108 次调用里 **0 次**复现 | ❌ **不是模型/预算问题**，是传输层故障 |
+| **标签空间覆盖不足** | `no_claim_extracted` = 11/25（44%），这些调用只用 30–800 output token（**离上限很远**）。4 标签 → 9/20；**8 标签 → 20/20** | ❌ **不是 T-105 的缺陷**，是**注册表配置** |
+
+⇒ **剔除那 13 行传输失败后，真实库"确实到过模型"的产出率是 4/11 ≈ 36%**，与 2048 下实测的 40% 同量级。
+也就是说：**原先那个 17% 主要是"传输故障 + 运行账跳过"造成的，不是分类器不行。**
+
+> **最重要的单条发现**：真正的**主导**原因是**标签空间太窄**，而且它是**唯一能真正解开那 20 行卡住单元的改变**
+> —— 因为 `label_space_version` **在** `plan_digest` 里，而 `max_output_tokens` 不在。
+> 诊断臂给那 20 个失败单元加上 4 个标签（`data-science` / `software-engineering` /
+> `business-and-markets` / `other`）后，**20/20 全部分类成功**，且用的是语义上确实成立的标签
+> —— **`other` 一次都没被用过**。这说明模型没有硬塞，是那 4 个 arXiv 分类标签**没有地方放**
+> kdnuggets / MCP / app-builder 这类内容。
+> ⇒ **这是"目录会腐烂"（§2.8）在标签空间上的同一形态**：标签空间必须随语料生长，而不是钉死在种子分类上。
+> 该改动**属于注册表配置**（生产数据），且会让**每个单元重新规划**，因此不在 T-105 范围内，需显式决策。
 
 #### 幂等键与摘要（公式是契约的一部分）
 
