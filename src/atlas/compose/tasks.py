@@ -7,6 +7,7 @@
 | `normalize` | `atlas.normalize.normalize` | 归一化文本 + 偏移映射 + 派生块（可重建缓存） |
 | `feed` | `atlas.feed.ArchiveFeedSource` + `run_query` | 只读投影（**不产生事实**） |
 | `label` | `atlas.labels.LabelStore.add` + `ConfirmedLabel.human` | 人工 `ConfirmedLabel`（只增不改） |
+| `evidence` | `atlas.evidence.verify_claim` + `SqliteEvidenceStore.record`（→ T-105 的 `proposed_claims`） | 证据锚点 `evidence_spans`（只增不改） |
 
 三条实现纪律
 ------------
@@ -46,6 +47,7 @@ from atlas.contracts import (
     AtlasTask,
     ConfirmedLabel,
     ContractError,
+    ProposedClaim,
     RawRecord,
     Snapshot,
     TaskVersions,
@@ -53,6 +55,7 @@ from atlas.contracts import (
     build_anchor,
     content_sha256,
 )
+from atlas.evidence import SqliteEvidenceStore, verify_claim
 from atlas.feed import MAX_LIMIT, ArchiveFeedSource, FeedQuery, run_query
 from atlas.labels import LabelStore
 from atlas.normalize import NormalizedText, normalize
@@ -62,9 +65,12 @@ __all__ = [
     "COMPOSE_CODE_VERSION",
     "MAP_SCHEMA",
     "ArchiveStage",
+    "ClaimVerificationRequest",
     "CollectStage",
     "CollectionFailedError",
     "ComposeDependencies",
+    "EvidenceStage",
+    "EvidenceStageError",
     "FeedStage",
     "LabelStage",
     "NormalizeStage",
@@ -74,10 +80,13 @@ __all__ = [
     "StageLabelError",
     "atomic_write",
     "build_evidence_anchor",
+    "claim_verification_requests",
     "decode_content",
     "encode_content",
     "make_artifacts",
+    "parse_raw_ids",
     "parse_window",
+    "proposed_claim_from_snapshot",
     "recompute_normalized_text",
     "sha256_text",
     "upstream_identity",
@@ -129,6 +138,15 @@ class NormalizeStageError(PipelineError):
 
 class StageLabelError(PipelineError):
     """打标阶段的输入不合法（例如解析不出目标文档）。"""
+
+
+class EvidenceStageError(PipelineError):
+    """证据校验阶段的输入 / 不变量不成立。
+
+    用它而不是 `AssertionError` / 静默继续：锚点越出单元区间、claim 行版本号
+    小于 1、上游缺字段，这些**都必须响亮失败**，因为它们意味着"写进
+    `evidence_spans` 的坐标不是这条 claim 的证据"。
+    """
 
 
 # --------------------------------------------------------------------------- #
@@ -785,6 +803,300 @@ class LabelStage(AtlasTask):
             "labeled_at": _utcnow().isoformat(),
         }
         return make_artifacts(identity, observed)
+
+
+# --------------------------------------------------------------------------- #
+# 阶段 6：证据校验与落库（T-107）
+# --------------------------------------------------------------------------- #
+
+
+def parse_raw_ids(values: Optional[Sequence[str]]) -> tuple[str, ...]:
+    """把 `--raw-id` 的取值整理成**去重且有序**的元组（空值响亮失败）。
+
+    这份列表会（经组合根）进入 `evidence` 节点的输入快照 ⇒ 进入幂等键。
+    因此它必须确定性：顺序由命令行给出者决定会被原样保留，重复项去掉。
+    """
+    seen: Dict[str, None] = {}
+    for raw in values or ():
+        text = raw.strip()
+        if not text:
+            raise EvidenceStageError("--raw-id 不得为空字符串")
+        seen.setdefault(text, None)
+    return tuple(seen)
+
+
+def claim_verification_requests(payload: Any) -> List[Dict[str, Any]]:
+    """校验并规范化 `evidence` 节点输入快照里的 `claims` 列表。
+
+    组合根负责把 `proposed_claims` 里的 `classified` 行**投影**成这份列表。
+    这里做的是**形状校验**：缺字段 / 类型不对都属于接线错误，响亮失败，
+    绝不用 `.get(...) or 0` 之类的方式把它蒙混成一条"看起来能校验"的 claim。
+    """
+    if payload is None:
+        return []
+    if not isinstance(payload, list):
+        raise EvidenceStageError(
+            f"evidence 节点的输入快照里 claims 必须是列表，收到 {type(payload).__name__}"
+        )
+    requests: List[Dict[str, Any]] = []
+    for index, item in enumerate(payload):
+        if not isinstance(item, Mapping):
+            raise EvidenceStageError(f"claims[{index}] 必须是映射，收到 {type(item).__name__}")
+        missing = [
+            key
+            for key in (
+                "claim_id",
+                "claim_version",
+                "raw_id",
+                "quote",
+                "kind",
+                "value",
+                "confidence",
+                "unit_char_start",
+                "unit_char_end",
+                "code_version",
+                "config_version",
+                "model_version",
+            )
+            if item.get(key) is None
+        ]
+        if missing:
+            raise EvidenceStageError(f"claims[{index}] 缺少字段 {missing}：{dict(item)!r}")
+        version = item["claim_version"]
+        if not isinstance(version, int) or isinstance(version, bool) or version < 1:
+            raise EvidenceStageError(
+                f"claims[{index}]（claim_id={item['claim_id']!r}）的 claim_version={version!r}，"
+                "必须 ≥ 1：证据记录以 (claim_id, claim_version) 为幂等键，"
+                "版本号小于 1 意味着这条 claim 还没有入 store"
+            )
+        requests.append(dict(item))
+    return requests
+
+
+def proposed_claim_from_snapshot(item: Mapping[str, Any]) -> ProposedClaim:
+    """把组合根投影的**一行分类 claim** 还原成 T-002 的契约对象。
+
+    **为什么不直接调 `ProposedClaimRow.as_proposed_claim()`**：阶段里没有那一行
+    （`proposed_claims` 是 T-105 的表，本节点的快照里只有组合根投影出来的字段）。
+    为了不让"契约对象"出现两份实现，这里的映射**逐个字段对齐**
+    `ProposedClaimRow.as_proposed_claim()`，并有测试
+    （`test_evidence_stage_contract_claim_matches_t105_bridge`）拿真实 store 的行
+    做**逐字段比对**钉死两者一致。
+
+    **版本号不做任何兜底**：`claim_version < 1` 已经在
+    `claim_verification_requests()` 里响亮失败。刻意**不**照抄
+    `as_proposed_claim()` 的 `version=max(self.version, 1)` —— 那会在"行还没入 store"
+    时**编造**一个版本号，而 `(claim_id, claim_version)` 正是证据的幂等键。
+    """
+    return ProposedClaim(
+        claim_id=str(item["claim_id"]),
+        raw_id=str(item["raw_id"]),
+        kind=str(item["kind"]),
+        value=str(item["value"]),
+        quote=str(item["quote"]),
+        confidence=float(item["confidence"]),
+        version=int(item["claim_version"]),
+        versions=TaskVersions(
+            code_version=str(item["code_version"]),
+            config_version=str(item["config_version"]),
+            model_version=str(item["model_version"]),
+        ),
+    )
+
+
+class EvidenceStage(AtlasTask):
+    """把 T-105 的 `classified` 产出校验成**确定性锚点**并落进 `evidence_spans`（T-107）。
+
+    依赖与数据流（SPEC §4.5 的边 `T-104→T-107`、`T-105→T-107`）::
+
+        normalize ──▶ evidence ◀── proposed_claims（T-105 的行，由组合根注入快照）
+
+    三条纪律，逐条对应 SPEC §2.2 的冻结契约：
+
+    1. **坐标只能来自确定性匹配**：本阶段把 raw **字节**（从归档读回）与 claim 的
+       `quote` 交给 `atlas.evidence.verify_claim`。`ProposedClaim` 的 `extra="forbid"`
+       与本阶段都不接受任何来自模型 / 来自快照的坐标。
+    2. **失败 = `FAILED` + 不落库**：`SqliteEvidenceStore.record()` 对非 `VERIFIED`
+       的结果**一行都不写**（明确返回 `None`），本阶段把它计进 `verification_failed`
+       与 `failures`（**不吞**）。
+    3. **锚点必须落在 claim 记录的真值区间内**：`unit_char_start` / `unit_char_end`
+       是 T-105 的单元区间（来自 T-130 的条目 / 整篇），若确定性匹配算出的锚点
+       越出它，说明"这条 quote 的证据不在它自己的单元里" ⇒ **响亮失败**，
+       绝不把一条越界的坐标写进证据表。
+
+    **未分类行必须被显式跳过并计数**（`skipped_unclassified`）：它们没有 `quote`，
+    契约里也不存在"未分类的 claim"（`as_proposed_claim()` 对它们抛错）。
+    组合根因此**只投影分类行**，本阶段另外如实报出"跳过了多少行、为什么"。
+
+    幂等（SPEC §3）：输入快照 = 上游归一化产物 + 组合根注入的 claims 投影，
+    两者都是内容寻址的 ⇒ 同输入同配置 ⇒ 幂等跳过；有新 claim / 新版本 /
+    新归一化 ⇒ 幂等键变了 ⇒ 重跑。**这一点必须由组合根保证**（见
+    `Pipeline._evidence_claims`）：若 claims 投影不进快照，新 claim 永远等不到校验。
+    """
+
+    name = "evidence"
+
+    def __init__(
+        self,
+        versions: TaskVersions,
+        *,
+        archive: ArchiveStore,
+        evidence: SqliteEvidenceStore,
+        verify_only: bool = False,
+    ) -> None:
+        super().__init__(versions)
+        self._archive = archive
+        self._evidence = evidence
+        self.verify_only = verify_only
+
+    def run(self, inputs: Snapshot, config: Snapshot) -> Dict[str, Any]:
+        records = _upstream_records(inputs, "normalize", what="归一化记录")
+        requests = claim_verification_requests(inputs.payload.get("claims"))
+
+        claim_raw_ids: Dict[str, None] = {}
+        for item in requests:
+            claim_raw_ids.setdefault(str(item["raw_id"]), None)
+        scoped_raws = {str(item["raw_id"]) for item in records}
+        out_of_scope = sorted(set(claim_raw_ids) - scoped_raws)
+        if out_of_scope:
+            raise EvidenceStageError(
+                f"evidence 节点的输入里含本轮归一化产物之外的 raw_id：{out_of_scope}；"
+                "锚点必须锚在本次真的读过字节的原文上（接线错误，拒绝越界校验）"
+            )
+
+        verified: List[Dict[str, Any]] = []
+        failures: List[Dict[str, Any]] = []
+        spans_written = 0
+        spans_unchanged = 0
+        per_raw: Dict[str, Dict[str, int]] = {
+            str(item["raw_id"]): {
+                "classified_claims": 0,
+                "verified": 0,
+                "failed": 0,
+                "spans_written": 0,
+                "spans_unchanged": 0,
+            }
+            for item in records
+        }
+
+        for item in requests:
+            claim_id = str(item["claim_id"])
+            claim_version = int(item["claim_version"])
+            raw_id = str(item["raw_id"])
+            quote = str(item["quote"])
+            unit_start = int(item["unit_char_start"])
+            unit_end = int(item["unit_char_end"])
+
+            # 契约对象由快照字段**逐字段**还原（与 `as_proposed_claim()` 对齐，有测试钉死）。
+            # 防"版本号被静默编造"：`ProposedClaimRow.as_proposed_claim()` 会把
+            # `version=0` 抬成 1（`max(self.version, 1)`）；本路径拒绝为未入 store 的行
+            # 编造版本号（那会让 `(claim_id, claim_version)` 这个幂等键失真）。
+            claim = proposed_claim_from_snapshot(item)
+
+            content_type = self._content_type_for(records, raw_id)
+            raw_bytes = self._archive.get_content(raw_id)
+            record = self._archive.get(raw_id)
+            if record.content_sha256 != content_sha256(raw_bytes):
+                raise EvidenceStageError(
+                    f"raw_id={raw_id} 归档字节指纹与元数据不符："
+                    f"{content_sha256(raw_bytes)[:12]}… != {record.content_sha256[:12]}…"
+                )
+            # 顺序是**契约的一部分**：
+            # 1) 先做确定性校验（纯函数，不落任何东西）；
+            # 2) 再判锚点是否落在它自己的单元区间内 —— 越界就抛，**此时还没有写任何行**；
+            # 3) 最后才落库。
+            # 反过来写（先 `record()` 再判越界）会在库里留下一行越界坐标 ——
+            # `evidence_spans` 是 append-only，那一行**永远删不掉**。
+            outcome = verify_claim(claim, raw_bytes, content_type=content_type)
+            entry = {
+                "claim_id": claim_id,
+                "claim_version": claim_version,
+                "raw_id": raw_id,
+                "quote": quote,
+                "status": outcome.status.value,
+                "char_start": None,
+                "char_end": None,
+                "unit_char_start": unit_start,
+                "unit_char_end": unit_end,
+            }
+            if outcome.status is VerificationStatus.VERIFIED:
+                anchor = outcome.anchor
+                assert anchor is not None  # VERIFIED 的契约
+                if not (unit_start <= anchor.char_start < anchor.char_end <= unit_end):
+                    raise EvidenceStageError(
+                        f"claim {claim_id}@v{claim_version} 的确定性锚点 "
+                        f"[{anchor.char_start}, {anchor.char_end}) 越出它自己的单元区间 "
+                        f"[{unit_start}, {unit_end})：证据不在它的单元里，拒绝写进 evidence_spans"
+                    )
+                entry["char_start"] = anchor.char_start
+                entry["char_end"] = anchor.char_end
+                verified.append(entry)
+                per_raw[raw_id]["verified"] += 1
+                if self.verify_only:
+                    # 只校验不落库：一条都不写，也不谎称写过了。
+                    spans_unchanged += 1
+                    per_raw[raw_id]["spans_unchanged"] += 1
+                else:
+                    existed = self._evidence.span_for(claim_id, claim_version)
+                    if existed is None:
+                        spans_written += 1
+                        per_raw[raw_id]["spans_written"] += 1
+                    else:
+                        spans_unchanged += 1
+                        per_raw[raw_id]["spans_unchanged"] += 1
+                    self._evidence.record(outcome)
+            else:
+                failures.append(entry)
+                per_raw[raw_id]["failed"] += 1
+            per_raw[raw_id]["classified_claims"] += 1
+
+        verified.sort(key=lambda item: (item["raw_id"], item["claim_id"], item["claim_version"]))
+        failures.sort(key=lambda item: (item["raw_id"], item["claim_id"], item["claim_version"]))
+
+        unclassified_rows = int(inputs.payload.get("unclassified_rows") or 0)
+        if unclassified_rows < 0:
+            raise EvidenceStageError(
+                f"unclassified_rows 不得为负：{unclassified_rows}（组合根注入的计数）"
+            )
+
+        identity = {
+            "raws": sorted(scoped_raws),
+            "claims_in_scope": len(requests),
+            # 只含**内容寻址**字段：锚点是 quote + 原文的纯函数（SPEC §2.2），
+            # `verified_at` 这类时刻不进来（重跑时刻不同不代表证据不同）。
+            "verified": verified,
+        }
+        observed = {
+            "raws_in_scope": len(scoped_raws),
+            "claims_in_scope": len(requests),
+            "classified_claims": len(requests),
+            "verified": len(verified),
+            "verification_failed": len(failures),
+            "skipped_unclassified": unclassified_rows,
+            "raws_without_claims": sorted(
+                raw for raw, counts in per_raw.items() if counts["classified_claims"] == 0
+            ),
+            "spans_written": spans_written,
+            "spans_unchanged": spans_unchanged,
+            "spans_in_store": self._evidence.count(),
+            "wrote_to_store": not self.verify_only,
+            "per_raw": per_raw,
+            "failures": failures,
+            "verified_claims": verified,
+            "evidence_db": str(self._evidence.db_path),
+            "verified_at": _utcnow().isoformat(),
+        }
+        return make_artifacts(identity, observed)
+
+    @staticmethod
+    def _content_type_for(records: Sequence[Mapping[str, Any]], raw_id: str) -> str:
+        for item in records:
+            if str(item["raw_id"]) == raw_id:
+                return str(item.get("content_type") or "")
+        raise EvidenceStageError(
+            f"上游归一化产物里没有 raw_id={raw_id!r} 的 content_type："
+            "证据校验必须用与归一化同一份 Content-Type"
+        )
 
 
 # --------------------------------------------------------------------------- #

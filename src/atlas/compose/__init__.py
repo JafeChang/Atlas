@@ -5,9 +5,11 @@
 
 ```
 collect ──▶ archive ──▶ normalize ──┬──▶ feed
-（T-102）   （T-103）    （T-104）    └──▶ label（T-108，人工产物）
-                          │
-                          └── atlas.contracts 的三态类型在阶段之间传递
+（T-102）   （T-103）    （T-104）    ├──▶ label（T-108，人工产物）
+                          │         └──▶ evidence（T-107，证据锚点）
+                          │                      ▲
+                          └── atlas.contracts 的  │ proposed_claims（T-105 的分类行，
+                              三态类型在阶段之间传递 │ 由组合根投影进输入快照）
 ```
 
 接线方式
@@ -49,6 +51,7 @@ from .cli import main
 from .pipeline import (
     NODE_ARCHIVE,
     NODE_COLLECT,
+    NODE_EVIDENCE,
     NODE_FEED,
     NODE_LABEL,
     NODE_NORMALIZE,
@@ -66,6 +69,8 @@ from .tasks import (
     ArchiveStage,
     CollectStage,
     CollectionFailedError,
+    EvidenceStage,
+    EvidenceStageError,
     FeedStage,
     LabelStage,
     NormalizeStage,
@@ -73,7 +78,10 @@ from .tasks import (
     PipelineError,
     StageInputError,
     StageLabelError,
+    claim_verification_requests,
+    parse_raw_ids,
     parse_window,
+    proposed_claim_from_snapshot,
     utc_hour_window,
 )
 
@@ -81,6 +89,7 @@ __all__ = [
     "COMPOSE_CODE_VERSION",
     "NODE_ARCHIVE",
     "NODE_COLLECT",
+    "NODE_EVIDENCE",
     "NODE_FEED",
     "NODE_LABEL",
     "NODE_NORMALIZE",
@@ -97,6 +106,8 @@ __all__ = [
     "ArchiveStage",
     "CollectStage",
     "CollectionFailedError",
+    "EvidenceStage",
+    "EvidenceStageError",
     "FeedStage",
     "LabelStage",
     "NormalizeStage",
@@ -104,7 +115,10 @@ __all__ = [
     "PipelineError",
     "StageInputError",
     "StageLabelError",
+    "claim_verification_requests",
+    "parse_raw_ids",
     "parse_window",
+    "proposed_claim_from_snapshot",
     "utc_hour_window",
     # cli
     "main",

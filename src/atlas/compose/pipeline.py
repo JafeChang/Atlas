@@ -3,7 +3,20 @@
 DAG（边方向：`A depends_on=[B]` ⇒ B → A）::
 
     collect ──▶ archive ──▶ normalize ──┬──▶ feed
-                                        └──▶ label
+                                        ├──▶ label
+                                        └──▶ evidence ◀── proposed_claims（T-105 的行）
+
+**`evidence` 节点的接线（T-107）**
+
+`evidence` 声明依赖 `normalize`（SPEC §4.5 的边 `T-104→T-107`）：它要用**归档字节**
+（经 T-104 归一化所依据的同一份 `Content-Type`）把 T-105 的 `classified` 行校验成锚点。
+另一条边 `T-105→T-107` 的数据（`proposed_claims` 的行）由**组合根**注入输入快照
+（`Pipeline._evidence_claims`），与 `label` 节点注入人工判断是同一种做法。
+
+> ⚠️ **为什么 claims 必须进快照，而不是让阶段自己去查库**：幂等键 = 输入快照 + 配置快照
+> 的摘要（`AtlasTask.idempotency_key`）。若快照里不含 claims 投影，T-105 之后再跑出
+> 新 claim 时幂等键**不变** ⇒ 节点被幂等跳过 ⇒ 新 claim 永远等不到校验。
+> 把投影放进快照，"有新 claim / 新版本 / 新归一化 ⇒ 重跑"就是结构性成立的。
 
 **T-207 的接线位置（调度器决定"采哪些渠道"）**
 
@@ -65,8 +78,11 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from atlas.archive import ArchiveStore, open_archive
-from atlas.contracts import ContractError, Snapshot, TaskVersions
+from atlas.cognition.store import CLAIM_STATUS_CLASSIFIED, open_proposed_store
+from atlas.contracts import ContractError, Snapshot, TaskVersions, content_sha256
+from atlas.evidence import open_evidence_store
 from atlas.labels import LabelStore, open_store as open_label_store
+from atlas.normalize import normalize
 from atlas.registry import RegistryService, open_store as open_registry
 from atlas.runner import (
     ExecutionRecord,
@@ -87,17 +103,20 @@ from .tasks import (
     ArchiveStage,
     CollectStage,
     ComposeDependencies,
+    EvidenceStage,
     FeedStage,
     LabelStage,
     NormalizeStage,
     PipelineError,
     StageInputError,
+    parse_raw_ids,
     parse_window,
 )
 
 __all__ = [
     "NODE_ARCHIVE",
     "NODE_COLLECT",
+    "NODE_EVIDENCE",
     "NODE_FEED",
     "NODE_LABEL",
     "NODE_NORMALIZE",
@@ -116,6 +135,7 @@ NODE_ARCHIVE = "archive"
 NODE_NORMALIZE = "normalize"
 NODE_FEED = "feed"
 NODE_LABEL = "label"
+NODE_EVIDENCE = "evidence"
 
 
 class NothingDueError(PipelineError):
@@ -147,6 +167,7 @@ DEFAULT_NODES: Tuple[str, ...] = (
     NODE_NORMALIZE,
     NODE_FEED,
     NODE_LABEL,
+    NODE_EVIDENCE,
 )
 
 
@@ -241,12 +262,14 @@ class NodeInputs(MappingABC):
         *,
         roots: Optional[Mapping[str, Mapping[str, Any]]] = None,
         extra: Optional[Callable[[str, "NodeInputs"], Mapping[str, Any]]] = None,
+        extras: Optional[Mapping[str, Mapping[str, Any]]] = None,
     ) -> None:
         self._graph = graph
         self._store = store
         self._config = config
         self._roots = dict(roots or {})
         self._extra = extra
+        self._extras = {name: dict(payload) for name, payload in (extras or {}).items()}
         self._snapshots: Dict[str, Snapshot] = {}
         self._artifacts: Dict[str, Dict[str, Any]] = {}
 
@@ -281,6 +304,10 @@ class NodeInputs(MappingABC):
         return artifacts
 
     def identity_of(self, node: str) -> Dict[str, Any]:
+        # 组合根显式提供的节点（离线复核路径）：直接给出，**不去查执行记录** ——
+        # 那条路径上根本没有上游的执行记录，而"造一条"等于伪造上游产物。
+        if node in self._extras:
+            return dict(self._extras[node].get("identity") or {})
         artifacts = self.artifacts_of(node)
         identity = artifacts.get("identity")
         if not isinstance(identity, Mapping):
@@ -295,7 +322,13 @@ class NodeInputs(MappingABC):
 
         dependencies = self._graph.dependencies(node)
         payload: Dict[str, Any] = {"node": node, "task": self._graph.task(node).name}
-        if dependencies:
+        if node in self._extras:
+            # 组合根显式提供的整块快照（T-107 的离线复核路径：证据节点不重跑上游，
+            # 输入直接来自存储里的既有事实）。**不是** root（它有依赖边），
+            # 因此这条分支必须显式写明 —— 没有它就只能靠"造一条上游执行记录"来绕过，
+            # 那等于伪造上游产物。
+            payload.update(self._extras[node])
+        elif dependencies:
             payload["upstream"] = {
                 dep: {"identity": self.identity_of(dep)} for dep in dependencies
             }
@@ -371,6 +404,8 @@ class PipelineConfig:
     on_channel_failure: str = "fail"
     max_retries: int = 1
     require_nonempty_text: bool = True
+    evidence_read_only: bool = False
+    raw_ids: Tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not str(self.store_root).strip():
@@ -383,6 +418,7 @@ class PipelineConfig:
             )
         if self.max_retries < 0:
             raise PipelineError(f"max_retries 必须 >= 0，收到 {self.max_retries}")
+        object.__setattr__(self, "raw_ids", parse_raw_ids(self.raw_ids))
 
     @property
     def root(self) -> Path:
@@ -391,6 +427,16 @@ class PipelineConfig:
     @property
     def db_path(self) -> Path:
         """注册表与人工标签共用的库文件（SPEC §2.10：同一份 atlas.db）。"""
+        return self.root / "atlas.db"
+
+    @property
+    def proposed_path(self) -> Path:
+        """T-105 的 `proposed_claims` 库文件（同一份共享 `atlas.db`，只读打开）。"""
+        return self.root / "atlas.db"
+
+    @property
+    def evidence_path(self) -> Path:
+        """T-107 的 `evidence_spans` 库文件（同一份共享 `atlas.db`）。"""
         return self.root / "atlas.db"
 
     @property
@@ -428,6 +474,8 @@ class Pipeline:
         archive: Optional[ArchiveStore] = None,
         labels: Optional[LabelStore] = None,
         registry: Optional[RegistryService] = None,
+        evidence: Optional[Any] = None,
+        proposed: Optional[Any] = None,
     ) -> None:
         self.config = config
         self.dependencies = dependencies or ComposeDependencies.real()
@@ -457,6 +505,16 @@ class Pipeline:
             )
             self._owned.append(registry.store)
         self.registry = registry
+
+        if evidence is None:
+            evidence = open_evidence_store(config.evidence_path)
+            self._owned.append(evidence)
+        self.evidence = evidence
+
+        if proposed is None:
+            proposed = open_proposed_store(config.proposed_path)
+            self._owned.append(proposed)
+        self.proposed = proposed
 
         self._last_inputs: Optional[NodeInputs] = None
 
@@ -531,6 +589,15 @@ class Pipeline:
                 ),
                 NODE_LABEL: (
                     LabelStage(versions, archive=self.archive, labels=self.labels),
+                    (NODE_NORMALIZE,),
+                ),
+                NODE_EVIDENCE: (
+                    EvidenceStage(
+                        versions,
+                        archive=self.archive,
+                        evidence=self.evidence,
+                        verify_only=self.config.evidence_read_only,
+                    ),
                     (NODE_NORMALIZE,),
                 ),
             }
@@ -687,15 +754,7 @@ class Pipeline:
         industry_of = {channel.id: channel.industry_id for channel in channels}
         graph = self.build_graph(versions=versions, industry_of=industry_of)
 
-        config_snapshot = Snapshot(
-            payload={
-                "actor": self.config.actor,
-                "on_channel_failure": self.config.on_channel_failure,
-                "require_nonempty_text": self.config.require_nonempty_text,
-                "code_version": COMPOSE_CODE_VERSION,
-                "config_version": versions.config_version,
-            }
-        )
+        config_snapshot = self._config_snapshot()
         roots: Dict[str, Mapping[str, Any]] = {
             NODE_COLLECT: {
                 "channels": [channel.payload() for channel in channels],
@@ -718,16 +777,187 @@ class Pipeline:
             config=config_snapshot,
             max_retries=self.config.max_retries,
         )
+        if targets is None and self.config.raw_ids:
+            # `raw_ids` 是**证据校验的收窄输入**（T-107 的取证 / 复核路径）：此时只跑
+            # 归一化及其上游 + evidence，不跑与本轮取证无关的 feed / label。
+            # 无 `raw_ids` 时 targets 保持原样（默认整图 = T-120 的行为）。
+            targets = (NODE_NORMALIZE, NODE_EVIDENCE)
         return runner.run(inputs, targets=targets)
 
     # ------------------------------------------------------------------
     # 内部
     # ------------------------------------------------------------------
+    def _config_snapshot(self) -> Snapshot:
+        """进入每个任务幂等键的配置快照（`run()` 与离线复核路径共用同一份）。"""
+        versions = self.versions()
+        return Snapshot(
+            payload={
+                "actor": self.config.actor,
+                "on_channel_failure": self.config.on_channel_failure,
+                "require_nonempty_text": self.config.require_nonempty_text,
+                "code_version": COMPOSE_CODE_VERSION,
+                "config_version": versions.config_version,
+            }
+        )
+
+    def collect_evidence_input(self) -> Tuple[Any, Snapshot, Snapshot]:
+        """装配 T-107 的**离线复核**输入：`(阶段, 输入快照, 配置快照)`。
+
+        **不采集、不重跑上游**：输入快照的 `records` 直接由归档当前内容构造
+        （内容寻址：同一份字节 → 同一 `content_sha256`，可重建），`claims` 仍由
+        `_evidence_claims()` 从 `proposed_claims` 投影 —— 与流水线内运行**同一份实现**，
+        因此两条入口看到的 claim 集合不会漂移。
+
+        为什么需要它：`evidence` 在 DAG 里依赖 `normalize`，而 `normalize` 依赖
+        `archive`、`archive` 依赖 `collect` —— 若"跑一次证据校验"必须重跑采集，
+        那么这个能力就**必须联网**才能用一次。而校验本身是纯离线的确定性匹配
+        （SPEC §2.2）：字节已经在归档里、claim 已经在库里。离线入口因此是刻意的。
+
+        Raises:
+            PipelineError: 归档里没有任何 raw 可校验（"没有输入"不伪装成"校验通过"）。
+        """
+        versions = self.versions()
+        graph = self.build_graph(versions=versions)
+        raw_ids = self.archive.all_raw_ids()
+        if not raw_ids:
+            raise PipelineError(
+                f"归档（{self.archive.raw_dir}）里没有任何 raw，证据校验没有输入；"
+                "先跑一次采集（ATLAS_LIVE=1 python -m atlas.compose run）"
+            )
+        scoped = self._scope_raw_ids(raw_ids, covered="归档")
+        records = [self._evidence_record(raw_id) for raw_id in scoped]
+        config_snapshot = self._config_snapshot()
+        inputs = NodeInputs(
+            graph,
+            self._store,
+            config_snapshot,
+            extra=self._extra_payload,
+            extras={
+                # 归一化这一步的快照直接由归档现状构造（**不重跑上游**）：
+                # `_evidence_claims()` 经 `identity_of(NODE_NORMALIZE)` 读它，
+                # 因此这条 extras 必须挂在 normalize 上，而不只是塞进 evidence 的 payload。
+                NODE_NORMALIZE: {"identity": {"records": records}},
+            },
+        )
+        return graph.task(NODE_EVIDENCE), inputs[NODE_EVIDENCE], config_snapshot
+
+    def _evidence_record(self, raw_id: str) -> Dict[str, Any]:
+        """归档记录 → 证据校验需要的那几个字段（归一化**元数据**，不含文本）。
+
+        `content_type` 由**真的跑一遍 `atlas.normalize.normalize`** 得到，而不是从
+        缓存文件里读：T-104 的归一化路径取决于 Content-Type（HTML / 纯文本），
+        而证据锚点的坐标是**归一化区间 → 原文区间**的映射结果。若离线复核用了
+        与流水线不同的 Content-Type，同一句 quote 可能落在不同的坐标上 ——
+        那就成了"两条入口给出两个答案"。这里的算法与 `NormalizeStage` 完全相同
+        （同一份字节、同一个函数），因此**不可能漂移**。
+        """
+        content = self.archive.get_content(raw_id)
+        record = self.archive.get(raw_id)
+        digest = content_sha256(content)
+        if digest != record.content_sha256:
+            raise StageInputError(
+                f"raw_id={raw_id} 盘上字节指纹 {digest[:12]}… 与归档元数据 "
+                f"{record.content_sha256[:12]}… 不符（归档被改动）"
+            )
+        normalized = normalize(content)
+        return {
+            "raw_id": raw_id,
+            "channel_id": record.channel_id,
+            "endpoint": record.endpoint,
+            "content_sha256": record.content_sha256,
+            # 与 `NormalizeStage` 同源：没有声明 Content-Type 时用归一化自己推断的那个
+            # （`text/plain` / `text/html`），因此校验走的是同一条解码路径。
+            "content_type": normalized.content_type,
+        }
+
     def _extra_payload(self, node: str, inputs: NodeInputs) -> Mapping[str, Any]:
-        """按节点补充输入快照里"组合根才知道"的部分（当前只有人工打标）。"""
-        if node != NODE_LABEL:
-            return {}
-        return {"assignments": self._resolve_assignments(inputs)}
+        """按节点补充输入快照里"组合根才知道"的部分（人工打标 / T-105 的 claims）。"""
+        if node == NODE_LABEL:
+            return {"assignments": self._resolve_assignments(inputs)}
+        if node == NODE_EVIDENCE:
+            return self._evidence_claims(inputs)
+        return {}
+
+    def _scope_raw_ids(self, raw_ids: Iterable[str], *, covered: str) -> List[str]:
+        """把 `raw_ids` 配置套用到本轮 raws 上（被配置漏掉的 raws 响亮失败）。
+
+        **刻意不用静默取交集**：`--raw-id` 打错一个字就会被解释成"没有这条"，
+        于是节点带着 0 条 claim "成功"结束 —— 那正是"看起来成功、实际什么都没做"。
+        `covered` 描述"可用范围"是什么（流水线内是"本轮归一化产物"，离线复核是"归档"），
+        因为同一条纪律在两条入口上的可用集合不同。
+        """
+        available = sorted(set(raw_ids))
+        if not self.config.raw_ids:
+            return available
+        missing = sorted(set(self.config.raw_ids) - set(available))
+        if missing:
+            raise PipelineError(
+                f"--raw-id 指定的 raw_id 不在{covered}里：{missing}；"
+                f"可用的有 {available}。拒绝静默取交集（那会让'校验过了'变成假象）"
+            )
+        return sorted(self.config.raw_ids)
+
+    def _evidence_claims(self, inputs: NodeInputs) -> Mapping[str, Any]:
+        """把 T-105 `proposed_claims` 的**分类行**投影成 `evidence` 节点的输入。
+
+        SPEC §4.5 的边 `T-105→T-107` 是一条**数据边**：T-105 的行不是本图里某个节点的
+        产物（`propose` 由 `python -m atlas.cognition` 按需调用模型产出），因此这条边
+        由组合根注入快照补齐，而不是声明一条指向不存在节点的依赖。
+
+        **投影里刻意不含**时刻与调用账（`created_at` / `batch_id` / token / `elapsed_ms`）
+        —— 它们变化不代表证据该重算；但 `quote` / `value` / `claim_version` /
+        `confidence` / 单元区间**必须**进投影，因为它们**决定锚点**。
+
+        `unclassified_rows` 单独计数并进入快照：未分类行没有 `quote`，
+        契约里也不存在"未分类的 claim"，它们**必须被显式跳过并可见**，不能被静默丢掉。
+
+        归一化产物里**没有**任何 claim 的 raw 不报错：那是真实状态（这个 raw 还没被
+        分类过）。但一旦库里有分类行而投影漏了它，幂等键就会失真，所以两者都在
+        `observed` 里如实呈现（`raws_without_claims`）。
+        """
+        records = inputs.identity_of(NODE_NORMALIZE).get("records", [])
+        if not isinstance(records, list):
+            raise PipelineError(
+                f"normalize 节点的 identity.records 必须是列表，收到 {type(records).__name__}"
+            )
+        scoped = self._scope_raw_ids(
+            (str(item["raw_id"]) for item in records), covered="本轮归一化产物"
+        )
+
+        claims: List[Dict[str, Any]] = []
+        unclassified = 0
+        for raw_id in scoped:
+            for row in self.proposed.current_for_raw(raw_id):
+                if row.status != CLAIM_STATUS_CLASSIFIED:
+                    # 审计行（unattributed / out_of_space）与降级行都**不是**证据：
+                    # 它们的 quote 必须为空（SPEC §2.17 的 CHECK 强制），因此不可能有锚点。
+                    unclassified += 1
+                    continue
+                claims.append(
+                    {
+                        "claim_id": row.claim_key,
+                        "claim_version": row.version,
+                        "raw_id": row.raw_id,
+                        "unit_id": row.unit_id,
+                        "unit_kind": row.unit_kind,
+                        "unit_char_start": row.unit_char_start,
+                        "unit_char_end": row.unit_char_end,
+                        "kind": row.kind,
+                        "value": row.value,
+                        "quote": row.quote,
+                        "confidence": row.confidence,
+                        "code_version": row.code_version,
+                        "config_version": row.config_version,
+                        "model_version": row.model_version,
+                        "label_space_version": row.label_space_version,
+                    }
+                )
+        claims.sort(key=lambda item: (item["raw_id"], item["claim_id"], item["claim_version"]))
+        return {
+            "raw_ids": scoped,
+            "claims": claims,
+            "unclassified_rows": unclassified,
+        }
 
     def _resolve_assignments(self, inputs: NodeInputs) -> List[Dict[str, Any]]:
         """把人工判断解析成具体 `raw_id`（解析不出即**响亮失败**，不静默跳过）。
@@ -782,11 +1012,15 @@ def build_pipeline(
     label_assignments: Sequence[LabelAssignment] = (),
     on_channel_failure: str = "fail",
     max_retries: int = 1,
+    evidence_read_only: bool = False,
+    raw_ids: Sequence[str] = (),
     dependencies: Optional[ComposeDependencies] = None,
     execution_store: Optional[ExecutionRecordStore] = None,
     archive: Optional[ArchiveStore] = None,
     labels: Optional[LabelStore] = None,
     registry: Optional[RegistryService] = None,
+    evidence: Optional[Any] = None,
+    proposed: Optional[Any] = None,
 ) -> Pipeline:
     """便捷装配入口（组合根的唯一公开构造方式）。"""
     config = PipelineConfig(
@@ -796,6 +1030,8 @@ def build_pipeline(
         label_assignments=tuple(label_assignments),
         on_channel_failure=on_channel_failure,
         max_retries=max_retries,
+        evidence_read_only=evidence_read_only,
+        raw_ids=tuple(raw_ids),
     )
     return Pipeline(
         config,
@@ -804,4 +1040,6 @@ def build_pipeline(
         archive=archive,
         labels=labels,
         registry=registry,
+        evidence=evidence,
+        proposed=proposed,
     )

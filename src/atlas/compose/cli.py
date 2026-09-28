@@ -1,11 +1,12 @@
 """T-120 瘦命令行入口：`python -m atlas.compose ...`。
 
-三条子命令，全部只做"调用组合根"这一件事：
+四条子命令，全部只做"调用组合根"这一件事：
 
 | 命令 | 作用 | 需要联网？ |
 |---|---|---|
 | `plan` | 打印将要执行的 DAG 与本轮渠道（**干跑**），每个渠道附 `due` / `last_collected_at` | 否 |
-| `run` | 真实跑一次流水线（采集 → 归档 → 归一化 → feed → 打标） | 是（且需 `ATLAS_LIVE=1`） |
+| `run` | 真实跑一次流水线（采集 → 归档 → 归一化 → feed → 打标 → 证据校验） | 是（且需 `ATLAS_LIVE=1`） |
+| `evidence` | **只做证据校验**（T-107）：不采集，把 `proposed_claims` 的分类行校验成锚点 | 否 |
 | `register` | 往注册表里配一个行业 + 渠道 | 否 |
 
 **真实抓取默认关闭**：`run` 要求环境变量 `ATLAS_LIVE=1`，否则以退出码 2 明确拒绝
@@ -31,6 +32,17 @@
 失败语义：节点失败时 `TaskFailedError` 向上传播到本层，本层把它与
 `partial_report`（失败节点 + 被阻塞的下游）打印到 stderr 并返回**非零退出码**；
 本层没有任何"部分成功即 success"的路径。
+
+**T-107 的证据校验（`evidence` 子命令）**
+
+`evidence` 是**离线**的（不采集）：它按 `--raw-id` 收窄到指定原文，
+把 T-105 的 `classified` 行按 quote 做确定性匹配并落进 `evidence_spans`。
+三条边界：
+
+1. **坐标只来自确定性匹配**，本层不接收任何坐标参数；
+2. **校验失败的行不落库**，但**必须在报告里可见**（`render_evidence` / `render_evidence_report`
+   会逐条打印），绝不"报成功然后把未验证的证据藏起来"；
+3. `--read-only` 只校验不落库（`wrote_to_store=false`），用于复核既有结论。
 """
 
 from __future__ import annotations
@@ -48,10 +60,18 @@ from atlas.runner import RunReport, TaskFailedError
 from atlas.runner.runner import STATUS_FAILED, STATUS_SKIPPED
 from atlas.schedule import ScheduleError
 
-from .pipeline import LabelAssignment, NothingDueError, build_pipeline
-from .tasks import PipelineError
+from .pipeline import NODE_EVIDENCE, LabelAssignment, NothingDueError, build_pipeline
+from .tasks import PipelineError, parse_raw_ids
 
-__all__ = ["build_parser", "main", "render_failure", "render_report", "render_schedule"]
+__all__ = [
+    "build_parser",
+    "main",
+    "render_evidence",
+    "render_evidence_report",
+    "render_failure",
+    "render_report",
+    "render_schedule",
+]
 
 LIVE_ENV_VAR = "ATLAS_LIVE"
 
@@ -164,6 +184,30 @@ def build_parser() -> argparse.ArgumentParser:
     register.add_argument("--rate-limit-seconds", type=int, default=None)
     register.add_argument("--tag", action="append", default=[])
 
+    evidence = sub.add_parser(
+        "evidence",
+        help=(
+            "T-107：把 proposed_claims 的分类行校验成确定性锚点并落进 evidence_spans"
+            "（离线：不采集、不打网络）"
+        ),
+    )
+    add_common(evidence)
+    evidence.add_argument(
+        "--raw-id",
+        action="append",
+        default=[],
+        metavar="RAW_ID",
+        help=(
+            "只校验这些原文（可重复）；缺省 = 归档里的全部原文。"
+            "指定的 raw_id 不在归档里会**响亮失败**（不静默取交集）"
+        ),
+    )
+    evidence.add_argument(
+        "--read-only",
+        action="store_true",
+        help="只校验不落库（报告里 wrote_to_store=false）；缺省 = 真的写 evidence_spans",
+    )
+
     return parser
 
 
@@ -209,6 +253,66 @@ def render_observed(name: str, observed: Any) -> List[str]:
     return lines
 
 
+def render_evidence(observed: Any) -> List[str]:
+    """把 T-107 证据校验的关键计数与**失败逐条**打出来。
+
+    为什么必须单独渲染（这是本项目踩过的真实缺陷形态）：`identity` 里只有
+    "哪些 claim 取得了锚点"，**不含**校验失败的行。若只打印 identity，
+    "3 条 quote 在原文里找不到"会显示成"一切正常" —— 与 SPEC §7.3 失败模式 3
+    （静默失效）完全同形。因此这里显式打印：
+
+    - 计数：范围内的 raw / 分类行 / 已验证 / 校验失败 / **跳过的未分类行** /
+      本轮新写入的 span / 已在库中的 span / 库中总行数；
+    - 每一条**校验失败**（claim + raw + quote）；
+    - `raws_without_claims`（归一化过但库里没有分类行的 raw）—— 它们不是错误，
+      但"校验了 0 条"必须能一眼看出原因。
+    """
+    if not isinstance(observed, Mapping):
+        return []
+    if "claims_in_scope" not in observed and "verified" not in observed:
+        return []
+
+    lines: List[str] = [
+        "  观察 evidence："
+        f"raws_in_scope={observed.get('raws_in_scope')}"
+        f" classified_claims={observed.get('classified_claims')}"
+        f" verified={observed.get('verified')}"
+        f" verification_failed={observed.get('verification_failed')}"
+        f" skipped_unclassified={observed.get('skipped_unclassified')}"
+        f" spans_written={observed.get('spans_written')}"
+        f" spans_unchanged={observed.get('spans_unchanged')}"
+        f" spans_in_store={observed.get('spans_in_store')}"
+        f" wrote_to_store={observed.get('wrote_to_store')}"
+    ]
+    if str(observed.get("evidence_db")):
+        lines.append(f"    证据库：{observed.get('evidence_db')}")
+
+    failures = list(observed.get("failures") or [])
+    if failures:
+        lines.append(
+            f"    ⚠️ {len(failures)} 条 claim 的 quote 在原文里**匹配不到**"
+            "（状态 failed、**未落库**）："
+        )
+        for item in failures:
+            lines.append(
+                f"      [未验证] {item.get('claim_id')}@v{item.get('claim_version')} "
+                f"raw={item.get('raw_id')} quote={item.get('quote')!r}"
+            )
+
+    without = list(observed.get("raws_without_claims") or [])
+    if without:
+        lines.append(
+            f"    [无 claim] 本轮归一化过但 proposed_claims 里没有分类行的 raw（{len(without)}）："
+            f"{without}"
+        )
+    if observed.get("classified_claims") == 0:
+        lines.append(
+            "    ⚠️ 本轮范围里没有任何 classified 行："
+            "校验了 0 条，**没有**产生证据（这不是'全部通过'）"
+        )
+    return lines
+
+
 def render_report(report: RunReport) -> str:
     lines: List[str] = ["执行汇总（拓扑序）："]
     for name in report.order:
@@ -232,7 +336,11 @@ def render_report(report: RunReport) -> str:
             continue
         identity = result.output.artifacts.get("identity", {})
         lines.append(f"产物 {name}：{json.dumps(identity, ensure_ascii=False, sort_keys=True)}")
-        lines.extend(render_observed(name, result.output.artifacts.get("observed")))
+        observed = result.output.artifacts.get("observed")
+        lines.extend(render_observed(name, observed))
+        if name == NODE_EVIDENCE:
+            # T-107 的失败与跳过**不在** identity 里，必须单独渲染（见 render_evidence）。
+            lines.extend(render_evidence(observed))
     return "\n".join(lines)
 
 
@@ -410,10 +518,54 @@ def _cmd_run(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_evidence(args: argparse.Namespace) -> int:
+    """T-107：把 `proposed_claims` 的分类行校验成锚点（**离线**，不采集、不打网络）。
+
+    走的不是 `TaskRunner`，而是组合根给出的**同一份**输入快照 + 同一个阶段实例：
+    证据校验的输入是"归档里已有的字节 + 库里已有的 claim"，重跑采集既不必要、
+    也会让这条命令变成"必须有网才能用一次"。代价是失去执行器的重试与执行记录，
+    因此这里显式打印阶段自己算出的幂等键（见下），让"同输入同输出"仍然可核对。
+
+    本命令**不要求** `ATLAS_LIVE=1`：它一个网络请求都不发。
+    """
+    pipeline = build_pipeline(
+        store_root=args.store_root,
+        actor=args.actor or args.author,
+        raw_ids=parse_raw_ids(args.raw_id),
+        evidence_read_only=args.read_only,
+    )
+    with pipeline:
+        stage, inputs, config = pipeline.collect_evidence_input()
+        output = stage.execute(inputs, config)
+        print(render_evidence_report(output))
+        if not output.artifacts["observed"]["wrote_to_store"] and not args.read_only:
+            # 不可能状态：只有 --read-only 才允许不落库。
+            print("证据未落库但未指定 --read-only：这是接线错误", file=sys.stderr)
+            return 1
+    return 0
+
+
+def render_evidence_report(output: Any) -> str:
+    """渲染一次离线证据校验的产物（计数 + 失败逐条 + 幂等键）。"""
+    lines: List[str] = [
+        f"证据校验（T-107，离线）：任务 {output.task_name}",
+        f"  幂等键：{output.idempotency_key}",
+        "产物 identity："
+        + json.dumps(output.artifacts.get("identity", {}), ensure_ascii=False, sort_keys=True),
+    ]
+    lines.extend(render_evidence(output.artifacts.get("observed")))
+    return "\n".join(lines)
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(list(argv) if argv is not None else None)
-    handlers = {"plan": _cmd_plan, "run": _cmd_run, "register": _cmd_register}
+    handlers = {
+        "plan": _cmd_plan,
+        "run": _cmd_run,
+        "register": _cmd_register,
+        "evidence": _cmd_evidence,
+    }
     handler = handlers[args.command]
     try:
         return handler(args)

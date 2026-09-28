@@ -100,7 +100,7 @@ HTML_BODY = (
     "</body></html>"
 ).encode("utf-8")
 
-EXPECTED_NODES = ("collect", "archive", "normalize", "feed", "label")
+EXPECTED_NODES = ("collect", "archive", "normalize", "feed", "label", "evidence")
 
 
 # --------------------------------------------------------------------------- #
@@ -249,6 +249,8 @@ def test_end_to_end_dataflow_produces_verifiable_artifacts(store_root: Path) -> 
     assert report.order.index("archive") < report.order.index("normalize")
     assert report.order.index("normalize") < report.order.index("feed")
     assert report.order.index("normalize") < report.order.index("label")
+    # T-107：证据校验是图里的一个节点，依赖归一化（SPEC §4.5 的 T-104→T-107）
+    assert report.order.index("normalize") < report.order.index("evidence")
     # 假 fetcher 一共只被打到两次（每个渠道一次），没有重试、更没有真实网络
     assert sorted(fetcher.calls) == sorted([PLAIN_ENDPOINT, HTML_ENDPOINT])
 
@@ -353,6 +355,14 @@ def test_end_to_end_dataflow_produces_verifiable_artifacts(store_root: Path) -> 
         assert labels.latest_value(expected_raw_id, "industry") == "ai"
         assert labels.count() == 1
         assert len(labels.all_for(expected_raw_id)) == 1
+
+    # ---- 阶段 6：证据校验（T-107；本用例没有分类 claim，因此如实是"0 条"）----
+    evidence = report.result("evidence").output.artifacts["observed"]
+    assert evidence["raws_in_scope"] == 2
+    assert evidence["classified_claims"] == 0
+    assert evidence["spans_written"] == 0
+    assert evidence["verification_failed"] == 0
+    assert sorted(evidence["raws_without_claims"]) == sorted([expected_raw_id, html_raw_id])
 
 
 # --------------------------------------------------------------------------- #
@@ -574,6 +584,7 @@ def test_channel_failure_fails_the_whole_run_and_names_the_failing_node(
         "normalize",
         "feed",
         "label",
+        "evidence",
     }
     for item in partial.blocked:
         assert item.status == STATUS_BLOCKED
@@ -838,6 +849,7 @@ def test_cli_plan_prints_dag_offline(tmp_path: Path) -> None:
     assert dependencies["normalize"] == ["archive"]
     assert dependencies["feed"] == ["normalize"]
     assert dependencies["label"] == ["normalize"]
+    assert dependencies["evidence"] == ["normalize"]
     assert plan["channels"] == []
 
 
