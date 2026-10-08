@@ -947,38 +947,61 @@ unit_char_start <= anchor.char_start < anchor.char_end <= unit_char_end
 > ⇒ 本节的表述取代 §2.10 那一句：**`proposed_claims` 与 `proposal_runs` 都是 append-only**，
 > "可覆写"由新增版本行实现。这与 §2.13"存储层可严于契约，单向"同一先例。
 
-#### T-105 在真实 store 上的实测产出（2026-09-26，主代理独立复核）
+#### T-105 在真实 store 上的实测产出
+
+**(a) 早期小样本（2026-09-26，24 行）**
 
 | 项 | 实测值 |
 |---|---|
 | `proposed_claims` | **24 行**，`status` 分布 `unclassified=20` / `classified=4` |
-| `proposed_claims` 行身份 | **24 行 / 24 个不同 `claim_key`，全部 `version=1`、`supersedes=0`** ⇒ **尚无版本链分叉**（版本链机制存在但未被行使） |
+| `proposed_claims` 行身份 | **24 行 / 24 个不同 `claim_key`，全部 `version=1`、`supersedes=0`** ⇒ 尚无版本链分叉 |
 | `proposal_runs` | **23 行**，`unclassified=20` / `classified=3` |
 | 未分类原因分布 | `timeout` = **13**、`no_claim_extracted` = **7** |
-| 版本三元组（实际写入值） | `code_version=cognition-extract-prompt/1`、`config_version=cognition-config/1`、`model_version=deepseek-flash` |
+| 版本三元组 | `code_version=cognition-extract-prompt/1`、`config_version=cognition-config/1`、`model_version=deepseek-flash` |
 | 标签空间版本 | `cfg-v0007-39f0540a983e#2303895ae70154a921ccf07122d2405e`（§2.5 闭环：来自配置） |
 | provider / model / 凭据路由 | `deepseek` / `deepseek-flash` / `deepseek@api.deepseek.com#b8faa230739d2fa8`（**记录路由，不记录密钥**） |
-| token / 调用 | runs 合计 **input 2004 / output 3886 / reasoning 3471**；`calls=23`、`batches=22`、`Σ elapsed_ms=181042`、**`max_batch_size=2`** |
 
-**两条必须记住的实测事实**
+> 这个 24 行的小样本曾经给出"产出率 17%"的印象。**全量跑完后那个数字是错的**（见下），
+> 它主要是"传输故障 + 运行账跳过 + 小样本偏差"三件事的合成，不是分类器的能力。
 
-1. **`timeout` 的 13 行是真实失败残留，不是污染，也不可删除**。
-   它们落在 **13 个互不相同的单元**上（10 个 `ent_*` 条目 + 3 个 `art_*` 文章），
-   **不是**同一个单元被重复写入 ⇒ 这 13 行正是 `retry_exhausted` 的实物凭证
-   （`retry_count=2` = `max_retries=2` 已被用尽）。
-   单次 `elapsed_ms ≈ 11.4–11.6 s`，而 `DEFAULT_TIMEOUT_SECONDS = 60.0` ⇒ **耗时本身远小于超时阈值**；
-   成因指向**推理 token 吃掉输出预算**（§2.14 决策三已量到 output 被推理放大 5–25 倍），
-   而不是网络慢。**这表明当前配置下分类器的产出率很低**，是下一阶段要先量的数字。
-   Confirmed 与 Proposed 都是 append-only ⇒ 这些行**按设计删不掉**，只能作为审计事实留在库里。
-2. **批量实际退化到了 1–2**（`max_batch_size=2`、22 个 batch 多为 `batch_size=1`），
-   远低于 `BATCH_MAX_UNITS=4` 的配置。这既解释了调用次数偏高，
-   也说明"上限是 4"与"实际能用 4"是两件事——**上限是配置，退化是观测**。
+**(b) 全量 895 个单元（2026-10-08 实际执行完毕，`CLASSIFY_EXIT=0`）**
 
-> ⚠️ **上面第 1 条当时的归因已被 2026-09-28 的分离实验修正**（见本节"产出率的真实构成"）：
-> 那 13 行 `timeout` **不是**推理吃预算，而是 `input_tokens=0` / `output_tokens=0` 的**传输层故障**
-> （散布 <200 ms、集中在 2.5 分钟窗口内）。推理吃预算**确实存在**，但它表现为
-> `empty_completion`（`output == reasoning == 上限`、`stopReason=length`），是**另一条**原因。
-> 两者不可混为一谈：前者改预算无用，后者改预算有效。
+| 项 | 实测值 |
+|---|---|
+| 跑过的**不同单元** | **895 / 895**（`proposal_runs` = 895 行） |
+| 覆盖的 raw | **73**（895 个单元来自 8 份 feed 的 830 条目 + 65 篇文章；另 2 条 raw 无内容） |
+| **单元级产出率** | **845 / 895 = 94.4%** `classified` |
+| 未分类 | **50 / 895 = 5.6%**，其中 `no_claim_extracted` = 37、`timeout` = 13 |
+| `proposed_claims` 行数 | **1379**（`classified` 1322 / `unclassified` 50 / `unattributed` 7） |
+| 每条 raw 的单元数分布 | 331 / 199 / 191 / 54 / 25 / 10 / 10 / 10（长尾：54 条 raw 各只有 1 个单元） |
+| 成本（`proposal_runs` 合计） | **calls=895**、input **859,046**、output **1,213,145**、**reasoning 1,007,828**、模型侧合计 **6,491,144 ms ≈ 108.2 min** |
+| 标签实际用量 | `machine-learning` 573 / `natural-language` 344 / `computer-vision` 263 / `statistical-learning` 142（**四个标签都在用**，没有闲置标签） |
+
+> **`reasoning` 占 `output` 的 83%**（1,007,828 / 1,213,145）—— 与分离实验量到的 87–92% 同量级，
+> 再次印证"推理把输出预算吃光"是这个模型的结构性特征，也是 `max_output_tokens=4096` 的依据。
+
+**⚠️ 那个 94.4% 必须按渠道拆开看，否则会得出错误结论**
+
+| 渠道 | 单元产出率 |
+|---|---|
+| `arxiv-computer-vision` / `arxiv-natural-language` / `arxiv-machine-learning` / `arxiv-statistical-learning` | **98.5% / 97.4% / 96.7% / 96.3%** |
+| `google-ai-blog` / `marktechpost` | 96.0% / 95.2% |
+| `ai-techpark` | 70.0% |
+| **`synced-review`** | **50.0%**（10/20） |
+| **`kdnuggets`** | **31.6%**（6/19） |
+
+**94.4% 是被 arXiv 拉高的**（830 / 895 = **93% 的单元来自 4 个 arXiv feed**，它们天然贴合那 4 个
+arXiv 分类标签）。**在非 arXiv 内容上产出率断崖式下跌**：`kdnuggets` 只有 31.6%、
+`synced-review` 50% —— 16 个 `no_claim_extracted` 集中在 `kdnuggets` 的 raw 上。
+
+⇒ **这正面印证了分离实验的结论，而不是推翻它**：标签空间是按 arXiv 分类
+（`cs.LG`/`cs.CV`/`cs.CL`/`stat.ML`）播种的，遇到"用 Python 自动化重复劳动""MCP 集成"这类
+工程/商业内容时**没有地方可放**。诊断臂实测：同样那批失败单元，4 标签 → 9/20，**8 标签 → 20/20**。
+**所以整体 94.4% 这个数字本身是"语料以 arXiv 为主"的产物，不是"分类器已经很准"的证据。**
+
+> **结论**：全量跑完**没有**改变"标签空间需要生长"这个判断，反而把它的**代价量化**了：
+> 在非 arXiv 渠道上，当前标签空间会丢掉 **约一半到七成** 的内容。
+> 这与 §2.8"目录会腐烂"同源：**标签空间必须随语料生长**。
 
 #### 组合根接线（T-105 / T-107 接进 `atlas.compose`，`223da32`）
 
