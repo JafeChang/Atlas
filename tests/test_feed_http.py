@@ -15,6 +15,7 @@ from __future__ import annotations
 import ast
 import concurrent.futures
 import hashlib
+import http.client
 import json
 import threading
 import time
@@ -351,11 +352,53 @@ def test_server_is_threading_and_does_not_serialize_requests() -> None:
 
 
 def test_server_close_releases_port() -> None:
+    """`close()` 必须真的释放端口。
+
+    判据在 T-208 修正过：原来这里是 `pytest.raises(urllib.error.URLError)`，
+    它建立在两个不成立的前提上，两条都有实测。
+
+    **前提一："关掉之后就连不上了"。** 内核允许刚 `close()` 的端口被新的监听者
+    **立刻接管**：本服务关掉后端口上留着 TIME_WAIT 连接套接字（实测：不带
+    `SO_REUSEADDR` 的 `bind` 一律 `EADDRINUSE`，**400/400**），而带 `SO_REUSEADDR`
+    的 `bind` + `listen` 可以盖着它成功（实测 **400/400**）。而本仓库每一台
+    `FeedHTTPServer` 都设了 `allow_reuse_address = True` —— 同一网络命名空间里
+    并发的绑定者随时可能拿到这个刚释放的端口并开始应答。
+    （实测：同一进程内紧接着起的下一台 `FeedServer` 在 300 次里都没拿到该端口，
+    0/300 —— 所以这个竞态需要**并发**的绑定者，不是顺序执行就能撞上。）
+
+    **前提二："失败就一定抛 `URLError`"。** `urllib` 只把 **connect/send 阶段**的
+    `OSError` 包成 `URLError`（`AbstractHTTPHandler.do_open` 里 `h.getresponse()`
+    在 `try` 之外），所以端口被接管之后的形态会以**裸异常**逃出来：实测接管者
+    以 RST 收尾 → `ConnectionResetError [Errno 104]`（30/30）；静默收尾 →
+    `RemoteDisconnected`（30/30）。这两种都被原判据判红，但它们恰恰证明
+    **本服务**已经不再服务这个端口了。
+
+    （顺带排除 self-connect：`urllib` 的客户端套接字不带 `SO_REUSEADDR`，在
+    本服务留下的 TIME_WAIT 上绑不出同号源端口；自然 autobind 连过来是
+    `ECONNREFUSED` 40/40。）
+
+    现在的判据分两层，都不再依赖"异常类型必须恰好是 `URLError`"：
+
+    1. **实例级、确定性**：本服务的监听套接字必须已被 `server_close()` 关闭
+       （`fileno() == -1`）。这一层不碰端口号，任何接管都影响不到它。
+    2. **端到端**：同一路径不得再收到响应 —— 连接层失败（连不上 / 被接管 /
+       被 RST）都算通过；**只要收到一个 HTTP 响应就判红**。
+    """
     with running_server(demo_source()) as server:
         base_url = server.base_url
-        assert get(server, "/health")[0] == 200
-    with pytest.raises(urllib.error.URLError):
-        urllib.request.urlopen(base_url + "/health", timeout=2)
+        httpd = server.server
+        assert httpd.socket.fileno() != -1, "运行中的服务应当持有打开的监听套接字"
+        assert get(server, "/health")[0] == 200  # 活对照：同一路径关之前确实成功
+
+    assert httpd.socket.fileno() == -1, "close() 之后监听套接字仍然打开（端口没释放）"
+    try:
+        with urllib.request.urlopen(base_url + "/health", timeout=2) as response:
+            served: Any = (response.status, response.read())
+    except urllib.error.HTTPError as exc:  # 收到状态码 ⇒ 端口上确实还有服务在答
+        served = (exc.code, exc.read())
+    except (OSError, http.client.HTTPException):
+        served = None  # 连不上 / 被接管 / 被 RST：本服务已不再服务该端口
+    assert served is None, f"close() 之后仍然收到 HTTP 响应：{served!r}"
 
 
 def test_source_factory_is_resolved_per_request() -> None:
