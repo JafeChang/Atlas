@@ -19,6 +19,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
+import atlas.evidence.verify as evidence_verify
 from atlas.contracts import (
     AnchorError,
     ConfirmedLabel,
@@ -521,3 +522,99 @@ def test_highlight_context_is_clamped_to_raw_bounds():
     assert payload.context_char_start == 0
     assert payload.context_char_end == len(RAW_TEXT)
     assert payload.context_text == RAW_TEXT
+
+
+# --------------------------------------------------------------------------- #
+# 判据 7：同一份原文只归一化一次（2026-10-25 性能修正）——"缓存"不得改变语义
+# --------------------------------------------------------------------------- #
+def _clear_normalization_cache() -> None:
+    evidence_verify._normalized_for.cache_clear()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_normalization_cache():
+    """缓存是进程级的：每个测试前后都清空，避免测试之间互相"供热"。"""
+    _clear_normalization_cache()
+    yield
+    _clear_normalization_cache()
+
+
+def _counting_normalize(monkeypatch):
+    """把 `verify` 模块里的 `normalize` 换成计数包装（仍调用真实实现）。"""
+    calls = {"n": 0}
+    real_normalize = evidence_verify.normalize
+
+    def counting(payload, content_type=""):
+        calls["n"] += 1
+        return real_normalize(payload, content_type)
+
+    monkeypatch.setattr(evidence_verify, "normalize", counting)
+    return calls
+
+
+def test_normalization_is_reused_for_the_same_raw(monkeypatch):
+    """同一 `(bytes, content_type)` 上校验两条 quote ⇒ 只归一化一次。
+
+    活对照：换一份字节后计数**必须**增加——证明断言的不是"这个计数器永远不动"。
+    """
+    calls = _counting_normalize(monkeypatch)
+
+    first = verify_quote(
+        raw_id=RAW_ID, raw_bytes=RAW_BYTES, quote=QUOTE, content_type="text/plain"
+    )
+    second = verify_quote(
+        raw_id=RAW_ID,
+        raw_bytes=RAW_BYTES,
+        quote="坐标由确定性匹配算出",
+        content_type="text/plain",
+    )
+    assert first.status is VerificationStatus.VERIFIED
+    assert second.status is VerificationStatus.VERIFIED
+    assert calls["n"] == 1, f"同一份原文竟然归一化了 {calls['n']} 次"
+
+    verify_quote(
+        raw_id=RAW_ID,
+        raw_bytes=(RAW_TEXT + "另一份原文").encode("utf-8"),
+        quote=QUOTE,
+        content_type="text/plain",
+    )
+    assert calls["n"] == 2, "换了字节却复用了旧缓存：键没有把字节算进去"
+
+
+def test_normalization_cache_key_includes_content_type(monkeypatch):
+    """同一份字节、不同 `content_type` ⇒ 必须分别归一化（HTML 与纯文本不是同一个函数）。"""
+    calls = _counting_normalize(monkeypatch)
+
+    plain = verify_quote(
+        raw_id=RAW_ID, raw_bytes=RAW_BYTES, quote=QUOTE, content_type="text/plain"
+    )
+    as_html = verify_quote(
+        raw_id=RAW_ID, raw_bytes=RAW_BYTES, quote=QUOTE, content_type="text/html"
+    )
+    assert calls["n"] == 2, "content_type 不在缓存键里：两种解析器共用了结果"
+    # 两种口径的结果都必须是 VERIFIED（这段文字本身不含标记，两种解析器都能找到它）
+    assert plain.status is VerificationStatus.VERIFIED
+    assert as_html.status is VerificationStatus.VERIFIED
+
+
+def test_cached_verification_is_byte_for_byte_equal_to_fresh_verification():
+    """缓存命中与"清空后重算"必须给出**完全相同**的契约对象（不是"看起来差不多"）。"""
+    fresh = verify_quote(
+        raw_id=RAW_ID, raw_bytes=RAW_BYTES, quote=QUOTE, content_type="text/plain"
+    )
+    cached = verify_quote(
+        raw_id=RAW_ID, raw_bytes=RAW_BYTES, quote=QUOTE, content_type="text/plain"
+    )
+    assert cached == fresh
+
+    other_quote = "原文上"
+    cached_other = verify_quote(
+        raw_id=RAW_ID, raw_bytes=RAW_BYTES, quote=other_quote, content_type="text/plain"
+    )
+    _clear_normalization_cache()
+    fresh_other = verify_quote(
+        raw_id=RAW_ID, raw_bytes=RAW_BYTES, quote=other_quote, content_type="text/plain"
+    )
+    assert cached_other == fresh_other
+    assert cached_other.anchor is not None
+

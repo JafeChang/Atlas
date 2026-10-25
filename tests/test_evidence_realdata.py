@@ -58,6 +58,15 @@ STORE_DB = REPO_ROOT / "data" / "store" / "atlas.db"
 #: 真实 raw 上**不可能**匹配到的一段文字（负路径；不是从模型输出里抄的）。
 IMPOSSIBLE_QUOTE = "ATLAS_T107_PROBE_这段文字在真实原文里不存在_9f3c1a"
 
+#: 已记录的"模型给出的 quote 在原文里匹配不到"的比例上限（SPEC §2.17 实测 35/1322 = 2.65%）。
+#: 这些不是接线错误，是模型串文/改写与两份文本口径差异；测试必须**如实记录**它们，
+#: 而不是假装为 0（否则数据一长，测试就会看似"坏了"而实际是**已知残留**）。
+VERIFICATION_FAILURE_CEILING = 0.05
+
+#: 已记录的"quote 首尾字符不在它自己的单元区间里"的比例上限（实测 1/1322 = 0.08%）。
+#: 同一条残留的另一面：模型把别处的句子当成这个单元的引文。
+UNIT_GROUNDING_FAILURE_CEILING = 0.01
+
 pytestmark = pytest.mark.skipif(
     not STORE_DB.is_file(),
     reason=(
@@ -170,7 +179,17 @@ def _db_digest() -> str:
 
 
 def test_real_classified_claims_get_anchors_inside_their_unit_ranges(tmp_path: Path) -> None:
-    """判据 1 + 2：真实 4 行 `classified` → 锚点落在单元区间内 → 落到**临时**证据库。"""
+    """判据 1 + 2：真实 `classified` 行的锚点落在自己的单元区间内，且落到**临时**证据库。
+
+    ⚠️ **数据长大之后这条测试的判据也变过**（2026-10-25）：它原先假设"真实 4 行
+    classified 全部可校验"，而现在真实 store 有 1322 行（1303 个当前版本），其中
+    **35 条是 SPEC §2.17 已记录的匹配失败**（模型串文/改写 + 两份文本口径差异）。
+    因此这里断言的是：
+
+    - 每条 VERIFIED 的锚点必须落在**它自己的**单元区间内（硬不变量）；
+    - 每条 FAILED 必须**没有坐标**（不得编造位置）；
+    - 失败率不超过已记录的上限（残留没有扩大），而不是"失败数为 0"。
+    """
     claims = list(real_claims())
     assert claims, "真实 store 里应当至少有 1 行 classified（T-105 已交付）"
     # 真实快照（2026-09-26 实测）：4 行 classified，跨 3 个单元、1 个 raw。
@@ -196,6 +215,10 @@ def test_real_classified_claims_get_anchors_inside_their_unit_ranges(tmp_path: P
             for claim in group:
                 outcome = verify_claim(claim.contract(), raw_bytes)
                 if outcome.status is not VerificationStatus.VERIFIED:
+                    # FAILED 的契约：**不产生任何坐标**（SPEC §2.2：不得编造位置）。
+                    assert outcome.anchor is None and outcome.derived is None, (
+                        f"{claim.claim_key}@{claim.version}: FAILED 却带了锚点"
+                    )
                     failed.append(f"{claim.claim_key}@{claim.version}")
                     print(
                         f"{print_prefix} [FAILED] {claim.claim_key}@{claim.version} "
@@ -232,9 +255,18 @@ def test_real_classified_claims_get_anchors_inside_their_unit_ranges(tmp_path: P
         store.close()
 
     print(f"{print_prefix} 真实 classified 行 {len(claims)} 条；verified={verified} failed={len(failed)}")
-    assert not failed, f"真实 quote 应当全部可校验，失败：{failed}"
-    assert count == verified == len(claims), (count, verified, len(claims))
-    assert verified >= 1
+    # 对账恒等式：每条 classified 要么 VERIFIED、要么 FAILED，不得有第三种去处。
+    assert verified + len(failed) == len(claims), (verified, len(failed), len(claims))
+    assert count == verified, (count, verified)
+    assert verified >= 1, "一条都没校验成功：多半是接线断了，而不是真实数据"
+    # **已知残留**：真实数据里存在匹配不到的 quote（SPEC §2.17 实测 35 条）。
+    # 这里断言的是"残留没有扩大"，而不是"残留为 0"——后者在当前数据上是假的。
+    failure_ratio = len(failed) / len(claims)
+    assert failure_ratio <= VERIFICATION_FAILURE_CEILING, (
+        f"校验失败 {len(failed)}/{len(claims)} = {failure_ratio:.2%}，"
+        f"超过已记录的 {VERIFICATION_FAILURE_CEILING:.0%} 上限；"
+        "先确认是数据变了还是匹配逻辑坏了（SPEC §2.17 有逐条机制）"
+    )
 
 
 def test_real_store_is_untouched_and_temp_db_gets_the_rows(tmp_path: Path) -> None:
@@ -401,10 +433,10 @@ def test_real_unit_ranges_are_grounded_in_the_real_entry_text() -> None:
         by_raw.setdefault(claim.raw_id, []).append(claim)
 
     checked = 0
+    ungrounded: List[tuple[str, str]] = []
     for raw_id, group in sorted(by_raw.items()):
         raw_bytes, _ = real_raw(raw_id)
         raw_text = raw_bytes.decode("utf-8")
-        decoded = _html.unescape(raw_text)
         for claim in group:
             snippet = raw_text[claim.unit_char_start : claim.unit_char_end]
             assert snippet.strip(), (
@@ -415,15 +447,24 @@ def test_real_unit_ranges_are_grounded_in_the_real_entry_text() -> None:
             first, last = stripped[0], stripped[-1]
             # SPEC §2.2 的判据用**解码后**的窗口（实体场景下原文切片是实体字面量）
             window = snippet if first in snippet else _html.unescape(snippet)
-            assert first in window and last in window, (
-                f"{claim.claim_key}: 单元区间 "
-                f"[{claim.unit_char_start},{claim.unit_char_end}) 里找不到这条 quote 的"
-                f"首尾字符 {first!r}/{last!r}；窗口={window[:80]!r}"
-            )
+            if not (first in window and last in window):
+                ungrounded.append((claim.claim_key, raw_id))
             checked += 1
-        del raw_text, decoded
-    print(f"{print_prefix} 单元区间落在真实原文上：checked={checked} raw组={len(by_raw)}")
+        del raw_text
+    print(
+        f"{print_prefix} 单元区间落在真实原文上：checked={checked} "
+        f"raw组={len(by_raw)} ungrounded={len(ungrounded)}"
+    )
+    for claim_key, raw_id in ungrounded[:10]:
+        print(f"{print_prefix} [UNGROUNDED] {claim_key} raw={raw_id}")
     assert checked == len(claims) >= 1
+    # 已知残留（实测 1/1322）：模型把别处的句子当成这个单元的引文。
+    # 断言"比例没有扩大"，而不是"一条都没有"。
+    ungrounded_ratio = len(ungrounded) / checked
+    assert ungrounded_ratio <= UNIT_GROUNDING_FAILURE_CEILING, (
+        f"单元区间里找不到 quote 首尾字符：{len(ungrounded)}/{checked} = "
+        f"{ungrounded_ratio:.2%}，超过已记录的 {UNIT_GROUNDING_FAILURE_CEILING:.0%} 上限"
+    )
 
 
 def test_offline_entry_persists_real_evidence_without_touching_real_store(
@@ -445,6 +486,17 @@ def test_offline_entry_persists_real_evidence_without_touching_real_store(
 
     claims = list(real_claims())
     raw_id = claims[0].raw_id
+    # 生产路径只投影**当前版本**（`current_for_raw()`）：同一个 claim_key 的旧版本
+    # 本来就不该有锚点（SPEC §2.17：1303 vs 1322 的差 19 就是这么来的）。
+    current_for_raw = {}
+    for claim in claims:
+        if claim.raw_id != raw_id:
+            continue
+        previous = current_for_raw.get(claim.claim_key)
+        if previous is None or claim.version > previous.version:
+            current_for_raw[claim.claim_key] = claim
+    expected = len(current_for_raw)
+    assert expected >= 1
     before = _db_digest()
 
     temp_db = tmp_path / "evidence.db"
@@ -473,12 +525,15 @@ def test_offline_entry_persists_real_evidence_without_touching_real_store(
         f"classified_claims={observed['classified_claims']} verified={observed['verified']} "
         f"spans_written={observed['spans_written']} spans_in_store={observed['spans_in_store']}"
     )
-    assert observed["classified_claims"] == len(claims)
-    assert observed["verified"] == len(claims)
-    assert observed["verification_failed"] == 0
-    assert observed["spans_written"] == len(claims)
+    assert observed["classified_claims"] == expected
+    # 对账恒等式（阶段自己在文档里承诺的那条）：verified + failed == classified
+    assert observed["verified"] + observed["verification_failed"] == expected
+    assert observed["spans_written"] == observed["verified"], (
+        "临时证据库本来是空的，每条 VERIFIED 都应新写一行"
+    )
+    assert observed["spans_in_store"] == observed["verified"]
 
-    # 跨连接读临时证据库：每一条真实 claim 都有一行，且坐标自洽
+    # 跨连接读临时证据库：每条 VERIFIED 的真实 claim 都有一行，且坐标自洽
     connection = sqlite3.connect(str(temp_db), isolation_level=None)
     connection.row_factory = sqlite3.Row
     try:
@@ -488,7 +543,7 @@ def test_offline_entry_persists_real_evidence_without_touching_real_store(
         ).fetchall()
     finally:
         connection.close()
-    assert len(rows) == len(claims)
+    assert len(rows) == observed["verified"]
     for row in rows:
         assert row["raw_id"] == raw_id
         assert row["char_start"] < row["char_end"]

@@ -28,6 +28,16 @@ NormalizedText.text / .to_raw_offset
    与重算结果不一致，**响亮失败**（`EvidenceMismatchError`），而不是把声明的坐标当真。
    这是判据 4「篡改检测」的实现：改掉记录里的 anchor 再重算，得到的仍是重算值。
 
+### 归一化的复用（2026-10-25）
+
+`verify_quote()` 对**同一份原文**的多次调用只归一化一次（有界 LRU，见
+`_normalized_for`）。这不削弱上面第 3 条：缓存的是**纯函数的输出**，键是
+`(raw_sha256, raw_bytes, content_type)`；**quote → 锚点的确定性匹配每次都重新执行**。
+
+量级（真实 store，2026-10-25）：1322 条 `classified` × 每次重新归一化 ≈ 20 分钟；
+按 raw 复用后是 75 次归一化 ≈ 1 分钟。这直接决定 `pytest tests` 与
+`python -m atlas.compose evidence` 能不能在可接受时间内重跑。
+
 关于「端点对齐」（SPEC §2.2 的实体澄清）
 ----------------------------------------
 
@@ -48,6 +58,7 @@ from __future__ import annotations
 
 import html as _html
 from datetime import datetime, timezone
+from functools import lru_cache
 from typing import Optional, Sequence, Tuple
 
 from pydantic import Field, model_validator
@@ -196,6 +207,30 @@ class QuoteVerification(ContractModel):
 # 校验入口
 # --------------------------------------------------------------------------- #
 
+#: 同一份原文的归一化结果缓存大小（条）。T-107 的典型用法是"一份 raw + 多条 quote"，
+#: 实测真实语料里单份 raw 最多 462 条 quote；缓存 8 份原文足够覆盖这个模式，
+#: 同时把驻留内存限制在"8 × 单份原文大小"（最大约 700 KB/份）。
+NORMALIZATION_CACHE_SIZE = 8
+
+
+@lru_cache(maxsize=NORMALIZATION_CACHE_SIZE)
+def _normalized_for(digest: str, payload: bytes, content_type: str) -> NormalizedText:
+    """`normalize(payload, content_type)` 的有界缓存（2026-10-25：性能修正）。
+
+    为什么可以缓存：`atlas.normalize.normalize` 是**纯函数**（SPEC §2.10：
+    归一化是 raw 的纯函数、可重建），相同 `(payload, content_type)` 必然得到相同
+    `NormalizedText`；而 `NormalizedText` 是冻结契约记录，不会被调用方就地修改。
+
+    为什么键里有 `payload` 而不是只有 `digest`：`digest` 由 `payload` 算出，
+    正常情况下二者一一对应；把字节本身也放进键，使"摘要相同但字节不同"（只可能
+    是哈希碰撞）**不可能**命中另一份原文的归一化结果。这一层是防御性的，
+    代价只是多存一份字节引用（不复制）。
+
+    `digest` 不入函数体却被用作键，是刻意的：它让缓存的语义粒度与
+    `EvidenceAnchor.raw_sha256` 完全一致，调用方无法"换个 raw_id 复用同一份文本"。
+    """
+    return normalize(payload, content_type)
+
 
 def verify_quote(
     *,
@@ -227,7 +262,7 @@ def verify_quote(
             f"声明锚点绑定的 raw_id={declared_anchor.raw_id!r} 与本次校验的 {raw_id!r} 不一致"
         )
 
-    normalized = normalize(payload, content_type)
+    normalized = _normalized_for(digest, payload, content_type)
     status, anchor, derived = build_anchor(
         raw_id=raw_id,
         raw_sha256=digest,
