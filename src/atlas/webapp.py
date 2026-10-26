@@ -32,13 +32,13 @@ SPEC §6.5 的结论是"把 T-130 的条目接进 feed 与前端"。接线需要
 | **本身就是条目**（按篇归档的文章，实测 65 条） | 整篇作为一条出现 |
 | 既不是 feed 也没有可解析内容（实测 2 条） | 仍是整篇一条，**不消失** |
 
-判据是**内容**（`parse_entries` 是否成功且产出条目），不是 endpoint 猜的，
+判据是**内容**（`parse_entries` 是否识别为 RSS/Atom，包括零条目的响应），不是 endpoint 猜的，
 也不是 endpoint 后缀匹配——`hacker-news-frontpage` 的 endpoint 以 `/search_by_date`
 结尾却返回 JSON，`ai-news-blog` 的 endpoint 以 `/feed/` 结尾却返回 HTML；
 按内容判定对这两条给出了正确结果（都是"整篇即条目"）。
 
 > ⚠️ 分类是**派生量**，没有落库：`raw_records` 没有 `entry_kind` 列，加列会牵动
-> T-103 的物理表（超出本任务范围）。因此它在启动时按内容重算一遍（确定性、可重建）。
+> T-103 的物理表（超出本任务范围）。因此它在浏览时按内容计算并缓存（确定性、可重建）。
 
 标签库为什么**不**在这里初始化
 ------------------------------
@@ -89,7 +89,12 @@ from atlas.feed import (
 from atlas.normalize.text import decode_bytes
 from atlas.registry import RegistryService
 from atlas.registry import open_store as open_registry_store
-from atlas.webui import DEFAULT_ACTOR, StoreLabelAccess, WebUIApplication
+from atlas.webui import (
+    DEFAULT_ACTOR,
+    StoreLabelAccess,
+    WebUIApplication,
+    raw_exists_from_source,
+)
 
 __all__ = [
     "ArchiveEntriesAccess",
@@ -121,11 +126,13 @@ DEFAULT_STORE_ROOT = "data/store"
 # ---------------------------------------------------------------------- #
 @dataclass(frozen=True)
 class _Analysis:
-    """一份原文的条目层内部结论（`entries` 为空表示它不是容器）。"""
+    """一份原文的条目层结论；容器身份与是否有文章分别记录。"""
 
     entries: Tuple[Any, ...]
     text: str
     text_length: int
+    is_feed: bool = False
+    problems: Tuple[str, ...] = ()
 
 
 class LocatedEntry:
@@ -175,6 +182,8 @@ class ArchiveEntriesAccess:
                 entries=tuple(entrieset.entries),
                 text=entrieset.feed_text,
                 text_length=len(entrieset.feed_text),
+                is_feed=entrieset.kind in ("rss", "atom"),
+                problems=entrieset.problems,
             )
 
         if len(self._cache) >= self._cache_size:
@@ -190,19 +199,25 @@ class ArchiveEntriesAccess:
         因此非容器也要解码一次——这正是 `RawEntriesView` 存在的理由。
         """
         analysis = self._analyse(record)
-        return _RawEntriesView(entries=analysis.entries, text_length=analysis.text_length)
+        return _RawEntriesView(
+            entries=analysis.entries, text_length=analysis.text_length,
+            is_feed=analysis.is_feed, problems=analysis.problems,
+        )
 
-    # -- 容器分类（启动时算一次） --------------------------------------------
+    def is_container(self, raw_id: str) -> bool:
+        """合法 RSS/Atom 即容器，包括本次没有文章的订阅响应。"""
+        return self._analyse(self._archive.get(raw_id)).is_feed
+
+    # -- 容器分类 -----------------------------------------------------------
     def container_ids(self) -> Tuple[str, ...]:
         """哪些 raw 是**容器**（`entry_kind == "feed"`）。
 
-        判据是内容：条目层解析成功**并且**产出了条目。解析失败或零条目的都不算容器
-        （它们仍然是条目列表里的一项，不会消失）。
+        判据是内容被识别为合法 RSS/Atom，与本次文章数量无关。
+        解析失败和未知 XML 仍按整篇原文保留，不伪装成空订阅。
         """
         containers: list[str] = []
         for raw_id in self._archive.all_raw_ids():
-            record = self._archive.get(raw_id)
-            if self._analyse(record).entries:
+            if self.is_container(raw_id):
                 containers.append(raw_id)
         return tuple(containers)
 
@@ -265,6 +280,8 @@ class _RawEntriesView:
 
     entries: Sequence[Any]
     text_length: int
+    is_feed: bool = False
+    problems: Tuple[str, ...] = ()
 
 
 # ---------------------------------------------------------------------- #
@@ -302,11 +319,13 @@ def build_webapp(
     """
     archive = open_archive(root)
     access = ArchiveEntriesAccess(archive)
-    kinds = {raw_id: FEED_ENTRY_KIND for raw_id in access.container_ids()}
-    raw_ids = tuple(archive.all_raw_ids())
+    kinds: Dict[str, Optional[str]] = {}
 
     def entry_kind_of(raw_id: str) -> Optional[str]:
-        return kinds.get(raw_id)
+        # Raw 不可变，单条分类可缓存；归档清单不能缓存，采集进程会持续追加。
+        if raw_id not in kinds:
+            kinds[raw_id] = FEED_ENTRY_KIND if access.is_container(raw_id) else None
+        return kinds[raw_id]
 
     source = ArchiveFeedSource(
         archive,
@@ -323,7 +342,7 @@ def build_webapp(
     def text_length(record: RawRecord) -> int:
         return access.entries_of(record).text_length
 
-    labels = StoreLabelAccess(db_path)
+    labels = StoreLabelAccess(db_path, actor=actor)
     if initialize_labels:
         labels.initialize()
 
@@ -331,7 +350,7 @@ def build_webapp(
         source,
         labels=labels,
         industry_provider=industry_provider,
-        raw_exists=lambda raw_id: raw_id in set(raw_ids),
+        raw_exists=raw_exists_from_source(source),
         actor=actor,
         entries_lookup=entries_of,
         locate_entry=locate_entry,
@@ -498,7 +517,7 @@ def render_startup(
             f"  可浏览条目：{summary.entries} 条"
             f"（容器派生 {summary.derived_entries} + 直接 {summary.direct_entries}）"
         ),
-        f"  打标署名（actor）：{actor}",
+        f"  打标署名（actor）：{actor}（标签展示与已打标筛选仅使用此署名的判断）",
         f"  Ctrl-C 退出（默认只监听 {host}，本机可见；服务无认证）",
     ]
     if port == 0:

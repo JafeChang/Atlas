@@ -9,7 +9,7 @@
 成本、解析策略与解析结果。密钥只用于调用，绝不打印——
 `CognitionConfig.api_key` 是 `repr=False`，记录里的 `credential_route` 只带指纹。
 
-`--route deepseek|openai-compatible` 只跑一条；`--json` 输出机器可读结果。
+`--route deepseek|openai-compatible|opencode-go` 只跑一条；`--json` 输出机器可读结果。
 """
 
 from __future__ import annotations
@@ -25,8 +25,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from atlas.cognition import (  # noqa: E402
-    DS_ROUTE,
-    OA_ROUTE,
+    ROUTES,
     CognitionConfig,
     CognitionRequest,
     PiSidecarCognitionPort,
@@ -93,11 +92,11 @@ def run_route(route: str) -> Dict[str, Any]:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--route", default=None, choices=[DS_ROUTE, OA_ROUTE])
+    parser.add_argument("--route", default=None, choices=ROUTES)
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
 
-    routes: List[str] = [args.route] if args.route else [DS_ROUTE, OA_ROUTE]
+    routes: List[str] = [args.route] if args.route else list(ROUTES)
     table = available_routes()
     reports: List[Dict[str, Any]] = []
     failures: List[str] = []

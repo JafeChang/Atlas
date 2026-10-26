@@ -25,6 +25,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import select
@@ -57,7 +58,11 @@ from .errors import (
 )
 from .node import NodeBinary, resolve_node
 from .parse import extract_single_json
-from .prompt import PROMPT_VERSION, build_system_prompt, build_user_content, truncate_content
+from .prompt import (
+    build_system_prompt,
+    build_user_content,
+    truncate_content,
+)
 
 __all__ = ["PROTOCOL", "FRAME_PREFIX", "SIDECAR_RELATIVE_PATH", "PiSidecarCognitionPort"]
 
@@ -273,6 +278,9 @@ class PiSidecarCognitionPort:
             call["apiKey"] = config.api_key
         if config.proxy_url:
             call["proxyUrl"] = config.proxy_url
+        if config.route_name == "opencode-go":
+            # 一份 raw 的多个批次共享会话；不把原始文档标识发送到请求头。
+            call["sessionId"] = "atlas-" + hashlib.sha256(request.raw_id.encode()).hexdigest()[:32]
         return {
             "protocol": PROTOCOL,
             "jobId": f"cog-{uuid.uuid4().hex[:16]}",

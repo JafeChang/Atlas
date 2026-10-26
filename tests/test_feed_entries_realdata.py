@@ -40,9 +40,10 @@ import pytest
 from atlas.archive import open_archive
 from atlas.feed import ENTRY_GRANULARITY, FeedQuery, run_query
 from atlas.webapp import ArchiveEntriesAccess, build_webapp
+from tests._realdata import real_store_root
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-STORE_ROOT = REPO_ROOT / "data" / "store"
+STORE_ROOT = real_store_root()
 
 #: SPEC §6.3 逐渠道列出的 `<item>`/`<entry>` 数（用 endpoint 作键：raw_id 是内容寻址的，
 #: 内容一变它就变；而"哪个端点是一份 feed"是稳定事实）。

@@ -215,7 +215,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--allow-partial",
         action="store_true",
         help=(
-            "采集阶段个别渠道失败时继续（默认失败即中止）。"
+            "个别渠道采集失败或正文为空时继续处理其他内容（默认失败即中止）。"
             "开启后失败会进入报告的 observed.failures，不会被吞掉"
         ),
     )
@@ -306,6 +306,11 @@ def render_observed(name: str, observed: Any) -> List[str]:
     per_channel = list(observed.get("per_channel") or [])
 
     lines: List[str] = []
+    if "records_seen" in observed:
+        lines.append(
+            f"  观察 {name}：records_seen={observed.get('records_seen')} "
+            f"normalized={observed.get('normalized')} rejected={len(failures)}"
+        )
     if per_channel:
         collected = sum(1 for item in per_channel if item.get("status") == "collected")
         lines.append(

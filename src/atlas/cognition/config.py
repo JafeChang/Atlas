@@ -20,6 +20,7 @@ import os
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Mapping, Optional
+from urllib.parse import urlsplit
 
 from .errors import ConfigError
 
@@ -39,6 +40,12 @@ __all__ = [
     "OA_MODEL",
     "OA_PROVIDER",
     "OA_ROUTE",
+    "GO_ROUTE",
+    "GO_PROVIDER",
+    "GO_MODEL",
+    "GO_BASE_URL",
+    "GO_API_KEY_ENV",
+    "ROUTES",
     "PROMPT_VERSION",
     "CognitionConfig",
     "available_routes",
@@ -69,6 +76,14 @@ OA_MODEL = "deepseek/deepseek-v4-flash"
 OA_BASE_URL = "https://openrouter.ai/api/v1"
 OA_API_KEY_ENV = "ATLAS_OPENAI_API_KEY"
 
+#: OpenCode Go：独立凭据与配置，避免覆盖 OpenRouter 兼容路由。
+GO_ROUTE = "opencode-go"
+GO_PROVIDER = "opencode-go"
+GO_MODEL = "glm-5.3-flash"
+GO_BASE_URL = "https://opencode.ai/inference/go/openai/v1"
+GO_API_KEY_ENV = "OPENCODE_GO_API_KEY"
+ROUTES = (DS_ROUTE, OA_ROUTE, GO_ROUTE)
+
 DEFAULT_ROUTE = DS_ROUTE
 DEFAULT_TIMEOUT_SECONDS = 60.0
 DEFAULT_NO_PROXY = "127.0.0.1,localhost,::1"
@@ -82,6 +97,8 @@ _DS_KEY_ENV = ("DEEPSEEK_API_KEY",)
 _OA_BASE_URL_ENV = ("ATLAS_LLM_BASE_URL", "ATLAS_OPENAI_BASE_URL")
 _OA_MODEL_ENV = ("ATLAS_LLM_MODEL", "ATLAS_OPENAI_MODEL")
 _OA_KEY_ENV = ("ATLAS_OPENAI_API_KEY",)
+_GO_BASE_URL_ENV = ("OPENCODE_GO_BASE_URL",)
+_GO_MODEL_ENV = ("OPENCODE_GO_MODEL",)
 _TIMEOUT_ENV = ("ATLAS_LLM_TIMEOUT",)
 _PROXY_ENV = ("ATLAS_COGNITION_PROXY", "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy")
 
@@ -223,6 +240,7 @@ class CognitionConfig:
 
         * `"deepseek"`（**默认**）→ `api.deepseek.com` + `DEEPSEEK_API_KEY` + `deepseek-flash`
         * `"openai-compatible"` → `.env.local` 里的 `ATLAS_OPENAI_API_KEY` + `ATLAS_LLM_BASE_URL`
+        * `"opencode-go"` → 独立的 `OPENCODE_GO_API_KEY`，模型与地址可分别覆盖
 
         `require_key=False` 用于"只想知道配置长什么样"的场景（例如测试里验证路由切换）；
         真正调用模型时缺 key 会**响亮失败**（`ConfigError`）。
@@ -242,9 +260,9 @@ class CognitionConfig:
             or _env_lookup(environ, file_values, *_ROUTE_ENV)
             or DEFAULT_ROUTE
         ).strip()
-        if selected not in (DS_ROUTE, OA_ROUTE):
+        if selected not in ROUTES:
             raise ConfigError(
-                f"未知的认知层路由 {selected!r}；可用：{DS_ROUTE!r} / {OA_ROUTE!r}"
+                f"未知的认知层路由 {selected!r}；可用：{', '.join(ROUTES)}"
                 f"（通过参数 route= 或环境变量 {_ROUTE_ENV[0]} 指定）"
             )
 
@@ -255,13 +273,18 @@ class CognitionConfig:
             model = _env_lookup(environ, file_values, *_DS_MODEL_ENV) or DS_MODEL
             default_key_env = DS_API_KEY_ENV
             default_provider = DS_PROVIDER
-        else:
+        elif selected == OA_ROUTE:
             base_url = (
                 _env_lookup(environ, file_values, *_OA_BASE_URL_ENV) or OA_BASE_URL
             )
             model = _env_lookup(environ, file_values, *_OA_MODEL_ENV) or OA_MODEL
             default_key_env = OA_API_KEY_ENV
             default_provider = OA_PROVIDER
+        else:
+            base_url = _env_lookup(environ, file_values, *_GO_BASE_URL_ENV) or GO_BASE_URL
+            model = _env_lookup(environ, file_values, *_GO_MODEL_ENV) or GO_MODEL
+            default_key_env = GO_API_KEY_ENV
+            default_provider = GO_PROVIDER
 
         api_key_env = overrides.pop("api_key_env", None)
         raw_timeout = _env_lookup(environ, file_values, *_TIMEOUT_ENV)
@@ -285,7 +308,7 @@ class CognitionConfig:
         # 凭据变量名在**最终** base_url 确定之后才判定：显式 override 到官方端点时
         # 必须自动改用 `DEEPSEEK_API_KEY`，否则会拿错钥匙。
         if "api_key_env" not in values:
-            values["api_key_env"] = cls._default_key_env(values["base_url"])
+            values["api_key_env"] = cls._default_key_env(values["base_url"], fallback=default_key_env)
         # `model_version` 默认跟随最终 model（除非调用方显式指定）。
         if "model_version" not in overrides:
             values["model_version"] = values["model"]
@@ -301,17 +324,22 @@ class CognitionConfig:
                 f"缺少 API key：环境变量 {config.api_key_env} 为空。"
                 f"（当前路由 {config.route_name!r} → {config.base_url}）"
                 "凭据必须通过环境变量提供（绝不写入代码 / 提交 / 日志）。"
-                "官方端点用 DEEPSEEK_API_KEY；环境内兼容凭据用 ATLAS_OPENAI_API_KEY。"
+                "DeepSeek 用 DEEPSEEK_API_KEY；兼容路由用 ATLAS_OPENAI_API_KEY；"
+                "OpenCode Go 用 OPENCODE_GO_API_KEY。"
             )
         return config
 
     @staticmethod
-    def _default_key_env(base_url: str) -> str:
-        """官方 DeepSeek 端点用**独立的** `DEEPSEEK_API_KEY`，不与环境内兼容凭据混用。"""
-        host = base_url.lower()
-        if any(official in host for official in _OFFICIAL_HOSTS):
+    def _default_key_env(base_url: str, *, fallback: str = OA_API_KEY_ENV) -> str:
+        """按真实主机名选择独立凭据；自定义代理端点沿用所选路由的凭据变量。"""
+        host = (urlsplit(base_url).hostname or "").lower()
+        if host in _OFFICIAL_HOSTS:
             return DS_API_KEY_ENV
-        return OA_API_KEY_ENV
+        if host == "opencode.ai":
+            return GO_API_KEY_ENV
+        if host == "openrouter.ai":
+            return OA_API_KEY_ENV
+        return fallback
 
     def with_overrides(self, **overrides: Any) -> "CognitionConfig":
         return replace(self, **overrides)
@@ -375,12 +403,12 @@ def available_routes(
     env: Optional[Mapping[str, str]] = None,
     env_file: Optional[str | os.PathLike[str]] = None,
 ) -> dict[str, dict[str, Any]]:
-    """列出两条路由的当前配置以及凭据是否就位（**不含密钥**）。
+    """列出全部路由的当前配置以及凭据是否就位（**不含密钥**）。
 
     给运维/测试用：一眼看出"官方端点是否可用、将回退到哪条路"。
     """
     out: dict[str, dict[str, Any]] = {}
-    for name in (DS_ROUTE, OA_ROUTE):
+    for name in ROUTES:
         try:
             config = CognitionConfig.from_env(
                 env=env, env_file=env_file, route=name, require_key=False

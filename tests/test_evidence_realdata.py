@@ -51,9 +51,10 @@ from atlas.evidence import (
     verify_claim,
     verify_quote,
 )
+from tests._realdata import real_store_root
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-STORE_DB = REPO_ROOT / "data" / "store" / "atlas.db"
+STORE_DB = real_store_root() / "atlas.db"
 
 #: 真实 raw 上**不可能**匹配到的一段文字（负路径；不是从模型输出里抄的）。
 IMPOSSIBLE_QUOTE = "ATLAS_T107_PROBE_这段文字在真实原文里不存在_9f3c1a"
@@ -165,7 +166,7 @@ def real_claims() -> List[RealClaim]:
 
 def real_raw(raw_id: str) -> Tuple[bytes, str]:
     """从真实归档读回原文**字节**（只读，不信任何自述）。"""
-    archive = open_archive(REPO_ROOT / "data" / "store")
+    archive = open_archive(real_store_root())
     try:
         record = archive.get(raw_id)
         content = archive.get_content(raw_id)
@@ -323,7 +324,7 @@ def test_node_and_pipeline_paths_agree_on_real_claims(tmp_path: Path) -> None:
     raw_bytes, _ = real_raw(raw_id)
 
     pipeline = build_pipeline(
-        store_root=REPO_ROOT / "data" / "store",
+        store_root=real_store_root(),
         actor="t107-realdata",
         execution_store=InMemoryExecutionRecordStore(),
         evidence=SqliteEvidenceStore(tmp_path / "evidence.db"),
@@ -481,7 +482,8 @@ def test_offline_entry_persists_real_evidence_without_touching_real_store(
     from atlas.compose import build_pipeline
     from atlas.evidence import SqliteEvidenceStore
     from atlas.labels import open_store as open_labels
-    from atlas.registry import RegistryService, open_store as open_registry
+    from atlas.registry import RegistryService
+    from atlas.registry import open_store as open_registry
     from atlas.runner import InMemoryExecutionRecordStore
 
     claims = list(real_claims())
@@ -503,7 +505,7 @@ def test_offline_entry_persists_real_evidence_without_touching_real_store(
     labels = open_labels(tmp_path / "labels.db")
     registry = RegistryService(open_registry(tmp_path / "registry.db", author="t107-realdata"))
     pipeline = build_pipeline(
-        store_root=REPO_ROOT / "data" / "store",
+        store_root=real_store_root(),
         actor="t107-realdata",
         raw_ids=(raw_id,),
         execution_store=InMemoryExecutionRecordStore(),

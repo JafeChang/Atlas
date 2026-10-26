@@ -68,6 +68,7 @@ node:fs         # 只用于 readFileSync 读自身源码；唯一一处 fs 用�
     "maxOutputTokens": 4096,
     "temperature": 0.0,
     "reasoning": false,
+    "sessionId": "atlas-…",       // 可选；Go 中由 raw_id 的摘要生成，同一原文的批次稳定共享
     "noProxy": "127.0.0.1,localhost,::1",
     "proxyUrl": "",               // 需要时由父进程传入
     "systemPrompt": "…",
@@ -103,13 +104,16 @@ Node 的 fd 3 **不可写**——`writeSync(3, …)` 与 `createWriteStream(null
 
 ## 3. 配置与凭据（provider/model 是配置，不是代码）
 
-| 项 | 路由 A（**默认**） | 路由 B（回退） |
-|---|---|---|
-| `route_name` | `deepseek` | `openai-compatible` |
-| provider | `deepseek` | `atlas-openai-compatible` |
-| base_url | `https://api.deepseek.com` | `ATLAS_LLM_BASE_URL`（实测 `https://openrouter.ai/api/v1`） |
-| model | `deepseek-flash` | `ATLAS_LLM_MODEL` |
-| 凭据变量 | `DEEPSEEK_API_KEY` | `ATLAS_OPENAI_API_KEY` |
+| 项 | 路由 A（**默认**） | 路由 B | 路由 C |
+|---|---|---|---|
+| `route_name` | `deepseek` | `openai-compatible` | `opencode-go` |
+| provider | `deepseek` | `atlas-openai-compatible` | `opencode-go` |
+| base_url | `https://api.deepseek.com` | `ATLAS_LLM_BASE_URL` | `OPENCODE_GO_BASE_URL`，默认 `https://opencode.ai/inference/go/openai/v1` |
+| model | `deepseek-flash` | `ATLAS_LLM_MODEL` | `OPENCODE_GO_MODEL`，默认 `glm-5.3-flash` |
+| 凭据变量 | `DEEPSEEK_API_KEY` | `ATLAS_OPENAI_API_KEY` | `OPENCODE_GO_API_KEY` |
+
+Go 请求使用 `User-Agent: Atlas/0.1`，并以 `sessionId` 填入 `x-opencode-session`。
+会话标识为 raw_id 的 SHA256 前 32 位加 `atlas-` 前缀，不含原始标识或凭据。
 
 选择方式：参数 `route=` > 环境变量 `ATLAS_COGNITION_ROUTE` > 默认（`deepseek`）。
 **切路由不需要改任何代码路径。**

@@ -59,9 +59,10 @@ from atlas.entries import (
     verify_ids,
     verify_offsets,
 )
+from tests._realdata import real_store_root
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-STORE_RAW = REPO_ROOT / "data" / "store" / "raw"
+STORE_RAW = real_store_root() / "raw"
 
 #: SPEC §6.3 记录的十份 feed：`endpoint → (channel_id, 形态, <item>/<entry> 数)`。
 #: 这是"先定义后实现"的验收数字，实测不符即响亮失败。

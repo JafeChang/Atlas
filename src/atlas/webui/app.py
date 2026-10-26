@@ -295,14 +295,27 @@ class _EmptySession(_ReadOnlySession):
 class _StoreSession(_ReadOnlySession):
     """把打开的 `LabelStore` 包成只读会话；退出时关闭连接。"""
 
-    def __init__(self, store: LabelStore) -> None:
+    def __init__(self, store: LabelStore, *, actor: Optional[str] = None) -> None:
         self._store = store
+        self._actor = actor
+        self._labels: Dict[str, list[ConfirmedLabel]] = {}
+
+    def _labels_for(self, raw_id: str) -> list[ConfirmedLabel]:
+        if raw_id not in self._labels:
+            self._labels[raw_id] = [
+                label for label in self._store.all_for(raw_id)
+                if self._actor is None or label.actor == self._actor
+            ]
+        return self._labels[raw_id]
 
     def keys_for(self, raw_id: str) -> Sequence[str]:
-        return tuple(self._store.keys_for(raw_id))
+        return tuple(sorted({label.label_key for label in self._labels_for(raw_id)}))
 
     def latest_value(self, raw_id: str, label_key: str) -> Optional[str]:
-        return self._store.latest_value(raw_id, label_key)
+        labels = [label for label in self._labels_for(raw_id) if label.label_key == label_key]
+        # all_for 按插入顺序读；时间相同时保留首条，与 LabelStore 的裁决一致。
+        latest = max(labels, key=lambda label: label.created_at, default=None)
+        return None if latest is None else latest.label_value
 
     def rates_for(self, raw_id: str) -> list[tuple[ConfirmedLabel, str]]:
         """该文档的全部标签 + **锚点区间串**（文档级为 `"document"`）。
@@ -310,7 +323,7 @@ class _StoreSession(_ReadOnlySession):
         用 `all_for` 而不是 `keys_for`：条目级标签的身份包含它的区间，
         只拿键名分不出"这条标签标在哪一段"。
         """
-        return [(label, _anchor_key(label)) for label in self._store.all_for(raw_id)]
+        return [(label, _anchor_key(label)) for label in self._labels_for(raw_id)]
 
     def __exit__(self, *exc_info: object) -> None:
         self._store.close()
@@ -330,14 +343,22 @@ class StoreLabelAccess:
     Args:
         db_path: Confirmed 库文件路径。**必须显式给出**（没有默认值），
             避免任何"不小心写到仓库 `data/`"的路径。
+        actor: 只读取此署名的判断；None 保持全体标签的审计视图。
+            这是浏览投影，不是访问控制；写入与历史记录保持原有契约。
     """
 
-    def __init__(self, db_path: str | Path) -> None:
+    def __init__(self, db_path: str | Path, *, actor: Optional[str] = None) -> None:
         self._db_path = Path(db_path)
+        self._actor = actor
 
     @property
     def db_path(self) -> Path:
         return self._db_path
+
+    @property
+    def actor(self) -> Optional[str]:
+        """浏览标签的署名范围；None 表示全体。"""
+        return self._actor
 
     def initialize(self) -> Path:
         """显式的一次性初始化：建库、建表、装触发器（全部归 T-108）。
@@ -360,7 +381,7 @@ class StoreLabelAccess:
         """
         if not self._db_path.exists():
             return _EmptySession()
-        return _StoreSession(open_store(self._db_path))
+        return _StoreSession(open_store(self._db_path), actor=self._actor)
 
     def record(
         self,
@@ -579,12 +600,16 @@ class WebUIRequestHandler(BaseHTTPRequestHandler):
             )
             return
 
+        notices = list(_entry_notices(result))
+        label_actor = getattr(server.labels, "actor", None)
+        if label_actor is not None:
+            notices.insert(0, f"当前署名：{label_actor}；标签展示与已打标筛选仅使用此署名的判断。")
         document = render_feed_page(
             result,
             industries=tuple(server.industry_provider()),
             values=values,
             actor=server.actor,
-            notices=_entry_notices(result),
+            notices=notices,
         )
         self._send_html(HTTPStatus.OK, document)
 
@@ -1099,7 +1124,7 @@ def _record_of(source: Any, raw_id: str) -> Any:
 
 def _entry_notices(result: Any) -> tuple[str, ...]:
     """把条目层的 `problems` 聚合成页面顶部的显式提示（**绝不静默**）。"""
-    seen: list[str] = []
+    seen: list[str] = list(getattr(result, "notices", ()))
     for item in result.items:
         for problem in getattr(item, "problems", ()):
             if problem not in seen:

@@ -30,10 +30,10 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from atlas.cognition import (  # noqa: E402
+    DS_ROUTE,
+    ROUTES,
     CallStatus,
     CognitionRequest,
-    DS_ROUTE,
-    OA_ROUTE,
 )
 from tests.test_cognition_support import (  # noqa: E402
     live_port,
@@ -70,7 +70,7 @@ def _run(route: str):
     return port, port.extract(request)
 
 
-@pytest.mark.parametrize("route", [DS_ROUTE, OA_ROUTE])
+@pytest.mark.parametrize("route", ROUTES)
 def test_criterion_2_real_call_returns_structured_json(route: str) -> None:
     _require_live_enabled()
     if route not in live_routes():

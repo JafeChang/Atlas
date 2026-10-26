@@ -143,39 +143,89 @@ def feed_query_string(query: FeedQuery, *, offset: int = 0, labeled: Any = _KEEP
 # 页面外壳
 # ---------------------------------------------------------------------- #
 _STYLE = """
-:root { color-scheme: light dark; }
+:root { color-scheme: light dark; --bg: #f5f7fb; --surface: #fff; --text: #182333;
+        --muted: #526174; --border: #d8e0ea; --accent: #175ac6; --tint: #eaf1fc; }
+* { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; }
 body { font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
-       margin: 0 auto; max-width: 62rem; padding: 1rem 1.25rem 5rem; line-height: 1.5; }
-h1 { font-size: 1.35rem; margin: 0.5rem 0 0.75rem; }
+       margin: 0 auto; max-width: 58rem; padding: 1rem 1rem 4rem; line-height: 1.6;
+       font-size: 16px; background: var(--bg); color: var(--text); }
+h1 { font-size: 1.55rem; letter-spacing: -0.025em; margin: 0.4rem 0 1rem; }
 h2 { font-size: 1rem; margin: 1.5rem 0 0.5rem; }
-a { color: inherit; }
+a { color: var(--accent); text-underline-offset: 0.18em; }
+button, input, select { font: inherit; }
+button, select, input[type=number] { min-height: 44px; border: 1px solid var(--border);
+    border-radius: 9px; padding: 0.5rem 0.75rem; }
+select, input { background: var(--surface); color: var(--text); max-width: 100%; }
+button { background: var(--accent); color: #fff; border-color: var(--accent); cursor: pointer; }
+button:hover { filter: brightness(0.94); }
+:focus-visible { outline: 3px solid var(--accent); outline-offset: 3px; }
+summary { cursor: pointer; min-height: 44px; padding-block: 0.55rem; }
 code, .raw-id { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.85em; }
-.filters { border: 1px solid currentColor; border-radius: 6px; padding: 0.6rem 0.8rem;
-           display: flex; flex-wrap: wrap; gap: 0.9rem; align-items: flex-end; }
-.filters label { display: flex; flex-direction: column; font-size: 0.8rem; gap: 0.2rem; }
-.filters select[multiple] { min-width: 10rem; }
-.pager { display: flex; gap: 0.9rem; align-items: center; margin: 0.7rem 0; font-size: 0.85rem; }
-.quick { font-size: 0.85rem; margin: 0.5rem 0; display: flex; gap: 0.6rem; }
-.item { border: 1px solid currentColor; border-radius: 6px; padding: 0.6rem 0.8rem; margin: 0.6rem 0; }
-.item .head { display: flex; flex-wrap: wrap; gap: 0.6rem; align-items: baseline; }
-.item .title { font-weight: 600; font-size: 1.02rem; }
+.filter-panel { border: 1px solid var(--border); border-radius: 12px; padding: 0.2rem 0.9rem;
+                background: var(--surface); }
+.filters { display: flex; flex-wrap: wrap; gap: 0.8rem; align-items: flex-end; padding-bottom: 0.8rem; }
+.filters label { display: flex; flex-direction: column; font-size: 0.875rem; gap: 0.3rem; min-width: 0; }
+.filters select[multiple] { width: 100%; }
+.filters label:first-child { flex: 1 1 100%; }
+.filters label:not(:first-child) { flex: 1 1 6rem; }
+.pager { display: flex; flex-wrap: wrap; gap: 0.3rem 0.9rem; align-items: center;
+         margin: 0.8rem 0; font-size: 0.875rem; }
+.pager .count { flex-basis: 100%; color: var(--muted); }
+.pager a { display: inline-flex; align-items: center; min-height: 36px; }
+.quick { margin: 0.9rem 0; display: flex; flex-wrap: wrap; gap: 0.4rem; align-items: center; }
+.quick > span { display: none; }
+.quick a { text-decoration: none; border-radius: 9px; min-height: 44px; padding: 0.5rem 0.85rem; }
+.quick a[aria-current=page] { background: var(--accent); color: #fff; }
+.item { border: 1px solid var(--border); border-radius: 14px; padding: 1rem;
+        margin: 0.8rem 0; background: var(--surface); }
+.item .head { min-width: 0; }
+.item .title { color: var(--text); font-weight: 650; font-size: 1.08rem;
+              text-decoration: none; overflow-wrap: anywhere; }
+.item .meta { display: flex; flex-wrap: wrap; gap: 0.25rem 0.75rem; color: var(--muted);
+              font-size: 0.875rem; margin: 0.45rem 0; overflow-wrap: anywhere; }
+.badge { display: inline-block; font-size: 0.8rem; border-radius: 6px;
+         padding: 0.15rem 0.5rem; background: var(--tint); color: var(--accent); }
 .item .endpoint, .item .trace, .item .open { font-size: 0.78rem; opacity: 0.8;
                                              margin: 0.2rem 0; overflow-wrap: anywhere; }
 .item .trace code { margin-right: 0.35rem; }
 .item .hint { font-size: 0.75rem; opacity: 0.7; }
-.item .meta, .item .labels { font-size: 0.8rem; opacity: 0.85; margin: 0.25rem 0; }
+.item .labels { font-size: 0.875rem; color: var(--muted); margin: 0.6rem 0; }
 .item .problem { font-size: 0.8rem; border-left: 3px solid currentColor;
                  padding-left: 0.5rem; margin: 0.3rem 0; }
-.actions { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; margin-top: 0.5rem; }
-.actions form { display: flex; gap: 0.3rem; align-items: center; }
+.item .open { opacity: 1; font-size: 0.875rem; }
+.open a { display: inline-flex; align-items: center; min-height: 40px; margin-right: 1rem; }
+.actions { display: grid; grid-template-columns: 1fr 1fr; gap: 0.6rem; margin-top: 0.5rem; }
+.actions > form, .actions button { width: 100%; }
+.act-invalid button { color: var(--text); background: var(--surface); border-color: var(--border); }
+.industry-editor { grid-column: 1 / -1; font-size: 0.875rem; color: var(--muted); }
+.industry-editor form { display: flex; flex-wrap: wrap; gap: 0.5rem; }
+.industry-editor select { flex: 1 1 9rem; min-width: 0; }
+.industry-editor button { width: auto; flex: 0 0 auto; }
+.record-details { border-top: 1px solid var(--border); margin-top: 0.5rem;
+                  padding-top: 0.25rem; color: var(--muted); font-size: 0.8rem; }
+.record-details .meta { display: block; }
 .label-tag { border: 1px solid currentColor; border-radius: 4px; padding: 0 0.3rem; margin-right: 0.3rem; }
 .notice { border-left: 4px solid currentColor; padding: 0.4rem 0.6rem; margin: 0.8rem 0; }
+.feed-notices { font-size: 0.875rem; color: var(--muted); overflow-wrap: anywhere; }
 .empty { opacity: 0.8; }
 .entry-slice { margin: 0.8rem 0; padding: 0.6rem 0.8rem; border-left: 4px solid currentColor;
                white-space: pre-wrap; overflow-wrap: anywhere; max-height: 60rem; overflow: auto; }
 .entry-slice mark { background: color-mix(in srgb, currentColor 22%, transparent); color: inherit; }
 .highlight-note { font-size: 0.82rem; opacity: 0.85; }
 footer { margin-top: 2rem; font-size: 0.75rem; opacity: 0.7; }
+@media (min-width: 640px) {
+  body { padding: 2rem 2rem 4rem; }
+  .filters label:first-child { flex: 1 1 14rem; }
+  .pager .count { flex-basis: auto; margin-right: auto; }
+  .item { padding: 1.25rem; }
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #101720; --surface: #18212d; --text: #e5ebf3; --muted: #a8b6c8;
+          --border: #354357; --accent: #8dbaff; --tint: #233653; }
+  button, .quick a[aria-current=page] { color: #101720; }
+  .act-invalid button { color: var(--text); }
+}
 """
 
 _SHELL = Template(
@@ -190,7 +240,7 @@ _SHELL = Template(
 <body>
 <h1>$heading</h1>
 $body
-<footer>Atlas T-109 打标前端 · 服务端渲染 · 无构建步骤 · 打标写入只经 atlas.labels 的 LabelStore</footer>
+<footer>Atlas · 个人信息流</footer>
 </body>
 </html>
 """
@@ -201,7 +251,7 @@ $body
 #: 隐藏字段里，锚点字段只补 `raw_sha256` / `char_start` / `char_end` ——
 #: **绝不包含 `entry_id`**（T-130：ID 是派生量，换解析器会漂移）。
 _ACTION_FORM = Template(
-    """<form class="act" method="post" action="/label">
+    """<form class="act act-$label_value" method="post" action="/label">
 <input type="hidden" name="raw_id" value="$raw_id">
 <input type="hidden" name="label_key" value="$label_key">
 $anchor_fields<input type="hidden" name="label_value" value="$label_value">
@@ -268,8 +318,13 @@ def render_feed_page(
         _render_quick_switches(result.query),
         _render_pager(result),
     ]
-    for notice in notices:
-        parts.append(f'<div class="notice">{escape(notice)}</div>')
+    if notices:
+        parts.append(
+            '<details class="feed-notices"><summary>'
+            f'订阅与浏览提示（{len(notices)}）</summary>'
+            + "".join(f'<p>{escape(notice)}</p>' for notice in notices)
+            + '</details>'
+        )
     if not result.items:
         parts.append(
             '<p class="empty">没有符合条件的记录。可放宽筛选条件，或先跑采集。</p>'
@@ -313,6 +368,7 @@ def _render_filters(query: FeedQuery, industries: Sequence[str]) -> str:
     desc = " selected" if query.order == "desc" else ""
     asc = " selected" if query.order == "asc" else ""
     return (
+        '<details class="filter-panel"><summary>筛选与排序</summary>'
         '<form class="filters" method="get" action="/feed">'
         '<label>行业（来自配置，可多选）'
         '<select name="industry" multiple size="5">' + "".join(options) + "</select>"
@@ -327,14 +383,15 @@ def _render_filters(query: FeedQuery, industries: Sequence[str]) -> str:
         "</label>"
         '<input type="hidden" name="offset" value="0">'
         '<button type="submit">筛选</button>'
-        "</form>"
+        "</form></details>"
     )
 
 
 def _render_quick_switches(query: FeedQuery) -> str:
     def link(label: str, labeled: Any) -> str:
         href = feed_query_string(query, offset=0, labeled=labeled)
-        return f'<a href="{escape(href)}">{escape(label)}</a>'
+        current = ' aria-current="page"' if query.labeled is labeled else ''
+        return f'<a href="{escape(href)}"{current}>{escape(label)}</a>'
 
     return (
         '<nav class="quick"><span>标签状态：</span>'
@@ -403,11 +460,26 @@ def _render_entry(
         f'<article class="item entry" id="item-{escape(entry.raw_id)}">'
         '<div class="head">'
         f'<a class="title" href="{_safe_href(link)}" rel="noreferrer noopener">'
-        f"{escape(entry.title)}</a>{title_hint}"
-        f'<span class="badge">行业：{escape(industry)}</span>'
-        f'<span class="badge">渠道：{escape(entry.channel_id)}</span>'
+        f"{escape(entry.title)}</a>"
         "</div>"
-        f'<div class="endpoint"><a href="{_safe_href(link)}" rel="noreferrer noopener">'
+        f'<div class="meta"><span>{escape(entry.channel_id)}</span>'
+        f'<time datetime="{escape(entry.timestamp.isoformat())}">'
+        f'{escape(entry.timestamp.strftime("%Y-%m-%d"))}'
+        f'{" · 发布" if entry.published_from_entry else " · 采集"}</time></div>'
+        f'<span class="badge">{escape(industry)}</span>'
+        + _label_line(labels)
+        + '<p class="open">'
+        f'<a href="{_safe_href(link)}" rel="noreferrer noopener">阅读原文</a>'
+        f'<a href="{escape(entry_anchor_url(entry))}">查看归档</a></p>'
+        + '<div class="actions">'
+        + _valid_action(entry, actor, return_to, LABEL_VALUE_VALID, "标记有效")
+        + _valid_action(entry, actor, return_to, LABEL_VALUE_INVALID, "标记无效")
+        + '<details class="industry-editor"><summary>修正行业</summary>'
+        + _industry_action(entry, labels, industries, actor, return_to)
+        + '</details></div>'
+        + '<details class="record-details"><summary>归档详情</summary>'
+        + title_hint
+        + f'<div class="endpoint"><a href="{_safe_href(link)}" rel="noreferrer noopener">'
         f"{escape(link)}</a></div>"
         f'<div class="meta">{escape(entry.timestamp.isoformat())}{escape(time_hint)}'
         f" · 区间 [{escape(entry.char_start)}, {escape(entry.char_end)})"
@@ -420,14 +492,9 @@ def _render_entry(
         f"<code>char_end={escape(entry.char_end)}</code>"
         "</div>"
         + problems
-        + _label_line(labels)
         + f'<p class="open"><a href="{escape(entry_anchor_url(entry))}">'
         "打开原文并高亮该条目区间</a></p>"
-        + '<div class="actions">'
-        + _valid_action(entry, actor, return_to, LABEL_VALUE_VALID, "标记有效")
-        + _valid_action(entry, actor, return_to, LABEL_VALUE_INVALID, "标记无效")
-        + _industry_action(entry, labels, industries, actor, return_to)
-        + "</div></article>"
+        + "</details></article>"
     )
 
 
@@ -577,7 +644,7 @@ def _industry_action(
         options.append('<option value="" disabled>（当前配置里没有行业）</option>')
     select = (
         '<select name="label_value" required aria-label="修正行业">'
-        + '<option value="" disabled selected hidden>（选择行业）</option>'
+        + ('<option value="" disabled hidden' + (' selected' if current is None else '') + '>（选择行业）</option>')
         + "".join(options)
         + "</select>"
     )

@@ -153,6 +153,12 @@ function buildModel(call) {
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     contextWindow: call.contextWindow ?? 128000,
     maxTokens: call.maxTokens ?? 4096,
+    ...(call.provider === "opencode-go" ? {
+      headers: {
+        "User-Agent": "Atlas/0.1",
+        ...(call.sessionId ? { "x-opencode-session": call.sessionId } : {}),
+      },
+    } : {}),
   };
 }
 
@@ -338,6 +344,7 @@ export async function callModel(job) {
     maxRetries: 0,
     timeoutMs,
     temperature: call.temperature ?? 0,
+    ...(call.sessionId ? { sessionId: call.sessionId } : {}),
     // Never ride the ambient proxy for a loopback/faux target.
     env: call.noProxy ? { no_proxy: call.noProxy } : undefined,
   };

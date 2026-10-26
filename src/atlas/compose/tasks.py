@@ -535,17 +535,20 @@ class NormalizeStage(AtlasTask):
         archive: ArchiveStore,
         normalized_dir: Path,
         require_nonempty_text: bool = True,
+        skip_empty_text: bool = False,
     ) -> None:
         super().__init__(versions)
         self._archive = archive
         self._dir = Path(normalized_dir)
         self.require_nonempty_text = require_nonempty_text
+        self.skip_empty_text = skip_empty_text
 
     def run(self, inputs: Snapshot, config: Snapshot) -> Dict[str, Any]:
         items = _upstream_records(inputs, "archive", what="归档记录")
 
         facts: List[Dict[str, Any]] = []
         observed_records: List[Dict[str, Any]] = []
+        failures: List[Dict[str, Any]] = []
         for item in items:
             raw_id = item["raw_id"]
             content = self._archive.get_content(raw_id)
@@ -558,6 +561,14 @@ class NormalizeStage(AtlasTask):
 
             normalized_text = normalize(content)
             if self.require_nonempty_text and not normalized_text.text.strip():
+                if self.skip_empty_text:
+                    failures.append({
+                        "raw_id": raw_id,
+                        "channel_id": item["channel_id"],
+                        "kind": "empty_text",
+                        "reason": f"raw_id={raw_id} 归一化后文本为空；保留原始归档，不向下游传递",
+                    })
+                    continue
                 raise NormalizeStageError(
                     f"raw_id={raw_id} 归一化后文本为空（{len(normalized_text.text)} 字符）；"
                     "空文本无法支撑 feed / 证据锚点，拒绝把它当成成功的归一化产物"
@@ -602,9 +613,18 @@ class NormalizeStage(AtlasTask):
                 }
             )
 
+        if failures and not facts:
+            raise NormalizeStageError(
+                "本轮所有归档归一化后均为空，未得到任何可用正文："
+                + "; ".join(item["reason"] for item in failures)
+            )
+
         identity = {"records": facts}
         observed = {
             "per_record": observed_records,
+            "records_seen": len(items),
+            "normalized": len(facts),
+            "failures": failures,
             "normalized_dir": str(self._dir),
             "normalized_at": _utcnow().isoformat(),
         }

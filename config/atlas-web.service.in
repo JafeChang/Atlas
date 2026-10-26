@@ -1,0 +1,23 @@
+[Unit]
+Description=Atlas information feed and labeling UI
+After=network.target
+RequiresMountsFor=@ATLAS_ROOT@
+
+[Service]
+Type=simple
+WorkingDirectory=@ATLAS_ROOT@
+Environment=PYTHONUNBUFFERED=1
+ExecStart=@ATLAS_ROOT@/.venv-new/bin/python -m atlas.webapp --host 127.0.0.1 --port 8765 --actor me
+Restart=on-failure
+RestartSec=5
+KillSignal=SIGINT
+TimeoutStopSec=15
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=@ATLAS_ROOT@/data @ATLAS_ROOT@/logs
+
+[Install]
+WantedBy=multi-user.target

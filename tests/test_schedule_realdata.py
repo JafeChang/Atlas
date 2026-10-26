@@ -52,13 +52,15 @@ from typing import Dict
 
 import pytest
 
-from atlas.registry import RegistryService, open_store as open_registry
+from atlas.registry import RegistryService
+from atlas.registry import open_store as open_registry
 from atlas.schedule import evaluate_schedule, open_last_collection_source
+from tests._realdata import real_store_root
 
 UTC = timezone.utc
 REPO_ROOT = Path(__file__).resolve().parents[1]
-REAL_DB = REPO_ROOT / "data" / "store" / "atlas.db"
-REAL_STORE_ROOT = REPO_ROOT / "data" / "store"
+REAL_DB = real_store_root() / "atlas.db"
+REAL_STORE_ROOT = real_store_root()
 
 #: 首次实测的注册表分布（2026-09-26）。变了就**响亮失败**，逼操作者重新测量并
 #: 更新本节数字，而不是让陈旧结论悄悄留在测试里（照 `test_search_realdata.py` 的先例）。

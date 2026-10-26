@@ -120,7 +120,7 @@ def _moment(minutes: int):
 
 
 @contextmanager
-def running_frontend(tmp_path: Path) -> Iterator[SimpleNamespace]:
+def running_frontend(tmp_path: Path, *, actor: str = "tester") -> Iterator[SimpleNamespace]:
     """把 fixture 写进临时归档根，再用**真实组合根**装一个前端（`127.0.0.1:0`）。"""
     root = tmp_path / "store"
     archive = open_archive(root)
@@ -137,7 +137,7 @@ def running_frontend(tmp_path: Path) -> Iterator[SimpleNamespace]:
         db_path=db_path,
         industry_provider=lambda: ("ai", "web"),
         industry_of={"chan-feed": "ai", "chan-article": "web"},
-        actor="tester",
+        actor=actor,
         initialize_labels=True,
     )
     try:
@@ -177,6 +177,121 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 def _label_rows(db_path: Path) -> int:
     with open_store(db_path) as store:
         return store.count()
+
+
+def test_probe_labels_do_not_count_as_current_actor_judgments(tmp_path: Path) -> None:
+    with running_frontend(tmp_path) as world:
+        world.app.labels.record(
+            raw_id="raw-feed-render", label_key="industry", label_value="ai",
+            actor="e2e-probe",
+        )
+        status, page, _ = _get(world.app, "/feed?labeled=true")
+        assert status == 200
+        assert 'class="count">共 0 条' in page
+
+        status, _, _ = _post(world.app, {
+            "raw_id": "raw-article-render", "label_key": "valid",
+            "label_value": "valid", "actor": "tester", "return_to": "/feed",
+        })
+        assert status == 303
+        # 同一文档上更晚的其他署名判断不能覆盖当前署名的显示。
+        world.app.labels.record(
+            raw_id="raw-article-render", label_key="valid", label_value="invalid",
+            actor="e2e-probe",
+        )
+        status, page, _ = _get(world.app, "/feed?labeled=true")
+        assert status == 200
+        assert 'class="count">共 1 条' in page
+        assert 'id="item-raw-article-render' in page
+        assert "Gamma Report" not in page
+        with world.app.labels.read_session() as session:
+            assert session.values_for("raw-article-render") == {"valid": "valid"}
+            assert [label.actor for label, _ in session.rates_for("raw-article-render")] == ["tester"]
+        status, page, _ = _get(world.app, "/feed?labeled=false")
+        assert status == 200
+        assert "Gamma Report" in page
+        assert 'id="item-raw-article-render' not in page
+        # 浏览投影不删除或改写探针；无署名筛选的审计入口仍能看到全部记录。
+        from atlas.webui import StoreLabelAccess
+        with StoreLabelAccess(world.db_path).read_session() as session:
+            assert session.values_for("raw-article-render") == {"valid": "invalid"}
+        assert _label_rows(world.db_path) == 3
+
+
+def test_new_feed_collected_after_startup_can_be_browsed_and_labeled(tmp_path: Path) -> None:
+    with running_frontend(tmp_path) as world:
+        # 用另一条归档连接模拟定时采集，而不重启 Web 应用。
+        payload = FEED_TEXT.replace("Gamma Report", "Fresh Scheduled Article").encode("utf-8")
+        record = RawRecord.create(
+            channel_id="chan-feed", endpoint="https://example.test/fresh.xml",
+            content=payload, http_status=200,
+        )
+        with open_archive(world.root) as archive:
+            archive.put(record, payload)
+        status, page, _ = _get(world.app, "/feed?limit=200")
+        assert status == 200
+        assert "Fresh Scheduled Article" in page
+        fields = _span_of(world.app, record.raw_id)
+        fields["actor"] = "tester"
+        status, body, _ = _post(world.app, fields)
+        assert status == 303, body[:400]
+        with open_store(world.db_path) as store:
+            labels = store.all_for(record.raw_id)
+            assert len(labels) == 1
+            assert labels[0].anchor is not None
+            assert labels[0].anchor.char_start == int(fields["char_start"])
+            assert labels[0].anchor.char_end == int(fields["char_end"])
+
+
+def test_empty_rss_and_atom_are_subscription_notices_instead_of_articles(tmp_path: Path) -> None:
+    from atlas.webapp import store_summary
+
+    with running_frontend(tmp_path) as world:
+        samples = (
+            b'<rss version="2.0"><channel><title>No papers today</title></channel></rss>',
+            b'<feed xmlns="http://www.w3.org/2005/Atom"><title>No articles today</title></feed>',
+        )
+        empty_ids = []
+        with open_archive(world.root) as archive:
+            for index, payload in enumerate(samples):
+                record = RawRecord.create(
+                    channel_id=f"empty-source-{index}",
+                    endpoint=f"https://example.test/empty-{index}",
+                    content=payload, http_status=200,
+                )
+                archive.put(record, payload)
+                empty_ids.append(record.raw_id)
+        before = hashlib.sha256(world.db_path.read_bytes()).hexdigest()
+        status, page, _ = _get(world.app, "/feed?limit=200")
+        assert status == 200
+        assert 'class="count">共 4 条' in page
+        assert "本次订阅没有可展示的文章" in page
+        assert "Gamma Report" in page  # 非空订阅仍展示真实文章。
+        for raw_id in empty_ids:
+            assert f'id="item-{raw_id}"' not in page
+        status, documents, _ = _get(world.app, "/feed?granularity=document&limit=200")
+        assert status == 200
+        for raw_id in empty_ids:
+            assert f'id="item-{raw_id}"' in documents
+        summary = store_summary(world.root)
+        assert summary.records == 5
+        assert summary.containers == 4  # 两个原有订阅 + 两个空订阅。
+        assert summary.entries == 4
+        assert hashlib.sha256(world.db_path.read_bytes()).hexdigest() == before
+
+
+def test_unrecognized_xml_remains_visible_for_inspection(tmp_path: Path) -> None:
+    with running_frontend(tmp_path) as world:
+        payload = b'<response><message>Not a subscription</message></response>'
+        record = RawRecord.create(
+            channel_id="unknown-xml", endpoint="https://example.test/unknown.xml",
+            content=payload, http_status=200,
+        )
+        with open_archive(world.root) as archive:
+            archive.put(record, payload)
+        status, page, _ = _get(world.app, "/feed?limit=200")
+        assert status == 200
+        assert f'id="item-{record.raw_id}"' in page
 
 
 # ===================================================================== #
@@ -311,7 +426,7 @@ def _span_of(app, raw_id: str) -> Dict[str, str]:
 # 判据 4 / 7 / 8：条目级打标
 # ===================================================================== #
 def test_entry_level_label_lands_with_anchor(tmp_path: Path) -> None:
-    with running_frontend(tmp_path) as world:
+    with running_frontend(tmp_path, actor="e2e-t109") as world:
         fields = _span_of(world.app, "raw-feed-render")
         assert {"raw_id", "raw_sha256", "char_start", "char_end"} <= set(fields)
         assert "entry_id" not in fields, "entry_id 绝不能进锚点（T-130）"

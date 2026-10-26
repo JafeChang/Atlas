@@ -41,17 +41,20 @@ from atlas.cognition import (
     CognitionConfig,
     DocumentKind,
     LabelSpace,
+    OutcomeCounters,
     PiSidecarCognitionPort,
     ProposalPolicy,
     SkipReason,
     SqliteProposedStore,
+    Unit,
     classify_document,
-    propose_documents,
+    propose_units,
 )
+from tests._realdata import real_store_root
 from tests._t105_criteria import CRITERIA
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-STORE_RAW = REPO_ROOT / "data" / "store" / "raw"
+STORE_RAW = real_store_root() / "raw"
 SIDECAR_DIR = REPO_ROOT / "src" / "atlas" / "cognition" / "sidecar"
 
 #: SPEC §6.3 / T-130 实测的十份 feed（`endpoint` 作键：内容寻址的 raw_id 会变）。
@@ -249,23 +252,36 @@ SAMPLE_FEED_UNITS = 8
 SAMPLE_ARTICLES = 3
 
 
-def _sample_jobs() -> Tuple[List[Tuple[Record, bytes]], List[str]]:
+def _sample_jobs() -> Tuple[List[Tuple[Record, Tuple[Unit, ...]]], List[str]]:
     """有界子集：若干**条目** + 若干**导入文章**（两类输入都被覆盖）。"""
-    jobs: List[Tuple[Record, bytes]] = []
+    jobs: List[Tuple[Record, Tuple[Unit, ...]]] = []
     notes: List[str] = []
     feed = FEEDS[0]
     plan = classify_document(feed.content, raw_id=feed.raw_id, endpoint=feed.endpoint)
-    jobs.append((feed, feed.content))
-    notes.append(f"{feed.channel_id}: {plan.unit_count} 单元")
+    units = plan.units[:SAMPLE_FEED_UNITS]
+    jobs.append((feed, units))
+    notes.append(f"{feed.channel_id}: {len(units)} / {plan.unit_count} 单元")
     articles = [
         record
         for record in RECORDS
         if record.endpoint not in EXPECTED_FEEDS and record.endpoint not in EXPECTED_SKIPS
     ][:SAMPLE_ARTICLES]
     for record in articles:
-        jobs.append((record, record.content))
+        plan = classify_document(record.content, raw_id=record.raw_id, endpoint=record.endpoint)
+        jobs.append((record, plan.units))
         notes.append(f"{record.channel_id}: 1 整篇单元")
     return jobs, notes
+
+
+@requires_real_data
+def test_paid_sample_is_bounded_before_any_model_call() -> None:
+    jobs, _ = _sample_jobs()
+    assert len(jobs) == 1 + SAMPLE_ARTICLES
+    assert len(jobs[0][1]) == SAMPLE_FEED_UNITS
+    assert sum(len(units) for _, units in jobs) == SAMPLE_FEED_UNITS + SAMPLE_ARTICLES
+    for record, units in jobs:
+        assert all(unit.raw_id == record.raw_id for unit in units)
+        assert all(unit.raw_sha256 == hashlib.sha256(record.content).hexdigest() for unit in units)
 
 
 @requires_real_data
@@ -285,26 +301,29 @@ def test_real_pipeline_writes_and_reads_back(tmp_path) -> None:
 
     store = SqliteProposedStore(db_path=tmp_path / "t105.db")
     port = PiSidecarCognitionPort(CognitionConfig.from_env(route="deepseek"))
-    outcome = propose_documents(
-        jobs,
-        label_space=space,
-        port=port,
-        store=store,
-        policy=ProposalPolicy(max_units_per_call=8),
-    )
-    counters = outcome.counters
+    policy = ProposalPolicy(max_units_per_call=4, max_retries=0)
+    outcomes = [
+        propose_units(record.raw_id, units, label_space=space, port=port, store=store, policy=policy)
+        for record, units in jobs
+    ]
+    counters = OutcomeCounters(**{
+        key: sum(getattr(outcome.counters, key) for outcome in outcomes)
+        for key in OutcomeCounters.__dataclass_fields__
+    })
+    batches = [batch for outcome in outcomes for batch in outcome.batches]
+    claims = [claim for outcome in outcomes for claim in outcome.claims]
     print(
-        f"[T-105 真实] 对账：{outcome.summary()}\n"
-        f"[T-105 真实] 调用 {len(outcome.batches)} 次；"
+        f"[T-105 真实] 对账：{counters.as_dict()}\n"
+        f"[T-105 真实] 调用 {len(batches)} 次；"
         f"label_space={space.as_dict()}"
     )
 
     # 真实数字必须来自真实响应（不是零值）
-    assert counters.units_run > 0
+    assert counters.units_run == SAMPLE_FEED_UNITS + SAMPLE_ARTICLES
     assert counters.batches >= 1
     assert counters.input_tokens > 0 and counters.output_tokens > 0
     assert counters.elapsed_ms > 0
-    for batch in outcome.batches:
+    for batch in batches:
         assert batch.tools_declared == 0 and batch.tool_calls == 0
         if batch.status == CallStatus.OK.value:
             assert batch.extracted_claims, "真实模型没有产出任何 claim"
@@ -316,7 +335,7 @@ def test_real_pipeline_writes_and_reads_back(tmp_path) -> None:
 
     # 独立读回（不经过本层的内存对象）
     stored = store.claim_count()
-    assert stored == len(outcome.claims) >= 1
+    assert stored == len(claims) >= 1
     checked = 0
     for row in store.current_for_raw(jobs[0][0].raw_id):
         assert row.code_version and row.config_version and row.model_version
@@ -357,7 +376,7 @@ def test_degradation_on_unreachable_endpoint_is_unclassified_with_reason(tmp_pat
     if not (SIDECAR_DIR / "node_modules").is_dir():
         pytest.skip("边车依赖未安装（需要 npm install）")
 
-    from atlas.cognition import CognitionConfig, propose_units
+    from atlas.cognition import CognitionConfig
 
     # 只取 **2 个短单元**（synced-review feed 的前两个条目）：降级测试不需要长文本，
     # 用它控制成本（每次调用仍要付一次边车启动）。
@@ -419,7 +438,7 @@ def _real_label_space() -> LabelSpace:
     from atlas.registry import RegistryService, SqliteConfigStore
 
     config_store = SqliteConfigStore(
-        author="t105-tests", db_path=REPO_ROOT / "data" / "store" / "atlas.db"
+        author="t105-tests", db_path=real_store_root() / "atlas.db"
     )
     service = RegistryService(config_store)
     space = LabelSpace.of(

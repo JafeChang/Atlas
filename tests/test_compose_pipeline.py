@@ -970,6 +970,38 @@ def test_partial_run_surfaces_channel_failures_in_the_rendered_report(
     assert observed["failures"][0]["reason"] in rendered, rendered
 
 
+@pytest.mark.parametrize("partial,all_empty", [(True, False), (False, False), (True, True)])
+def test_empty_challenge_page_is_reported_without_blocking_other_content(
+    store_root: Path, partial: bool, all_empty: bool,
+) -> None:
+    challenge = b'<html><head><meta http-equiv="refresh" content="0;/.well-known/sgcaptcha/"></head></html>'
+    fetcher = FakeFetcher({
+        PLAIN_ENDPOINT: challenge if all_empty else PLAIN_BODY,
+        HTML_ENDPOINT: challenge,
+    })
+    with _pipeline(
+        store_root, fetcher, on_channel_failure="report" if partial else "fail",
+        max_retries=0,
+    ) as pipeline:
+        if not partial or all_empty:
+            with pytest.raises(TaskFailedError) as exc:
+                pipeline.run()
+            assert "归一化后" in str(exc.value)
+            return
+        report = pipeline.run()
+        assert not report.failed and not report.blocked
+        output = report.result("normalize").output.artifacts
+        assert [row["channel_id"] for row in output["identity"]["records"]] == ["chan-plain"]
+        failure, = output["observed"]["failures"]
+        assert failure["channel_id"] == "chan-html"
+        assert failure["kind"] == "empty_text"
+        assert len(pipeline.archive.all_raw_ids()) == 2
+        assert not (store_root / "normalized" / f"{failure['raw_id']}.txt").exists()
+        rendered = render_report(report)
+        assert "normalized=1 rejected=1" in rendered
+        assert failure["reason"] in rendered
+
+
 # ---------------------------------------------------------------------- #
 # `__all__` 不得写出幽灵名字（真实缺陷的回归测试）
 # ---------------------------------------------------------------------- #

@@ -54,10 +54,11 @@ from atlas.migrate import (
     iter_legacy_files,
 )
 from tests._migrate_fixtures import directory_stats, tree_digest
+from tests._realdata import real_store_root
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 LEGACY_RAW = REPO_ROOT / "data" / "raw"
-STORE_ROOT = REPO_ROOT / "data" / "store"
+STORE_ROOT = real_store_root()
 STORE_DB = STORE_ROOT / "atlas.db"
 
 #: 实测基线（2026-09 快照）。数据变了就**响亮失败**，逼操作者重新测量。

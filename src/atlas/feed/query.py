@@ -440,6 +440,8 @@ class RawEntriesView(Protocol):
     |---|---|
     | `entries` | 这份原文的派生条目；**不是容器**时为空序列 |
     | `text_length` | 解码后原文的字符数（整篇条目的区间靠它定；见 `EntryView`） |
+    | `is_feed`（可选） | 已识别为 RSS/Atom；空序列表示本次无可展示文章，不回落为文章 |
+    | `problems`（可选） | 无文章时保留条目层的诊断，供浏览提示展示 |
 
     为什么必须单独带 `text_length` 而不是从 `entries` 里取：**非容器本来就没有条目**，
     而整篇条目的区间仍然需要"这份原文有多长"。缺了它只能用字节数顶替，
@@ -544,6 +546,7 @@ class FeedResult:
     offset: int
     has_more: bool
     next_offset: int | None
+    notices: Tuple[str, ...] = ()
 
 
 def run_query(
@@ -652,14 +655,23 @@ def _run_entry_query(
     """条目粒度：把筛选后的 Raw 展开成可浏览单元，再排序 / 分页。"""
     assert entries_of is not None  # 由 run_query 保证
     units: list[FeedEntry] = []
+    notices: list[str] = []
     for record in records:
         labels = () if label_lookup is None else tuple(label_lookup(record.raw_id))
         view = entries_of(record)
+        text_length = _require_text_length(record, view)
+        if record.entry_kind == "feed" and getattr(view, "is_feed", False) and not view.entries:
+            reason = "；".join(getattr(view, "problems", ()))
+            notices.append(
+                f"{record.channel_id}：本次订阅没有可展示的文章，已从文章列表略过。"
+                + (f"原因：{reason}" if reason else "")
+            )
+            continue
         units.extend(
             _entry_units(
                 record,
                 tuple(view.entries),
-                text_length=_require_text_length(record, view),
+                text_length=text_length,
                 industry=industries.get(record.raw_id),
                 labels=labels,
             )
@@ -678,6 +690,7 @@ def _run_entry_query(
         offset=query.offset,
         has_more=has_more,
         next_offset=(query.offset + returned) if has_more else None,
+        notices=tuple(notices),
     )
 
 

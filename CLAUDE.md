@@ -80,6 +80,8 @@
 
 ## 环境
 
+**当前 OMV Linux 的运行与验证方式见 `SPEC.md` §6.9。下述 WSL 路径与代理为历史环境记录，不能直接用于当前机器。**
+
 开发在 WSL 内进行（Windows PowerShell 无法执行项目 venv）。**WSL 是镜像网络模式**，外网必须走宿主代理：
 
 ```bash

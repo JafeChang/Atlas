@@ -31,6 +31,7 @@ from atlas.cognition import (  # noqa: E402
     DS_BASE_URL,
     DS_MODEL,
     DS_ROUTE,
+    GO_ROUTE,
     OA_ROUTE,
     PROMPT_VERSION,
     CognitionConfig,
@@ -257,9 +258,9 @@ def test_deepseek_base_url_implies_the_deepseek_key_variable() -> None:
     assert other.api_key_env == "ATLAS_OPENAI_API_KEY"
 
 
-def test_available_routes_reports_both_without_secrets() -> None:
+def test_available_routes_reports_all_without_secrets() -> None:
     table = available_routes()
-    assert set(table) == {DS_ROUTE, OA_ROUTE}
+    assert set(table) == {DS_ROUTE, OA_ROUTE, GO_ROUTE}
     for name, entry in table.items():
         assert set(entry) >= {"provider", "model", "base_url", "api_key_env", "credential_available"}
         assert "api_key" not in entry

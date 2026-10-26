@@ -24,7 +24,7 @@ import pytest
 
 from atlas.cognition import (
     DS_ROUTE,
-    OA_ROUTE,
+    ROUTES,
     CognitionConfig,
     PiSidecarCognitionPort,
     available_routes,
@@ -69,7 +69,7 @@ def route_credential_available(route: str) -> bool:
 
 
 def live_routes() -> List[str]:
-    return [route for route in (DS_ROUTE, OA_ROUTE) if route_credential_available(route)]
+    return [route for route in ROUTES if route_credential_available(route)]
 
 
 def require_live_route(route: str) -> None:
@@ -126,6 +126,7 @@ class MockModel:
 
     def __init__(self) -> None:
         self.requests: List[Dict[str, Any]] = []
+        self.request_headers: List[Dict[str, str]] = []
         self.script: List[Any] = []
         self.default_content = '{"schema_version": "cognition-output/1", "claims": []}'
         self._lock = threading.Lock()
@@ -210,6 +211,7 @@ class _Handler(BaseHTTPRequestHandler):
         except ValueError:
             payload = {"_raw": raw.decode("utf-8", errors="replace")}
         mock: MockModel = self.server.mock  # type: ignore[attr-defined]
+        mock.request_headers.append({key.lower(): value for key, value in self.headers.items()})
         status, body = mock.next_response(payload)
 
         if status == 200 and payload.get("stream"):

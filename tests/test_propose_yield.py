@@ -136,6 +136,8 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from tests._realdata import real_store_root
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 sys.path.insert(0, str(REPO_ROOT))
@@ -145,6 +147,7 @@ import pytest  # noqa: E402
 from atlas.cognition import (  # noqa: E402
     BATCH_MAX_CHARS,
     BATCH_MAX_UNITS,
+    DEFAULT_TIMEOUT_SECONDS,
     UNIT_TEXT_MAX_CHARS,
     CallStatus,
     CognitionCallRecord,
@@ -153,7 +156,6 @@ from atlas.cognition import (  # noqa: E402
     CognitionRequest,
     CognitionResult,
     CognitionUsage,
-    DEFAULT_TIMEOUT_SECONDS,
     DegradeReason,
     ExtractedClaim,
     LabelSpace,
@@ -557,8 +559,8 @@ def test_configured_output_budget_reaches_the_http_request_body() -> None:
 # 判据 Y6：只读快照可重复（缺真实数据时自跳过）
 # =========================================================================== #
 
-REAL_DB = REPO_ROOT / "data" / "store" / "atlas.db"
-STORE_RAW = REPO_ROOT / "data" / "store" / "raw"
+REAL_DB = real_store_root() / "atlas.db"
+STORE_RAW = real_store_root() / "raw"
 
 requires_real_data = pytest.mark.skipif(
     not (REAL_DB.is_file() and STORE_RAW.is_dir()),

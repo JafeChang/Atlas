@@ -1,7 +1,7 @@
 ---
-version: "0.4.1"
+version: "0.4.5"
 last_updated: "2026-10-26"
-status: "L1 已落地并端到端复核；真实人工标签已有 2 条（2026-10-26 首批），标签空间已扩到 8 个行业；剩余：标注量不足以触发 T-112/T-202 + 三处显式决策项（§2.10 / §2.17 / §5 #10）"
+status: "L1 已落地并端到端复核；OMV 的 Web 常驻服务与 cron 采集已恢复（2026-10-26，见 §6.9）；真实人工标签 2 条，标签空间 8 个行业；剩余：标注量不足以触发 T-112/T-202 + 三处显式决策项（§2.10 / §2.17 / §5 #10）"
 baseline: "archive/growth-baseline-2026-09-25 @ f8231bd"
 branch: "rebaseline"
 document_type: "mutable"
@@ -18,7 +18,7 @@ document_type: "mutable"
 
 | 项 | 值 |
 |---|---|
-| 版本 | 0.4.1 |
+| 版本 | 0.4.5 |
 | 日期 | 2026-10-26 |
 | 归档基线 | `archive/growth-baseline-2026-09-25` → `f8231bd` |
 | 工作分支 | `rebaseline` |
@@ -1809,12 +1809,11 @@ T-131 导入的是**旧系统当年按篇存下来的东西**，所以进来就�
 - UI 复核：重启后启动横幅 `行业 8 个`；`/feed?limit=3` 每个条目下拉含 8 个选项；
   用户的 2 条 `valid=invalid` 仍显示为"已打标"。
 
-> ⚠️ **一个仍未处理的 UI 事实**：`已打标` 快捷筛选现在会返回 **22 条**，其中 **20 条**来自
+> **历史 UI 问题（已于 §6.9 修复）**：`已打标` 快捷筛选曾返回 **22 条**，其中 **20 条**来自
 > 2026-09-26 的两条**探针**（`e2e-verify` 给 `raw_0a57b660…` 标的 `industry=machine-learning`；
 > `e2e-t109` 给 `raw_15094c8d…` 标的同名标签）。它们锚在**容器 feed** 上，因此其派生的
 > 10 + 10 个条目全部显示"已打标"。界面目前**不区分 actor**；用户看到的是探针标签，
-> 不是自己打的。`confirmed_labels` 是 append-only，探针删不掉——可选的处理是
-> **在 UI 上显示 actor** 或**只显示 `actor=me`**，属显式决策，未登记为任务。
+> 不是自己打的。现采用**按启动时的 actor 展示和筛选标签**，默认 `me`；探针与审计记录完整保留。
 
 **T-112 / T-202 仍不触发**：2 条标签远达不到"数量多了"。但 §1.3 所要求的第一步
 （"真的去打标"）**已经发生**，这是本项目从"能打标"到"有人打标"的转折点。
@@ -2013,6 +2012,189 @@ append-only 触发器删掉后，它会以 `DID NOT RAISE DatabaseError` **失�
 > 旧版与新版**各 10 次全部 PASS** ⇒ 这个控制**不能**证明"旧判据会失败"。
 > 能证明 flake 机制的是上面的端口复用探针（400/400 的 bind 覆盖），不是它。
 > 记在这里，是因为**一个不会失败的控制，和一个不会失败的测试一样没有价值**（§6.6 第 4 条）。
+
+---
+
+### 6.9 OMV 运行恢复与首次持续采集（2026-10-26）
+
+用户在本轮进度复核后授权恢复运行、解决探针标签干扰，并启用定时采集。
+当前机器为 OMV Linux；下述命令替代 §8 与 `CLAUDE.md` 中历史 WSL 路径。
+
+**运行环境与部署**
+
+- Python **3.13.5**，环境为 `.venv-new`，按现有锁文件恢复，无新增第三方依赖：
+  `UV_PROJECT_ENVIRONMENT=.venv-new uv sync --frozen --python /usr/bin/python3.13`。
+- 认知边车在 `src/atlas/cognition/sidecar` 执行 `npm ci --no-audit --no-fund` 恢复。
+  本轮**未调用付费模型**；定时任务显式关闭机器分类。
+- `atlas-web.service` 已安装并设为开机自启，监听 **127.0.0.1:8765**，署名 `me`。
+  仓库模板为 `config/atlas-web.service.in`，部署时把 `@ATLAS_ROOT@` 替换为项目绝对路径，
+  写入 `/etc/systemd/system/atlas-web.service`，再 `systemctl daemon-reload` / `enable --now`。
+- 随后用户明确要求绑定 **`atlas.sharany.com`**。已复用本机现有 Cloudflare Tunnel
+  `e7a2474a-87e3-40fc-8f2f-a0c2a014eda4`，在 `/etc/cloudflared/config.yml` 增加
+  `atlas.sharany.com → http://127.0.0.1:8765`，并创建指向该隧道的 DNS CNAME。
+  ingress 校验与 hostname 匹配通过，重启 `cloudflared.service` 后四条连接注册成功。
+  HTTPS 外网请求先跳转到**现有 Cloudflare Access 登录页**；该结果验证的是边缘访问入口，
+  并非未登录即可读取应用。原站 `/health` 已独立验证 HTTP 200 / `service=atlas-webui`。
+  配置备份：`.tmp_atlas/cloudflared-20261026T013313Z/config.yml.before`。
+- `/etc/cron.d/atlas` 每 **5 分钟**调用 `scripts/collect-due.sh`，只采到期渠道。
+  真实采集开关只在机器的 cron 中显式开启；cron 同时携带本机可用的网络代理设置。
+  脚本用 `flock` 避免重叠，外层 `timeout` 限制单轮 20 分钟。
+- Web 日志：`journalctl -u atlas-web.service`；采集日志：`logs/compose-run.log`。
+  `/etc/logrotate.d/atlas` 已配置压缩轮转。
+
+**两项运行接线修正**
+
+1. **标签投影按当前署名过滤**：生产装配把 `actor` 注入 `StoreLabelAccess`，
+   标签键、最新取值、条目详情、已打标/未打标筛选使用相同范围，页面显示当前署名。
+   默认署名 `me`，实测已打标从 22 条变为 **2 条**。
+   这只是浏览投影，**不是鉴权**；无署名限制的审计入口与全部 4 行历史标签保留。
+2. **在线采集不要求重启 Web**：不再在启动时冻结 raw 清单与容器类别；
+   新 raw 的存在与条目化按需读取，单份不可变 raw 的类别仍可缓存。
+   回归测试用另一条归档连接追加 feed，随后在原 Web 实例上浏览并提交带锚点的标签。
+
+**首轮真实数据与部分失败的边界**
+
+- 首轮采集收到 **10/13** 个渠道的响应，归档从 **75 → 84**（同内容归档自然复用）。
+  3 个渠道明确失败：`ai-techpark` 的 robots.txt 为 403、`openai-blog` 为 HTTP 403、
+  `venturebeat-ai` 为 HTTP 429；未尝试绕过限制。
+- `ai-news-blog` 虽返回 HTTP 202，实际是验证码跳转 HTML，归一化后为空。
+  原严格模式因此让整条链路停在 normalize；原始响应已正确归档。
+- **本轮明确扩展 `--allow-partial`**：除渠道采集失败外，允许把**空正文**逐条记入
+  `normalize.observed.failures`（`kind=empty_text`，含 channel/raw/reason），
+  不为其写归一化缓存、不传给下游，其余可用正文继续。
+  **默认严格模式不变；整轮全部空正文仍失败；指纹与偏移不变量错误仍立即失败。**
+- 使用同一窗口的已持久化采集/归档产物恢复后，链路退出码 **0**：
+  normalize **10 输入 / 9 可用 / 1 明确拒绝**，没有失败或阻塞的任务节点。
+  这是**部分渠道可用**，不是“13 个渠道全部采集成功”。恢复日志为 `logs/compose-recovery.log`。
+- Web 未重启（同一 PID），可浏览条目从 **897 → 933**；`/health`、feed、已打标筛选均 HTTP 200。
+  人工标签仍 4 行（真实 2 + 探针 2），机器提议 1379、运行账 895、证据锚点 1268 均未增长。
+
+**真实回归测试与在线事实分开取数**
+
+历史回归里的 75 份原文 / 830 个派生条目是**固定语料的期望值**，不应约束持续增长的在线库。
+`tests._realdata.real_store_root()` 现在默认读取 **`data/test-baseline/store`**：
+它是启用采集前保存的完整真实快照，不含本轮新采集数据，仍不进 git。
+可用 `ATLAS_TEST_STORE_ROOT` 指向同一基线的其它完整副本；缺失时真实数据测试自跳过。
+迁移机器时需同时保留这份快照，不能拿已增长的在线库直接替换固定语料。
+在线新增内容的可浏览、可打标行为由使用临时归档与真实 HTTP 的联调测试独立验证。
+
+最终门禁：`ATLAS_COGNITION_LIVE_TESTS=0 .venv-new/bin/python -m pytest tests -ra`，
+**1708 passed / 6 skipped，158.93 s，退出码 0**；6 条跳过均为默认关闭的付费模型调用。
+此外已验证采集入口的显式开启门禁、重叠任务跳过，以及 systemd 单元语法与启动状态。
+**09:30 的 cron 已实际触发并跑通**：本轮 6 个到期渠道，3 个采集成功、3 个明确失败，
+3 份归档均有可用正文，7 个任务节点成功，无失败或阻塞节点。
+
+本轮采集前的完整可恢复备份位于 `.tmp_atlas/before-runtime-20261026T011757Z/`，
+内有 `store/` 与记录表计数、库摘要、全部人工标签的 `manifest.json`。
+停止运行可执行 `systemctl disable --now atlas-web.service`，再移除 `/etc/cron.d/atlas`。
+代码回退不需要回滚数据：本轮未新增物理表，原文与人工记录保持 append-only。
+
+---
+
+### 6.10 手机浏览反馈：空订阅与归档信息展示（2026-10-26）
+
+用户的手机截图暴露了两项实际问题：没有文章的 arXiv RSS 被当成整篇文章；
+默认卡片展示 raw id、字符区间、HTTP 状态与指纹，挤占了标题和打标操作。
+
+- **修正容器判据**：内容已识别为 RSS/Atom 即为订阅容器，是否有条目是另一件事。
+  `RawEntriesView` 可选的 `is_feed` / `problems` 区分“已确认是订阅，但没有可展示文章”
+  与“没有解析结论”。前者不生成整篇文章卡片，原因进入 `FeedResult.notices`，
+  页面可在“订阅与浏览提示”中展开查看；原始归档在文档粒度仍可查询。
+  未识别的 XML 与既有无判形信息的调用方继续显示原文，不静默隐藏解析失败。
+  既有 JSON HTTP 响应形状不变，本轮未增加 JSON 文章解析器。
+- **移动端卡片**：默认展示标题、来源、日期、行业与打标操作；归档区间、指纹、
+  raw id、完整时间戳和原文链接仍保留在原生 `details` 中。
+  行业修正与筛选器也可展开，标签状态切换显示当前选中项。
+- 按钮与表单控件使用 16px 字号和至少 44px 高度，支持键盘焦点、深色模式，
+  不增加前端框架、构建步骤或第三方依赖。
+- **回归**：新增 RSS / Atom 空订阅及未知 XML 的真实 HTTP 测试，验证正文条目正常、
+  空订阅有提示且不冒充文章、原文在文档视图保留、浏览前后库摘要相同。
+  完整测试 **1710 passed / 6 skipped，159.98 s，退出码 0**；跳过项仍为付费模型调用。
+- **浏览器验证**：Chromium 实测 375px 手机、812px 横屏、1366px 桌面及手机深色模式，
+  均无横向溢出；展开归档、行业修正与筛选器后仍无溢出。
+  截图和测量脚本保存在 `.tmp_atlas/mobile-review/`，不是新的进度文档。
+
+---
+
+### 6.11 付费模型调用调试（2026-10-26）
+
+用户明确授权调试此前默认跳过的真实付费调用。本轮先检查配置与 Node 边车，
+再分别验证两条路由，以及使用当前 8 个行业标签的有界分类样本。
+
+| 直接调用 | 请求模型 | 端到端耗时 | input / output | 结果 |
+|---|---|---|---|---|
+| DeepSeek 官方 | `deepseek-flash` | 4315 ms | 375 / 624 | OK，3 条提议，3/3 引文逐字存在 |
+| OpenRouter 兼容路由 | `deepseek/deepseek-v4-flash` | 5795 ms | 428 / 473 | OK，3 条提议，3/3 引文逐字存在 |
+
+两条路由均声明零工具、调用零工具。调用记录未提供可核对的实付金额，因此登记 token
+与耗时，不将它们换算成账单；`response_model` 未报告，表中登记的是请求模型。
+
+**本轮发现并修复测试的费用边界错误**：`SAMPLE_FEED_UNITS=8` 原先只声明了常量，
+`_sample_jobs()` 实际传的是整份 feed 字节，之后会再次展开全部条目。
+现在先从原文建立分类单元，再明确截取 **8 个 feed 单元 + 3 篇文章 = 11 个单元**，
+保留每个单元原始指纹与锚点。测试按批次上限 4、重试 0 执行，新增不付费的样本边界断言。
+
+**真实分类结果**：11 个单元全部有分类产出，7 次请求全部成功、无降级或重试；
+23 条提议均可归属，引文逐字匹配所在单元。独立重开临时库读到 23 行 classified 与
+11 行运行账。input **6436**、output **8436**（其中 reasoning **7086**），合计 **14872**
+token；模型调用累计 **54682 ms**，整条测试 **60.75 s**。这是样本产出率，不是人工评估的准确率。
+
+验证命令与结果：
+
+- `ATLAS_COGNITION_LIVE_TESTS=1 .venv-new/bin/python -m pytest tests/test_cognition_real_call.py -k criterion -ra -s`
+  → **5 passed**，17.08 s。
+- 同一环境下运行 `tests/test_classify_realdata.py::test_real_pipeline_writes_and_reads_back`
+  → **1 passed**，60.75 s。
+- 关闭 live 开关后，两个相关测试文件 → **8 passed / 6 skipped**，0.72 s；
+  付费调用仍需显式开启，默认门禁保持有效。
+
+证据保存于 `.tmp_atlas/paid-debug/`，分类数据库仅写入其 `pytest-live/` 临时目录。
+正式库核对：人工标签 **4**、机器提议 **1379**、运行账 **895**、证据锚点 **1268**，
+均与调试前一致。本轮没有触发整库重分类或改变定时任务的模型开关。
+
+---
+
+### 6.12 OpenCode Go 路由与正式库处理前盘点（2026-10-26）
+
+用户询问正式库处理方式后，盘点得到 **86 份 raw / 925 个可分类单元**：
+旧标签空间已分类 **845**、未分类 **50**，新入库尚未分类 **30**。
+已用 SQLite backup 保存一致性备份于 `.tmp_atlas/before-production-classify-20261026T022838Z/`，
+另存全部人工标签与表计数、增量 80 单元的计划。
+用户随后指定“先把 opencode go 加上，key 可以找 Hermes 的”，因此先完成本节接入。
+正式库处理范围（补 80 个单元或全量重跑 925 个）尚未选定，本轮未进行正式库分类写入。
+
+**独立路由**：`ATLAS_COGNITION_ROUTE=opencode-go`，provider `opencode-go`。
+
+| 配置 | 默认 / 来源 |
+|---|---|
+| 凭据 | `OPENCODE_GO_API_KEY`，按用户指令从 Hermes `.env` 一次性导入 Atlas `.env.local` |
+| 模型 | `glm-5.3-flash`，可用 `OPENCODE_GO_MODEL` 覆盖 |
+| API 根 | `https://opencode.ai/inference/go/openai/v1`，可用 `OPENCODE_GO_BASE_URL` 覆盖 |
+| 客户端标识 | `User-Agent: Atlas/0.1` |
+| 会话标识 | `x-opencode-session: atlas-<raw_id 的 SHA256 前 32 位>`，同一原文的批次保持一致 |
+
+端点与请求头依据 [OpenCode Go 官方文档](https://opencode.ai/v2/docs/console/go)，
+并通过实际模型列表接口及真实调用核验。Atlas 使用自己的客户端标识。
+运行时只读自己的配置，不依赖或扫描 Hermes 凭据目录；本地 `.env.local` 权限 **0600**，
+已确认被 git 忽略。三条路由各用独立凭据，不覆盖 OpenRouter 的配置。
+默认路由保持 DeepSeek，切换需显式指定上述环境变量。
+
+**实测**：Go 的 `glm-5.3-flash` 返回结构化 OK，端到端 **3159 ms**（模型侧 **3011 ms**），
+input **353** / output **136**（reasoning **67**）/ total **489** token，
+1 条提议的引文逐字存在于原文，声明与调用工具均为 0。
+随后单独开启 Go 真实测试 → **1 passed，2.77 s**。
+本机 HTTP 对照测试确认 Go 凭据、Atlas 客户端头与稳定会话头真正到达服务端，
+且相同 raw 的不同批次会话相同、不同 raw 的会话不同。
+
+完整默认门禁 → **1716 passed / 7 skipped，160.64 s，退出码 0**。
+7 条付费测试仍由 live 开关控制；本节 Go 真实测试另行显式运行并通过。
+测量结果保存在 `.tmp_atlas/paid-debug/opencode-go.json` 与同目录的 live 测试日志。
+
+单独验证 Go 可运行：
+
+```bash
+.venv-new/bin/python tools/t003_real_call.py --route opencode-go --json
+```
 
 ---
 

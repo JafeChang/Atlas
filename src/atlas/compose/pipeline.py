@@ -717,6 +717,7 @@ class Pipeline:
                         archive=self.archive,
                         normalized_dir=self.config.normalized_dir,
                         require_nonempty_text=self.config.require_nonempty_text,
+                        skip_empty_text=self.config.on_channel_failure == "report",
                     ),
                     (NODE_ARCHIVE,),
                 ),
