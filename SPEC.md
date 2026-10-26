@@ -1,0 +1,2804 @@
+---
+version: "0.4.16"
+last_updated: "2026-10-26"
+status: "L1 已落地并端到端复核；OMV Web 与 cron 采集运行中；正式库已用 DeepSeek V4.1 Flash 全量重跑（1529 单元，1474 已分类 / 55 未分类，见 §6.16），人工标签完整保留，标签空间 8 个行业；剩余：标注量不足以触发 T-112/T-202 + 三处显式决策项（§2.10 / §2.17 / §5 #10）"
+baseline: "archive/growth-baseline-2026-09-25 @ f8231bd"
+branch: "rebaseline"
+document_type: "mutable"
+---
+
+# Atlas 规格（Rebaseline）
+
+> 本文件是目标重新梳理后的**单一事实来源**。与仓库内其它文档冲突时，以本文件为准。
+> 旧的 `docs/` 文档体系（49 篇、多处互相矛盾的进度、29 个失效链接）**不作为依据**。
+
+---
+
+## 0. 元信息
+
+| 项 | 值 |
+|---|---|
+| 版本 | 0.4.16 |
+| 日期 | 2026-10-26 |
+| 归档基线 | `archive/growth-baseline-2026-09-25` → `f8231bd` |
+| 工作分支 | `rebaseline` |
+| 依据 | A1–A2 / B3–B7 / C8–C9 / D10 目标澄清 + 同类工程 prior art 调研 |
+
+---
+
+## 1. 项目定位
+
+### 1.1 一句话定义
+
+Atlas 是一个**个人信息聚合分析服务**：持续采集不同行业与领域的时效信息、科研进展与新闻，归档分类并支持人工打标，最终为"判断什么信息有效"提供依据。
+
+### 1.2 目的
+
+获取**不定行业、领域**的时效信息、科研进展、新闻消息。
+
+### 1.3 明确的留白（重要）
+
+> "什么信息是有效的"**目前无法表达清楚**，因此系统**不预设答案**。
+
+策略：先把所有收集到的信息分门别类归档 → 人工打标 → **等数量多了之后，由标注数据反向回答这个问题**。
+
+这是设计上的有意留白，不是待办事项。禁止在此之前硬编码"有效性"规则。
+
+### 1.4 成功信号（首期唯一验收开关）
+
+> **可以在多个渠道、多个领域给收集到的信息打标。**
+
+达不到这一条，其余能力一律不算数。
+
+### 1.5 交付形态
+
+| 项 | 结论 |
+|---|---|
+| 运行形态 | 永不停歇的在线服务 |
+| 使用者 | 我，以及我允许的人 |
+| 使用频率 | 约每天一次 |
+| 形态 | **可筛选、可排序的 feed 流**（明确**不做**定期报告） |
+
+---
+
+## 2. 已定契约（变更需显式提出并记录）
+
+### 2.1 打标锚点 = 1A 仅文档级
+
+- 人工标签锚定在 `raw_id` 上。
+- **已接受的后果**：若将来要表达"这篇第 3 段才有效"，必须重新人工标注一遍。
+- **缓解**：2C 的锚点机制已就位，升级到句级**不需要任何 schema 迁移**，只付出人工重标成本。这是一次"安全的延后"。
+
+**✅ 这条"缓解"已被实测证实（2026-09-26，主代理在真实 store 上核验）**
+
+上面那句"2C 的锚点机制已就位"原本是个**断言**。它现在有证据了——
+`data/store/atlas.db` 的 `confirmed_labels` 表**已经带完整的 2C 锚点**，而且约束写得很严：
+
+```sql
+anchor_raw_id TEXT, anchor_raw_sha256 TEXT,
+anchor_char_start INTEGER, anchor_char_end INTEGER,
+-- 锚点必须与标签锚在**同一份原文**上，否则依附对象就有两个（文档级 vs 句级）
+CHECK (anchor_raw_id IS NULL OR anchor_raw_id = raw_id),
+-- 人工直判不带证据(1A) → 锚点整体可空；要带就必须带全，不允许"半截锚点"
+CHECK ((anchor_raw_id IS NULL AND anchor_raw_sha256 IS NULL
+        AND anchor_char_start IS NULL AND anchor_char_end IS NULL)
+       OR (anchor_raw_id IS NOT NULL AND ... AND anchor_char_end > anchor_char_start))
+```
+
+`src/atlas/labels/sqlite_store.py` 确实在读写这四列（10+ 处引用），不是建了空列。
+现有那条标签的四个锚点列是 `NULL`，因为它是**人工直判（1A）**——正合上面第二个 CHECK 的语义。
+
+> **对 §6.3 裁决 B（条目化）的直接意义**：**条目级打标不需要任何 schema 迁移**，
+> §2.1 说的"安全延后"是**字面成立**的。
+> 需要补的只有两处：① 内存契约 `ConfirmedLabel`（`contracts/states.py`）目前**不暴露**锚点，
+> 需让它能携带 `(raw_id, sha256, char_start, char_end)`；② T-106 / T-109 把条目而不是 feed 摆到台前。
+> 存储层与约束**都不用动**。
+
+> ⚠️ 注意：`ConfirmedLabel` 的内存契约**比存储层窄**（少了锚点）——这正是 §2.13 裁决过的
+> "存储层可严于契约，单向"那条。现在要把这个单向差补平，因为条目化需要它。
+
+### 2.2 证据锚点 = 2C 字符区间为真值 + 块 ID 为派生
+
+```yaml
+真值（不可变）: { raw_id, raw_sha256, char_start, char_end }
+派生（可重算）: block_id / 页码 / 归一化文本区间
+```
+
+**关键分工**：PI 只输出 **quote（引用的文字）**，**不输出坐标**。系统在归一化文本层做确定性匹配得到字符区间；匹配失败标记为"**未验证**"，**不得写入 Confirmed**。
+
+这让位置永远由确定性解析算出，符合"不让 LLM 成为黑箱裁判"。
+
+**关于实体来源的精确表述（实现中发现的必要澄清）**
+
+若某段文字的来源是 HTML 实体（如 `&mdash;` → `—`、`&lt;` → `<`），
+原文切片是**实体的字面量**（`&mdash;`），而不是解码后的字符。因此：
+
+> 判据必须表述为「**原文切片经实体解码后**包含该区间的首尾非空白字符」，
+> 而不是「原文切片包含该字符」——后者在实体场景下**不可能成立**。
+
+普通字符仍要求逐字符精确映射（`raw[to_raw_offset(i)] == text[i]`）。
+
+### 2.3 四条不变量
+
+| 层 | 规则 | 说明 |
+|---|---|---|
+| Raw | **只增不改** | 写入即不可变；重复抓取产生新版本而非覆盖 |
+| 归一化 | **可重建** | raw 的纯函数；换解析器可全量重算 |
+| Proposed | **可覆写** | 机器产出，随时可被新版本取代 |
+| Confirmed | **只增不改** | 人工产出，不可重建，必须备份与可导出 |
+
+### 2.4 去重约束
+
+> **去重只做"隐藏/标注"，永不"合并"条目身份。**
+
+因为**全部**人工标签都锚在 `raw_id` 上，一旦合并改变条目身份，打标数据就会漂移。若将来确需合并，规则必须是"新对象引用旧对象，人工标签永不迁移"。
+
+### 2.5 C8 闭环（配置化加行业的心脏）
+
+```
+前端配的行业  =  AI 分类的标签空间  =  feed 的筛选维度  =  打标时的修正对象
+```
+
+四者**必须引用同一份配置**。做不到这一点，"配置化"就会退化成一堆硬编码枚举。
+
+主题本体的种子取自现成分类（如 `config/sources.yaml` 已在使用的 arXiv 分类 `cs.LG` / `cs.CV` / `cs.CL` / `stat.ML`），不自行发明。
+
+**闭环的落地方式（已端到端验证）**
+
+`atlas.feed` **刻意不 import** `atlas.registry`（解耦，见 §4.0）。闭环因此由**组合根**注入完成：
+
+```python
+industry_map = {c.id: c.industry_id for c in registry_service.list_channels()}
+source = archive_source_factory(root, industry_of=lambda cid: industry_map.get(cid))()
+run_query(source, FeedQuery(industries=("ai",)))
+```
+
+主代理独立验证（两个行业各一条渠道）：注入后 `industries == ['ai','semis']`；
+按 `industries=("ai",)` 筛选得 **1** 条、按不存在的行业筛选得 **0** 条。
+
+> ⚠️ 若组合根**忘记注入** `industry_of`，feed 里 `industry` 会是 `None`、按行业筛选会静默返回全空——**能跑，但闭环断开**。这正是需要端到端断言（而非单包测试）才能发现的缝隙。
+
+### 2.6 C8 的准确边界
+
+| 情形 | 需要写代码？ |
+|---|---|
+| 新增 RSS / Atom 源 | ❌ 只配置 |
+| 新增 JSON API 源 | ❌ 只配置 |
+| 新增无 feed 网页（XPath / CSS 选择器） | ❌ 只配置 |
+| 新增**协议类型**（需登录、需 JS 渲染、SOAP、私有 SDK） | ✅ 写一个 **adapter 插件**，但**核心不改** |
+
+准确表述：**新增已知类型的渠道零代码；新增协议类型只加插件、不改核心。**
+
+### 2.7 "把所有能想到的都做了"的判据
+
+| 层 | 开发期是否做全 | 理由 |
+|---|---|---|
+| **能力层**（适配器类型、抓取参数、校验规则、筛选与打标维度） | ✅ **做全** | 有限、可穷举、成本可控；是"零代码扩展"的前提 |
+| **目录层**（渠道库、行业/主题预设） | ⚠️ **做"种子 + 聚合管道"，不做全集** | 目录是**聚合 + 验证 + 分类**出来的，不是想出来的 |
+| **本体层**（行业→主题→标签层级） | ❌ **不做全** | 见 §1.3；本体必须由标注数据反向生长 |
+
+**"做全"的对象是能力与管道，不是内容与本体。**
+
+### 2.8 目录会腐烂
+
+信息源会失效。目录**没有"完成"状态，只有持续保鲜**。因此"聚合去死链 + 定期健康检查"是常驻能力（T-111），不是一次性工作。
+
+---
+
+### 2.9 C8 外部契约（前端可配置项）
+
+**目的**：新增行业/渠道**不改代码**。契约一旦确定，前端与后端可并行开发。
+
+**三层结构**
+
+```
+行业 Industry ──1:N──> 渠道 Channel ──1:N──> 抓取方式 FetchSpec
+                            └── 采集策略（interval / rate_limit / user_agent）
+```
+
+**行业 Industry**
+
+| 字段 | 必填 | 说明 |
+|---|---|---|
+| `id` | ✅ | 稳定标识（小写短横线）；**一旦被标签引用即不可改** |
+| `name` | ✅ | 显示名 |
+| `keywords` | | 分类与检索辅助词 |
+| `parent_id` | | 允许层级；空为顶层行业 |
+| `enabled` | ✅ | 停用后不再采集，历史数据保留 |
+
+**渠道 Channel**
+
+| 字段 | 必填 | 说明 |
+|---|---|---|
+| `id` | ✅ | 稳定标识 |
+| `industry_id` | ✅ | 必须指向已存在的行业 |
+| `type` | ✅ | 抓取方式（枚举见下） |
+| `endpoint` | ✅ | URL |
+| `fetch_spec` | ✅ | 随 `type` 变化的参数（选择器 / 字段路径） |
+| `interval_seconds` | ✅ | 采集间隔，带下限保护 |
+| `rate_limit_seconds` | | 同域最小间隔 |
+| `user_agent` | | 引用 UA 选项名；**默认禁止浏览器伪装**（合规底线，见 §7.1 准则）；如需例外必须显式记录理由 |
+| `enabled` | ✅ | |
+| `tags` | | 自由标签 |
+
+**抓取方式枚举与扩展边界（落实 §2.6）**
+
+| `type` | 零代码 | `fetch_spec` 内容 |
+|---|---|---|
+| `rss` / `atom` | ✅ | 无 |
+| `json_api` | ✅ | 字段路径映射 |
+| `html_xpath` | ✅ | 列表 / 标题 / 正文 / 时间的选择器 |
+| 其他协议 | ❌ | 新增 adapter 插件；**核心不改** |
+
+**校验规则（必须实现）**
+
+> 非法配置必须在**保存时拒绝**，不得静默降级——归档基线的 `except` 掩盖错误模式在此处同样禁止。
+
+1. `id` 唯一且符合格式；被已存在标签引用的 `id` 不得修改或删除
+2. `industry_id` 必须存在
+3. `type` 必须在枚举内
+4. `fetch_spec` 必须满足该 `type` 的必填项
+5. `interval_seconds` / `rate_limit_seconds` 不得低于下限
+6. `endpoint` 必须是合法 `http(s)` URL
+
+**版本化与回滚**
+
+- 每次配置变更产生新版本（含作者、时间、diff），支持回滚到任一历史版本
+- **采集任务必须记录其使用的配置版本**（对应 §3 的 `config_version`）
+
+**目录交换**
+
+- 支持 **OPML 导入导出**（渠道列表），使目录可与外部清单复用（依据 prior art：`awesome-rsshub-routes` / `awesome-rss-feeds` 均以 OPML 分发）
+- 导入必须走**同一套校验**，不得有旁路
+
+**闭环约束（§2.5 的落地）**
+
+```
+行业配置  =  AI 分类的标签空间  =  feed 的筛选维度  =  人工打标的修正对象
+```
+
+- **禁止**在代码中硬编码任何行业枚举
+- AI 分类的候选标签集合必须从当前启用的行业配置读取
+
+---
+
+### 2.10 存储层（延后登记 #1 的落地）
+
+**决策**：文件系统（不可变原文 + 可重建派生物）+ **标准库 `sqlite3`**（元数据、Proposed、Confirmed、FTS5 索引）。
+
+**不引入 SQLAlchemy，也不引入任何 ORM。**
+
+**理由**
+
+1. 准则要求"能标准库解决，不引入第三方"——`sqlite3` + `json` 已足够
+2. SQLite 内置 **FTS5** → T-205 检索同样零新依赖
+3. **零新依赖 ⇒ 不受当前 WSL 无外网的限制**（见 §8.5）
+4. 可用 SQL 约束 / 触发器**在存储层强制不变量**（Confirmed 禁改），与 §2.3 一致
+5. 可迁移：原文是文件、元数据可导出 JSON，将来迁 PostgreSQL **不需要重写数据**
+
+**目录布局**（新系统使用独立命名空间，避免与旧系统的 `data/raw/` 冲突）
+
+```
+data/store/
+├── raw/<raw_id>/            不可变原文（原始字节）+ meta.json（url / 抓取时间 / HTTP 头 / raw_sha256）
+├── normalized/<raw_id>.txt  归一化文本（可重建的缓存；**由消费者按需写入，不在 T-103 范围**）
+├── normalized/<raw_id>.map  字符区间 → 原文偏移的映射（同上，可重建）
+└── atlas.db                 元数据 + Proposed + Confirmed + FTS5
+```
+
+> `normalized/` 是**可重建的缓存**，不是事实来源：`atlas.normalize` 是无 I/O 的纯函数（T-104），
+> 任何消费者都能由 `raw` 重新生成它。因此它**不属于 T-103（归档）的范围**，由第一个需要持久化它的
+> 消费者按需写入；丢了可以从 `raw` 重算，不算数据损失。
+
+- 旧系统继续写 `data/raw/`，**两者互不干扰**（`data/` 是共享 junction，见 §8.4）
+- 旧系统退役时，已有文件通过一个导入任务纳入 `data/store/raw/`（当作新 Raw 写入并生成版本）
+
+**配置也放在同一存储**
+
+行业 / 渠道配置与其版本历史（§2.9）同样存放在 `data/store/atlas.db`。
+**YAML / OPML 仅作为导入导出格式，不作为事实来源**——避免出现两个事实来源。
+C8 的配置来自前端 / API，不依赖手工编辑文件。
+
+**强制性**
+
+- Raw 写入后**不得覆盖**；同一 URL 重复抓取产生**新 `raw_id` / 新版本**
+- Confirmed 表**禁用 UPDATE / DELETE**（用 SQL 触发器强制，而非靠约定）
+- 所有派生物（`normalized` / `.map` / 索引）必须能由 `raw` **单独重建**，且重建不得影响 Confirmed
+
+**表归属登记（防止多任务共用同一 DB 时静默冲突）**
+
+`data/store/atlas.db` 由多个域共用。所有 DDL 都是 `CREATE TABLE IF NOT EXISTS`，因此**表名冲突会导致静默复用一张结构错误的表**——这与归档基线里"同一个 SQLite 躺着两套 schema"是同一类故障。
+
+规则：**表名全局唯一；新增表必须先登记到本表**。
+
+| 表 | 归属 | 说明 |
+|---|---|---|
+| `store_meta` | T-101 | 共享元数据（`schema_version` 等）；其它域**只读** |
+| `industries` / `channels` | T-101 | 当前配置的物化投影（可由版本链重建） |
+| `config_versions` | T-101 | 配置版本链（**append-only，触发器强制**） |
+| `label_space` | T-101 | 每版本的启用行业集合（= 标签空间，§2.5） |
+| `registry_label_refs` / `registry_label_ref_snapshots` | T-101 | **标签引用索引**（§2.9 规则 1：被引用 id 不得改删）——**不是标签本身** |
+| `raw_records` | T-103 | 原文元数据（字节本体在文件系统） |
+| `article_contents` | T-103 正文留存（§6.20） | 正文获取快照与清洗文本、压缩原始响应、内容类型和结构化失败原因；append-only，不改 Raw / Confirmed |
+| `feed_articles` | T-105 展示生成（§6.19） | 逐篇持久化的 `title_zh` / `summary_zh` 新列及输入正文、抓取状态；位于正式 `atlas.db`，不写不可变 Raw / Confirmed 表 |
+| `catalog_health` | T-111 | 渠道健康状态（探测结果 + 时间；**只增不改**，最新一条为当前状态） |
+| `proposed_claims` | T-105 | 机器提议（**可覆写**，保留版本链）。`PK(claim_key, version)` + `UNIQUE(claim_key, supersedes)`；⚠️ **实现刻意加了 UPDATE/DELETE 双 append-only 触发器**——见 §2.17 的裁决 |
+| `proposal_runs` | T-105 | **"这个单元在本配置下跑过没有"**——降级单元**没有 claim 但跑过了**，没有这张表就无法区分，会导致降级单元每次重跑都被重复调用模型。`UNIQUE(unit_id, plan_digest)`，append-only 双触发器。契约值见 §2.17 |
+| `cognition_store_meta` | T-105 | 认知域的元数据（照 T-103 `raw_store_meta` 先例），`key`/`value` 两列，记 `schema_version` |
+| `confirmed_labels` | T-108 | 人工标签（**Confirmed，只增不改**） |
+| `evidence_spans` | T-107 | 证据锚点索引（真值仍在 `raw` 偏移上）。`(claim_id, claim_version)` 唯一；**只增不改**双触发器。✅ 代码与 DAG 节点已落地（`c9f004f` / `41398da`）。**建立时机：由 T-107 首次以写入模式运行时创建**（`CREATE TABLE IF NOT EXISTS`）；真实库中现已存在，且**已由一次离线校验写入 1268 行**（2026-10-09，见 §2.17「T-107 在真实 store 上的实测产出」） |
+| `search_meta` / `search_documents` / `search_documents_fts`（+ FTS5 影子表 `search_documents_fts_{data,idx,content,docsize,config}`） | T-205 | 检索索引（**派生物**：可整体 `drop` 后由 raw 全量重建；**刻意不加 append-only 触发器**——加触发器与"可删除重建"自相矛盾） |
+
+**命名要求**：跨域共用 DB 的表名必须带领域前缀（如 `registry_`），避免语义误导与后续静默冲突。
+
+> ⚠️ **"只读"必须在文件层成立，不只是"不插行"**（2026-09-28 实测教训）
+>
+> 任何声称**只读**的命令/路径，打开 `atlas.db` 时必须用 URI `file:...?mode=ro`，且
+> **不得执行任何 DDL**。理由是一条真实发生过的副作用：T-107 的第一版
+> `SqliteEvidenceStore` 在构造函数里**无条件** `executescript(CREATE TABLE IF NOT EXISTS evidence_spans …)`，
+> 于是 `--read-only` 虽然一行都没插，**仍然改动了真实库文件**
+> （SHA256 `31286241b688…` → `b4a0c0730d64…`，多出一张空表 + 2 个触发器）。
+> 表与触发器都是 append-only / DDL 已落盘 ⇒ **不可撤销**。
+> 数据本身未受损（0 行、schema 合法、§2.10 本来就登记了这张表），但"只做只读核对却改了用户的库"
+> 是必须从机制上杜绝的。
+>
+> 已修（`41398da`）：只读模式用 `mode=ro` 连接 + **不执行 DDL**；表不存在时把
+> `no such table` **如实**解释成"0 行"，而不是去创建它。已接受的代价：
+> **对一个还没有 `evidence_spans` 的库做只读打开会 `FileNotFoundError`**
+> —— 因为"只读不创建"正是这条路径的意义所在（缺什么、怎么补要写在错误消息里）。
+>
+> 由此追加一条通用判据：**"只读"类命令的验收必须比对库文件字节摘要（sha256）前后一致**，
+> 而不能只看"有没有插行"。
+>
+> ⚠️ **同一形态的已知残留（已实测，未修）**：组合根在**首次**打开共享库时会建
+> `proposed_claims` / `proposal_runs` / `cognition_store_meta` / `evidence_spans`，
+> 因此 `plan` / `register` 在一个**全新的** store 上也会写 DDL（首次即建齐全部表，
+> 之后 `plan` 逐字节不变）。目前只有 evidence store 做了真正的只读处理（`41398da`），
+> **cognition store 还没有**。这不影响既有库，但意味着"在一个空目录上跑只读命令"
+> 会创建一个库 —— 与上面那条判据的精神不一致。是否需要给 `SqliteProposedStore`
+> 同样的只读模式，**留待显式决策**（未登记为任务）。
+
+---
+
+### 2.11 服务层与前端技术选型（延后登记 #5 的落地）
+
+**决策**：feed 查询 API 与打标前端都用 **Python 标准库**（`http.server.ThreadingHTTPServer` + `json`），**不引入 Web 框架**。
+
+**理由**
+
+1. 准则要求"能标准库解决，不引入第三方"；规模是"一个人每天看一次"，不是高并发服务
+2. 零新依赖 ⇒ `uv.lock` 不变，与当前依赖策略一致
+3. 对外是我们自己的 JSON 契约（由 T-106 定义），框架因此可替换——将来若需要 SSE / 复杂鉴权，改用 FastAPI 是**局部替换**，不触及数据模型
+
+**边界与要求**
+
+- 必须用 `ThreadingHTTPServer`（不用单线程 `HTTPServer`），否则一个慢请求会阻塞整个服务
+- 所有写操作（打标）必须走 T-108 的 Confirmed 契约（只增不改）
+- 不引入构建步骤（无 npm / 打包），模板用 stdlib（`string.Template` 或 `json`）
+- 将来替换框架时**不得改变对外 JSON 契约**
+
+**明确不做**：用户体系与权限（延后登记 #10）、前端构建链、JS 框架。
+
+2026-10-26 的正文简介补充（§6.19）：Web 服务仍用标准库。
+原文为 PDF 时，标准库和既有 HTML/XML 依赖不能提取 PDF 正文，因此显式新增
+`pypdf>=6.0.0`（锁定版本由 `uv.lock` 管理），仅用于文章读取批处理。
+依赖集合门禁相应增加这一项，不开放其它未登记依赖。
+
+---
+
+### 2.12 采集合规与限速的默认规则（T-102 实现中定的边界）
+
+这几条此前只存在于实现者的判断里，现固化为规则——**默认值不写进文档就等于没有默认值**。
+
+**同域最小请求间隔**
+
+| `channel.rate_limit_seconds` | 采用值 |
+|---|---|
+| 显式给出（含 `0`） | 原样采用 |
+| `None` | 全局下限（默认 **1 秒**，对应准则"1 req/sec per domain"） |
+
+理由：`interval_seconds` 是**轮询周期**（下限 60s），不是请求间隔；把它当作同域请求间隔会让批量采集退化到分钟级。
+
+**robots.txt 判定（区分"无法获取"与"明确不存在"）**
+
+| 情形 | 判定 |
+|---|---|
+| 规则明确禁止 | ❌ 拒绝 |
+| 401 / 403 | ❌ 拒绝 |
+| 5xx、网络异常、超时、解析失败 | ❌ 拒绝（**保守**：拿不到规则 ≠ 没有规则） |
+| 其它 4xx（含 **404**） | ✅ 允许（RFC 9309：站方**明确**表示没有 robots.txt） |
+
+> 关键区分：**404 是"确定的没有限制"，超时/5xx 是"我们没拿到规则"**——后者一律保守。
+> 可用 `allow_when_absent=False` 把 4xx 也收紧为拒绝（代价是绝大多数没有 robots.txt 的站点都抓不到）。
+
+**其它**
+
+- **2xx + 空响应体（0 字节）→ 失败且不重试**：空 feed 通常意味着端点已失效，重试无意义，交给 T-111 的去死链处理
+- **UA**：`user_agent` 是选项名；解析失败**响亮失败**（不退回默认 UA）；解析结果以 `Mozilla/` 开头必须带 `user_agent_justification`，否则拒绝（不绕过 §7.1）
+- **不做**（首期）：并发采集、`Retry-After`、断点续采
+
+---
+
+### 2.13 已裁决的实现边界（T-102 / T-106 / T-108 / T-111）
+
+实现者把边界问题列出来而**没有**自行拍板，这是对的。以下是裁决——**不写下来就等于没有默认值**。
+
+| 问题 | 裁决 | 理由 |
+|---|---|---|
+| 打标存储的 `label_id` 内容寻址校验与锚点归属校验"比内存契约更严" | **保留**（存储层可严于契约，单向） | 与 `RawStore.put` 校验内容指纹同一先例。差异只有"存储层 ⊇ 契约"一个方向，并有专门测试钉死方向 |
+| `ConfirmedStore.all_for` 的顺序 | **写入顺序**（属契约的一部分） | `latest_value` 在 `created_at` 并列时的判定依赖它；改排序会让内存版与 sqlite 版分叉 |
+| 标签导出：保序 vs 确定序排序 | **保序** | 备份必须与原库**语义等价**（顺序参与并列判定）。代价：来自两个构建顺序不同的库，导出字节不保证相同 |
+| 健康"失效"如何标记 | **用渠道标签 `health-unhealthy`；禁止改 `enabled`** | `enabled=False` 的语义是"**用户主动停用**"。把"源失效"塞进同一个开关会让两个概念混淆，且恢复标记会与用户的停用决定打架。标签可逆且是纯信息标记 |
+| 健康分类是否允许第 8 类 `local_error` | **保留** | "本地原因导致没发出请求"（UA 选项非法 / 限速等待超预算）与"源站坏了"**必须分开**，否则是对源站的错误判断 |
+| 聚合是否默认补建清单里声明、但注册表没有的行业 | **默认不补建**（`create_missing_industries=False`） | 新增行业是**配置决策**，不应由聚合隐式完成；显式打开才补建 |
+| 健康探测是否重试 / 是否连续 N 次才标记 | **不重试，一票标记**（首期） | 标记是可逆标签，噪声可接受；"连续失败"属后续策略层 |
+| feed API 的契约值 | `contract_version=1`；`limit` 默认 **50** / 上限 **200**（越界**拒绝**不截断）；排序键 `(fetched_at, raw_id)`；查询参数 naive 时间 **400** | 契约值属对外接口，**改动需升 `contract_version`** |
+| `total` 需要全量扫描 | **允许**（硬上限 20 万条，超限报错不截断） | 当前规模可接受；数据量大时应在存储侧提供 `count` / 索引 |
+| feed 是否提供 `/raw/{raw_id}` 原文入口 | **暂不提供** | 超出"查询 API"范围；T-107 / T-109 需要展示原文时作为**纯增量**加入 |
+
+**另外记录一条工具链现状**：`ruff` **未纳入门禁**（仓库基线已有 365+ 条 UP/I 类提示）。因此各包按既有风格书写，**门禁的唯一判据是 pytest 退出码**。
+
+---
+
+### 2.14 认知层契约与 PI 分层（T-003 前置的裁决）
+
+#### 决策一：PI 用哪一层 = `pi-ai`（Node 边车，**注册零工具**）
+
+§4.7 硬门槛的成因是"agent **自带工具** + 处理不可信外部内容 ⇒ prompt injection 升级为任意代码执行"。
+实测三个包的能力面（npm 元数据，均为 0.87.1）：
+
+| 包 | 能力面 | 与 §4.7 门槛的关系 |
+|---|---|---|
+| `@earendil-works/pi-ai` | 统一 LLM 调用库；**工具必须由调用方用 TypeBox 自己定义并自行处理** | 注册**零工具** ⇒ 无执行面 ⇒ 门槛**由构造满足** |
+| `@earendil-works/pi-agent-core` | 通用 agent；依赖含 `diff` / `ignore` / `yaml`（文件操作） | 有工具 ⇒ 必须**真**隔离 |
+| `@earendil-works/pi-coding-agent` | 编码 agent，自带 bash / 读写文件 | 有工具 ⇒ 必须**真**隔离 |
+
+**裁决**：选 `pi-ai` + **零工具**。因此 T-003 **不需要**容器 / 微VM——
+门槛不是被"绕过"，而是**前提不再成立**。
+
+> ⚠️ 这不是"永远不用做"：一旦需要给模型工具（例如让它自己调检索），门槛**立即复活**，
+> 那时必须上真隔离。现在的裁决只是**不为尚未存在的需求预付基础设施成本**。
+
+#### 隔离是**被独立验证过**的，不是被声称的（2026-09-26）
+
+主代理**没有采信 T-003 自己的测试**，而是直接驱动真实边车，并**故意在父进程环境里塞了三把假凭据**
+（`LEAKED_OPENAI_KEY` / `LEAKED_DEEPSEEK_KEY` / `AWS_SECRET_ACCESS_KEY`）看它会不会继承：
+
+| 检查 | 实测结果 |
+|---|---|
+| `toolsRegistered` | **0** |
+| `declared_tools` / `declared_tool_count` | **`[]` / 0** |
+| **静态 import 清单**（= 真实能力面） | `['./json-extract.mjs', '@earendil-works/pi-ai', '…/openai-completions.lazy', 'node:crypto', 'node:fs']` —— **无任何执行能力面** |
+| `child_process_used` / `shell_used` | **false / false** |
+| `require_available` | **false**（ESM，没有 CommonJS `require` 作用域） |
+| **子进程实际环境变量名** | `['HOME', 'NODE_ENV', 'NODE_NO_WARNINGS', 'PATH']` —— **三把假凭据一个都没继承进来** |
+| 子进程环境里有凭据形变量吗 | **没有** |
+
+> **一个必须说清楚的精确性**：边车**确实** import 了 `node:fs`（读自己的源码算 `sidecarSha256`）。
+> 所以隔离claim 的准确表述是「**模型无法导致执行**」（零工具 ⇒ 模型没有调用通道），
+> **不是**「这个进程被沙箱化了」。两者不可混为一谈。
+
+> **设计上值得记一笔的诚实之处**：边车**不**用"探测不到 `child_process`"来证明无执行面——
+> 它明确报告 `builtin_available.child_process = **true**`（Node 里当然存在），
+> 再用**静态 import 清单**证明"存在但未被引入/使用"。用"探测不到"来证明"没有能力"是错的论证方式，
+> 这里没有犯这个错。
+
+#### 真实调用与**真实降级**都已验过（2026-09-26）
+
+主代理直接跑 `tools/t003_real_call.py`，两条路由各一次真实调用：
+
+| 路由 | 结果 | 关键数字 |
+|---|---|---|
+| **官方 DeepSeek**（`deepseek/deepseek-flash` @ `api.deepseek.com`） | `ok` | 边车内 2438 ms / 端到端 7300 ms；input 247 / output 256 / **reasoning 119**；**抽出 3 条 claim，每条都带 `quote` 且 `quote_in_document=True`**；`tools_declared=0 tool_calls=0` |
+| **备用**（`deepseek/deepseek-v4-flash` @ OpenRouter） | `ok` | 端到端 7990 ms；input 349 / output 155 / reasoning 106；1 条 claim，`quote_in_document=True` |
+
+这同时验证了 §2.2 的分工**在真实调用里成立**：PI 只吐 `quote`，坐标由系统侧算，且 quote 确实能在原文里找到。
+版本三元组也如 §3 要求随产物记录（`code=cognition-extract-prompt/1` / `config=cognition-config/1` / `model=<实际模型>`）。
+
+**降级路径是在一次真实故障上验的，不是模拟的**
+
+备用路由早先被环境变量指到了一个**已下架**的模型（`ATLAS_LLM_MODEL=xiaomi/mimo-v2-flash:free`，
+OpenRouter 返回 404 `deprecated`）。那次真实调用返回：
+
+```
+状态 : unclassified   reason=model_deprecated
+claims : （空）
+token  : input=0 output=0 total=0
+```
+
+即：模型不可用时**标记未分类并给出原因，一条 claim 都没有编造**——正是本节的决策四。
+这比任何 mock 都更有说服力：**一次真的 404 换来了真的降级**。
+
+> 顺带修掉一个真隐患：`.env.local`（gitignored，本地）里的 `ATLAS_LLM_MODEL` /
+> `ATLAS_OPENAI_MODEL` 仍指向那个已下架模型，会**盖掉代码里正确的默认值**
+> （`OA_MODEL = "deepseek/deepseek-v4-flash"`，T-003 自己已在 config.py 里注明该环境值已失效）。
+> 已把这两个本地值改正，备用路由随即从 `unclassified` 变成 `ok`。
+> ⚠️ **代码默认值是对的，坏的是本地环境值**——这类"配置盖住正确默认值"的问题，只有真的调用一次才会暴露。
+
+#### ⚠️ 边车启动成本：drvfs 上 import pi-ai 要 **~4.5 秒**（主代理复测）
+
+`PROTOCOL.md` §7 报告"在 `/mnt/c`（drvfs）上 `import '@earendil-works/pi-ai'` 约 5900–6400 ms"。
+主代理独立复测（本机 WSL，node v22.21.1，`node_modules` 70 MB / **10,746 个文件**）：
+
+| 场景 | 实测 |
+|---|---|
+| 从 **drvfs**（`/mnt/c/.../sidecar`）import pi-ai | **4.20 / 4.53 / 4.87 s** |
+| 从 **Linux 原生 fs**（同一份 `node_modules` 复制到 `/tmp`）import | **0.09 s** |
+| 边车 `inspect` 端到端：drvfs vs 原生 | **4.39 s vs 0.09 s** |
+| 裸 node 启动（无 import） | 0.01 s |
+
+即 **约 48× 差距**，成因是 drvfs 对 10,746 个小文件的读取开销。
+（它报的 5.9–6.4 s 比我的 4.2–4.9 s 略高，量级一致；且与它自己那次真实调用的
+"边车内 2438 ms / 端到端 7300 ms"之差 ≈ 4.9 s **互相印证**。）
+
+**为什么这条必须写进 SPEC**：`PiSidecarCognitionPort` 按设计是
+**一次性进程**（`adapter.py`："子进程读完即开始处理（一次性进程，无长连接状态）"），
+这是一个**有意的隔离属性**——每次调用拿一个干净进程，文档之间不会串状态。
+代价是这笔启动开销**每次调用都要付**：
+
+> **T-105 的批量分类必须把这条算进去。**
+> 830 个条目 × 4.5 s ≈ **62 分钟**纯启动开销；若每次调用塞多个条目（批量提示），
+> 成本按**调用次数**而非条目数计。
+
+**不建议**为了省这笔钱改成"长驻进程复用"——那会削弱上面那条隔离属性
+（跨文档的会话状态可能互串），得不偿失。真要在意，正确的方向是让 ESM 解析到
+**Linux 原生**的 `node_modules`（符号链接或打包），而不是复用进程。
+
+#### 认知层的契约值（T-003 锁定，主代理登记）
+
+包 `src/atlas/cognition/`（归属 **T-003 / T-105**）。**端口是 `CognitionPort`，PI 只是它的一个适配器**（`PiSidecarCognitionPort`）。
+
+| 项 | 值 |
+|---|---|
+| IPC 协议 | `PROTOCOL = "atlas.cognition.sidecar/1"`；帧前缀 `FRAME_PREFIX = "#atlas-cognition/1#"`；父→子 stdin **一行** JSON job；子→父 **fd 3**（未开则退回 stdout）上的帧行；**非帧行一律忽略**（对"库往 stdout 打警告"的真实防御） |
+| job 字段 | `protocol` / `jobId` / `operation` ∈ {`inspect`, `call`, `parse`} |
+| 主路由 | `deepseek`：provider `deepseek`、model **`deepseek-flash`**、base `https://api.deepseek.com`、key 环境名 `DEEPSEEK_API_KEY` |
+| 备用路由 | `openai-compatible`：provider `atlas-openai-compatible`、model `deepseek/deepseek-v4-flash`、base `https://openrouter.ai/api/v1`、key 环境名 `ATLAS_OPENAI_API_KEY` |
+| 默认路由 | `DEFAULT_ROUTE = "deepseek"` |
+| 超时 / 代理豁免 | `DEFAULT_TIMEOUT_SECONDS = 60.0`；`DEFAULT_NO_PROXY = "127.0.0.1,localhost,::1"` |
+| 版本三元组（§3） | `SCHEMA_VERSION = "cognition-output/1"`、`CONFIG_VERSION = "cognition-config/1"`、`PROMPT_VERSION = "cognition-extract-prompt/1"` |
+| 最低 Node | **22.3.0**（用了 `process.getBuiltinModule` + 顶层 await + ESM） |
+| 状态 | `CallStatus ∈ {ok, unclassified}` |
+| **降级原因码** | `unreachable_model` / `timeout` / `http_error` / `model_deprecated` / `empty_completion` / `unparseable_output` / `sidecar_error` |
+| **响亮失败（绝不降级）** | `ModelEnvelopeError`（结构违反冻结契约）、`IsolationViolationError`（边车报告注册了**非零**工具 ⇒ 隔离前提不成立）、`SidecarUnavailableError`、`ProtocolError`、`ConfigError` |
+| **降级不变式** | `is_unclassified` 为真 ⇒ `claims` **恒为空** 且 `record.reason` **必非空**（§2.14 决策四） |
+| 输出契约 | 冻结 `ContractModel`（`extra="forbid"`）；**PI 只输出 `quote`，不输出坐标**（§2.2） |
+
+> `src/atlas/cognition/PROTOCOL.md` 是**实现说明**，它自己第一句就写明"不是第二份规格；规格以 `SPEC.md` 为准"。
+> 上面这张表才是权威——**契约值的唯一事实来源仍然只有本文件**。
+
+**Node 依赖被关在边车进程里**：Python 项目因此**仍是 stdlib-only**，`pyproject.toml` / `uv.lock` 不变。
+这与"依赖最小化、显式声明"不冲突——新增的依赖不在 Python 依赖图里。
+
+#### 决策二：provider / model 是**配置**，不是代码
+
+Python 侧定义 `CognitionPort`（`atlas.cognition`）；PI 边车只是它的**一个适配器**。
+换 provider、换模型、甚至换回直连 HTTP，都只是**换适配器**，调用方不动。
+
+| 项 | 值 |
+|---|---|
+| 目标模型 | DeepSeek 官方 `deepseek-flash` |
+| 官方端点 | ✅ **已就位并实测**（2026-09-26）：`GET https://api.deepseek.com/models` → HTTP 200，模型列表 `['deepseek-flash', 'deepseek-v4-pro']`；`POST https://api.deepseek.com/chat/completions` 与 `/v1/chat/completions` 均 HTTP 200 且返回**干净 JSON**。凭据为 `.env.local` 的 `DEEPSEEK_API_KEY`（**gitignored，绝不提交**） |
+| 备用路径 | 环境内的 OpenAI 兼容凭据（`ATLAS_OPENAI_API_KEY` + `ATLAS_LLM_BASE_URL`）实测可达 `~deepseek/deepseek-flash-latest`、`deepseek/deepseek-v4-flash`。**哪条路在用必须能从结果看出来**（记录 provider 标识，不记录密钥） |
+
+> **凭据优先级**：`DEEPSEEK_API_KEY`（官方）→ 其次 OpenAI 兼容凭据。
+> **不得**从 DSH 自身的凭据库（`~/.dsh/.credentials.yaml`）借用——那是 harness 的凭据，不是项目凭据。
+
+#### 决策三：结构化输出必须防御三种**已实测**的失败（不是设想）
+
+| 失败 | 实测证据 |
+|---|---|
+| 输出被 markdown 围栏包裹 | `deepseek/deepseek-chat` 实际返回 ` ```json\n{...}\n``` `，裸 `json.loads` 直接失败 |
+| 模型被下架 | `xiaomi/mimo-v2-flash:free` → HTTP **404** `This model has been deprecated` |
+| 端点不可达 / 超时 | WSL 缺代理时因 fake-IP DNS 直连失败（§8.5） |
+
+解析失败必须**响亮失败或明确降级**，**不得**返回编造结果（硬规则 2）。
+
+**成本观测（实测，两条路都是推理型）**：对一次**极小**抽取（提取公司名 / 行业），
+
+| 路径 | completion tokens | 其中 reasoning |
+|---|---|---|
+| `deepseek-flash`（官方） | 61–69 | **48–56（约 80%）** |
+| `xiaomi/mimo-v2.5`（OpenRouter） | 760 | **728（96%）** |
+
+即：**output token 被推理放大 5–25 倍**，而 output 单价通常是 input 的数倍。
+T-105 做批量分类时必须先量这个数字再决定是否关推理 / 换非推理模型——
+否则成本与延迟都由推理主导，而不是由抽取本身主导。
+
+#### 决策四：降级路径 = "未分类"，**绝不是猜测**
+
+模型不可用时，文档标记为**未分类**并保留原因；**不得**用关键词规则偷偷顶上、冒充模型输出。
+这保持 §2.3 的"Proposed 可覆写"语义：下次模型可用时可重跑覆盖。
+
+**不变项**
+
+- §2.2 的分工不变：PI **只输出 `quote`，不输出坐标**
+- 每次调用记录 `model` / `prompt` 版本（§5 登记 #4）
+- §2.9 的闭环不变：分类的候选标签集合必须来自**当前启用的行业配置**，**不硬编码**
+
+---
+
+### 2.15 检索与分块的契约值（T-205 / T-206 落地时定的）
+
+与 §2.12 / §2.13 同一性质：**默认值不写进文档就等于没有默认值**。
+
+#### 检索（`src/atlas/search/`，T-205）
+
+| 项 | 值 |
+|---|---|
+| `SCHEMA_VERSION` / `INDEX_VERSION` | `1` / `"atlas.search.index/1"`（**索引版本不符时读路径响亮失败**，并提示"删索引后重建"） |
+| 分词器 | `unicode61 remove_diacritics 2`（见下方**已知缺口**） |
+| 文本来源 | `atlas.normalize.normalize → NormalizedText.text`（**文档级，不分块**） |
+| `limit` | 默认 **50** / 上限 **200**，**越界拒绝不截断**（与 §2.13 对 T-106 的裁决一致） |
+| `snippet_tokens` | 默认 32 / 上限 64 |
+| 查询上限 | 长度 ≤ 4096 字符、词元 ≤ 64（越界拒绝）；筛选值 ≤ 200 个 |
+| 排序键 | `relevance = (score desc, fetched_at desc, raw_id asc)`；`recency = (fetched_at desc, raw_id asc)`；`score = -bm25(...)`。`raw_id` 唯一 ⇒ **全序** ⇒ 可复现、可分页 |
+| 时间键 | 索引内存**定宽 UTC 串** `%Y-%m-%dT%H:%M:%S.%f+00:00`（naive 按 UTC 解释，同 T-106），使 SQL 字符串比较即时间比较 |
+| 打分可组合 | `search(query, boost=...)`——`boost` 是**第二个打分源**，返回附加分。这是给 T-201 留的位置，**不是占位类** |
+
+**两处必须记住的裁决**
+
+1. **用户输入永不作为 FTS5 表达式**。流程是：切词（`[^\W_]+`，近似 unicode61 的分隔规则）→ 去重保序 → 逐词加双引号 → `AND` 连接。
+   于是 `x" OR "secret` 被当作 4 个**字面词**做 AND（**不放大结果**），`NEAR` / `AND` 只作字面词。
+   **有意不做**短语 / 前缀 / NEAR / 排除语义——那需要"解析用户意图"。
+2. **索引是只读投影**：`search_*` 表**刻意不加 append-only 触发器**——它是派生物，必须能整体 `drop` 后重建，加触发器与"可删除重建"自相矛盾。只增不改的触发器留给 Raw / Confirmed / 版本链（§2.10）。
+   已用 SQLite `authorizer` 实测"索引执行的全部 SQL 只碰 `search_*` 表（含 FTS5 影子表）"。
+
+> ⚠️ **已知缺口与裁决**：`unicode61` **不切分连续汉字**——查 `中文` 命不中 `中文分词测试`，只有整段连写才命中。
+> T-205 诚实地把该行为**用测试钉死**（"缺口是被记录的，不是被掩盖的"）。
+>
+> **用户已裁决（2026-09-26）：采用"汉字逐字切分后再索引"**，保留 `unicode61`。
+> - **不做** `trigram`：它会带来约 3 倍索引膨胀、英文 BM25 排序退化、且查询不得短于 3 字符。
+> - 做法：索引进**独立列**（切分后的文本），查询侧用**同一个切分函数**，且**连续汉字必须作为 FTS5 短语**匹配——
+>   逐字 `AND` 会命中"世**人**民**工**作**智**慧**能**力"这类不相关文档，短语只匹配连续汉字串。
+> - `SCHEMA_VERSION` / `INDEX_VERSION` 因此**必须升版**，旧索引读取时响亮失败（这是设计好的路径，不是故障）。
+> - 摘要/高亮**绝不能露出插入的分隔符**；`text_index` 是内部列，不得经任何对外路径泄漏。
+
+**已实现的切分契约（`b876f18` / `ff0c87f`）**
+
+| 项 | 值 |
+|---|---|
+| 切分函数 | `atlas.search.cjk.segment_cjk(text) -> str`，**纯函数**；逆函数 `desegment`，`desegment∘segment == id`（任意 str） |
+| **插入规则** | 在**至少一侧是汉字**的词元字符边界上、**空白间隙末尾**插入**一个** ASCII 空格；其它位置逐字符不动 |
+| 汉字范围 | `CJK_RANGES` 六段：`U+3400–4DBF` / `U+4E00–9FFF` / `U+F900–FAFF` / `U+20000–2EBEF` / `U+2F800–2FA1F` / `U+30000–323AF`（**不含**假名、谚文、CJK 标点、部首） |
+| 版本 | `SCHEMA_VERSION = 2`（新增 `text_index` 列）、`INDEX_VERSION = "atlas.search.index/3"`、`SEGMENTATION_VERSION = "atlas.search.cjk/2"`（`search_meta.segmentation` 记录） |
+| 查询 | 组间 `AND`；连续汉字 → **短语**（`中文分词` → `"中 文 分 词"`）；用户输入**永不**作为表达式 |
+| 摘要 | 由 `snippet()` 生成后经私用区哨兵还原到**原文**；对外标记仍是 `[` / `]` / `…` |
+| **不升 `TOKENIZER`** | 仍是 `unicode61 remove_diacritics 2` |
+
+> **两条被采纳的建议，都来自实现者的反对**（记录下来，因为它们改进了原始裁定）：
+> 1. 我最初给的规则是"在两个**相邻汉字**之间插空格"，实现者指出这**技术上不成立**——
+>    那样 `中文` 与 `中 文` 会切出同一串、逆映射不唯一。改为"空白间隙末尾"后，`中文→中 文`、
+>    `中 文→中 文`（两个空格），逆函数唯一。
+> 2. 第一版只处理汉字↔汉字，实测 `Transformer架构` 查不到 `架构`、`GPT模型` 查不到 `模型`。
+>    扩到"至少一侧是汉字"后修复（见下）。
+>
+> **主代理独立复核（worktree @ `b876f18`，未复用 T-205 的断言）**：
+>
+> | 查询 | 结果 |
+> |---|---|
+> | `架构` / `Transformer` @ `Transformer架构` | **均命中**（修复前 `架构` 为 0） |
+> | `模型` / `GPT` @ `GPT模型` | **均命中**（修复前 `模型` 为 0） |
+> | `向量数据库` / `abc` @ `向量数据库abc` | **均命中**（修复前 `向量数据库` 为 0） |
+> | 对照：`人工智能` vs 诱饵 `世界人民工作智慧能力` | **不命中**（短语未退化成逐字 AND） |
+> | 对照：`分词中文` vs `中文分词` | **不命中**（顺序敏感保持） |
+> | 对照：纯英文 `machine learning` | 命中正确，`segment_cjk` 对纯拉丁是**恒等变换** |
+> | 摘要 | `'我们分析了 Transformer[架构] 的注意力机制与推理成本。'` —— **无泄漏分隔符**，高亮连续 |
+
+#### 分块（`src/atlas/chunk/`，T-206）
+
+| 项 | 值 |
+|---|---|
+| 入口 | `chunk(raw_bytes, content_type="", *, raw_id, policy) -> (NormalizedText, ChunkSet)`；`chunk_normalized(normalized, *, raw_id, policy) -> ChunkSet` |
+| 策略 | `ChunkPolicy(version="chunk-policy-v1", target_chars=1000, max_chars=1600, overlap_chars=0, separators=DEFAULT_SEPARATORS)`，frozen dataclass |
+| 分隔符优先级 | `paragraph` > `sentence` > `newline` > `list-item`；`MIN_FILL_RATIO = 0.5` |
+| ID | `chunk_id = "chk_" + sha256(raw_id ␟ policy_version ␟ start ␟ end ␟ normalize_for_id(text))[:32]`（与 T-002 的 `raw_` / `clm_` / `lbl_` 同构） |
+| 产物自含重建信息 | `ChunkSet` 带**完整策略快照** `policy` + `policy_fingerprint`，`Chunk` 带 `policy_version` + `raw_id` |
+
+**分块 ID 永不作人工产物锚点（§5 登记 #7 的硬要求）——用三层代码级强制，不靠约定**
+
+理由：分块边界由"归一化文本 + 策略版本"决定，换解析器 / 策略 / 参数会**整体漂移**；
+以分块 ID 为锚的人工产物会**静默指向另一段文字**。
+
+1. `Chunk` **根本没有** `raw_sha256` / `char_start` / `char_end` 字段，`as_anchor()` **永远抛** `ChunkNotAnchorError`（不返回 `None`、不打 warning）
+2. `chk_…` 违反 `EvidenceAnchor.raw_sha256` 的 `^[0-9a-f]{64}$`
+3. `Chunk` 与 `EvidenceAnchor` / `DerivedLocator` 类型不同，塞错地方 pydantic 直接 `ValidationError`
+
+**其它裁决**：`overlap_chars >= target_chars` 会让循环永不前进 ⇒ **构造期**抛 `ChunkPolicyError`（非法正则同理）；
+分块**刻意不读** T-104 的派生块（`normalized.blocks`）——有测试把块清空后要求结果相同；
+非空白字符必须**全覆盖**（`uncovered_non_whitespace` 自检，有缺口即 `ChunkError`）。
+
+---
+
+### 2.16 旧语料导入的契约值（T-131）
+
+包 `src/atlas/migrate/`。下游只有 `atlas.archive` 与 `atlas.contracts`；**不** import
+`registry` / `labels` / `feed` / `search` / `normalize`（有 AST 测试钉住）。
+
+| 项 | 值 |
+|---|---|
+| `channel_id` | 旧频道目录名 → 注册表渠道 id（实测 5 个真频道 **1:1 精确匹配**）；映射不到**不猜**，记为失败 |
+| `endpoint` | 旧记录的 `source_url` = **文章地址**（⚠️ 与新采集记录的 feed 地址**语义不同**，见下） |
+| `content` | 旧记录 `raw_content` 的 UTF-8 字节（**原样**，不做归一化、不解码） |
+| `raw_id` | `raw_id_for(channel_id, endpoint, content_sha256)`（未改） |
+| `fetched_at` 来源 | `collected_at` → `created_at` → `stored_at` → `updated_at`（实测 474/474 走 `collected_at`）；`published_at` **不用**（那是发布时间，且实测恒空）；naive 按 UTC 解释；**任何情况下不回退 `now()`** |
+| `http_status` | 恒 `200`（`LEGACY_HTTP_STATUS`——旧记录没有响应体状态） |
+| 布局规则 | 频道 = `data/raw/` 下**第一段目录名**，文件须直接位于频道目录下（嵌套 → 记失败 `nested_layout`） |
+| **对账不变量** | `scanned = skipped + articles`；`articles = imported + deduplicated + failed`；`records_after == records_before + imported` |
+| `strict` | 默认 `False`（逐条记账）；`True` 时首条失败即抛，异常文本带**完整对账表** |
+| 默认渠道映射 | `resolve_nothing`（**一律未映射**）—— 忘记注入必须**响亮可见** |
+| 实测收敛 | 534 JSON → 60 个非文档 + 474 篇文档 → **65** 条不同 Raw（与 §6.2 预测的 65 精确吻合） |
+
+#### ⚠️ `endpoint` 有两种语义（T-131 确认这是**有意**的）
+
+`raw_records.endpoint` 现在同时承载两种含义：
+
+| 来源 | `endpoint` 是 |
+|---|---|
+| **新采集**的记录 | **feed 地址**（如 `https://www.kdnuggets.com/feed`） |
+| **导入**的记录 | **文章地址**（旧记录的 `source_url`，如 `…/b-well-launches-…-ai-assistants/`） |
+
+理由有实证：`raw_id = f(channel_id, endpoint, content_sha256)`，只有把**文章地址**放进 `endpoint`
+才能得到**逐篇身份**；塞 feed 地址会让 65 篇**塌回 5 条**，等于把 §6.3 的缺口原样复制进旧语料。
+
+> **因此 `endpoint` 不可用于**：去重、「这份 feed 是否已采过」、当作 feed 标识。
+> 做溯源 / 展示 / 去重之前**必须先区分来源**。已用测试钉住
+> （`test_criterion_1_endpoint_is_article_url_not_feed_url`）。
+
+> 处理方式：**没有**加 `endpoint_kind` 列——加列会牵动 T-103 的物理表与 T-106/T-205 的消费者，
+> 超出 T-131 的范围。现在以「文档事实 + 消费者纪律 + 测试钉住」登记；
+> 将来若出现**第二个需要机器可判**的消费者，再加列并升 `raw_store_meta.schema_version`。
+
+---
+
+### 2.17 认知层（Proposed）的契约值（T-105）
+
+与 §2.11 / §2.12 / §2.13 / §2.15 / §2.16 同一性质：**默认值不写进文档就等于没有默认值**。
+`f778877` 只登记了"两张新表存在"，**表结构、幂等键、原因码闭集、批量上限都没登记** ——
+本节把它补齐。**契约值的唯一事实来源仍然是本文件。**
+
+包 `src/atlas/cognition/`（`classify.py` 分流、`propose.py` 调用与归属、`store.py` 持久化）。
+**端口是 `CognitionPort`，PI 只是它的一个适配器**（§2.14）。
+
+#### 常量
+
+| 项 | 值 |
+|---|---|
+| 库文件 | `data/store/atlas.db`（与其它域共用，§2.10） |
+| 本域 `SCHEMA_VERSION` | `1`（记在 `cognition_store_meta.schema_version`；**不符即响亮失败**，不做静默兼容） |
+| 表名 | `proposed_claims` / `proposal_runs` / `cognition_store_meta` |
+| `CLAIM_KEY_PREFIX` | `pcl_`（`pcl_` 是本层**表格行身份**；与契约里的 `clm_`、T-130 的 `ent_`、`art_` 分属不同身份空间） |
+| `KIND_INDUSTRY` | `industry`（与 `confirmed_labels.label_key` 同一语义，§2.5 闭环） |
+| `BATCH_MAX_UNITS` / `BATCH_MAX_CHARS` | **4** / **6000**（两条上限**先到者生效**；实测标定，见下） |
+| `UNIT_TEXT_MAX_CHARS` | **2000**（单单元文本截断上限；**截断位置参与 `unit_digest`**） |
+| 单元 ID 前缀 | 文章级 `art_` + 32 hex（`ARTICLE_ID_RE`）；feed 条目用 T-130 的 `ent_` |
+| 批次 / 运行账 ID | `batch_id = "bat_" + batch_key_for(raw_id, unit_ids)[:32]`；`run_id = "prun_" + stable_digest([unit_id, plan_digest])[:32]` |
+| `ProposalPolicy` 默认 | `max_units_per_call=4`、`max_chars_per_call=6000`、`kind=industry`、`include_link=True`、`source="t105-classify"`、**`max_retries=2`**、`retry_max_units_per_call=1`、`retry_shrink=True` |
+| 重试批次规则 | 第 `retry_count` 轮（0 = 首次）：`min(max_units_per_call, retry_max_units_per_call)`，`retry_shrink` 时再 `// 2**(retry_count-1)`，**下界 1** |
+| `ProposalPolicy.fingerprint()` | `sha256("max_units|max_chars|kind|include_link|max_retries|retry_max_units|retry_shrink")[:32]`（**进配置指纹**：批次策略改变模型看到的输入） |
+
+> **为什么是 4 / 6000（实测标定，不是拍的）**：边车**每次调用**的启动开销约 4.2–8.2 s（drvfs）
+> 且与单元数无关 ⇒ 固定成本按**调用次数**计，塞得越多越省；但 `deepseek-flash` 是推理型，
+> 实测 **reasoning 占 `output` 的 87–92%**（早期估的"1000–2000"偏低），而单次输出预算是**配置值**
+> （`CognitionConfig.max_output_tokens`，实测经 `max_completion_tokens` 真正生效）。
+> 两条合起来 ⇒ **中等批量 + 有界重试**，而不是"越大越好"。
+>
+> **输出预算已由实测重标定为 4096（2026-09-28）**，判据是「**在生产标签空间下不再出现截断的最小上限**」：
+>
+> | 上限 | 单元产出率（25 单元确定性样本） | 顶到上限的调用 | `empty_completion` |
+> |---|---|---|---|
+> | 2048（旧值） | 10/25 = **40.0%** | **10/62** | 4 |
+> | **4096（现值）** | 14/25 = **56.0%**（独立复现 14/25） | **0/50** | **0** |
+> | 8192 | 15/25 = 60.0% | 0/25 | 0 |
+>
+> 2048 下被截断的调用特征是 `output_tokens == reasoning_tokens == 上限` 且 `stopReason=length`
+> ⇒ 内容为 0 ⇒ `empty_completion`。**推理把预算吃光**，所以上限本身就是产出率的直接杠杆。
+> **不选 8192**：14 vs 15（分母 25）在单次运行噪声内，成本无可测差异 —— 数据不支持就不声称差异。
+> 残留风险已记录：4096 下 3 次调用落在上限的 97–100%，但失败模式 `empty_completion` **可重试**，
+> 且各次尝试相互独立。复现用 `tools/t105_yield_probe.py`（**只写临时库**，无 `--write-store` 开关）。
+>
+> ⚠️ **一处必须知道的机制（否则会误判"改了没用"）**：`max_output_tokens` **不在** `plan_digest` 里
+> —— `config_version` 是**静态常量** `CONFIG_VERSION="cognition-config/1"`（不是 `public_digest()`）。
+> 因此**改预算不会让已经跑过的单元重跑**（`propose.py` 的 `attempt > policy.max_retries` 会跳过它们）。
+> 实测：真实库里 13 行 `timeout` 的 `retry_count` 已是 2（= 默认 `max_retries`），改预算救不回它们。
+>
+> ⚠️ 改这两个数字**应当重跑** `tools/t105_real_evidence.py`；但注意**它只报告、不断言预算** ——
+> 真正的门禁是 `tools/t105_yield_probe.py`。
+
+#### 产出率的真实构成（2026-09-28 实测，**推翻了原先的单一归因**）
+
+原先把 24 行里 20 行未分类笼统归因为"输出预算"。分离实验（`tools/t105_yield_probe.py`，
+25 单元确定性样本 = 全部 20 个真实失败 unit_id + 5 个按长度分层抽的从未跑过的 unit，**每臂独立临时库**）
+把它拆成三条**互不相同**的原因：
+
+| 原因 | 实测 | 归属 |
+|---|---|---|
+| **输出预算截断** | 2048 下 10/62 次调用顶上限；4096 下 0/50 | ✅ **T-105 的配置**，已修（上限 4096） |
+| **瞬时传输失败**（那 13 行 `timeout`） | `input_tokens=0`、`output_tokens=0`、`elapsed_ms` 11367–11551（**散布 <200 ms**）、全部写在同一个连续 **2.5 分钟**窗口内；新一轮 108 次调用里 **0 次**复现 | ❌ **不是模型/预算问题**，是传输层故障 |
+| **标签空间覆盖不足** | `no_claim_extracted` = 11/25（44%），这些调用只用 30–800 output token（**离上限很远**）。4 标签 → 9/20；**8 标签 → 20/20** | ❌ **不是 T-105 的缺陷**，是**注册表配置** |
+
+⇒ **剔除那 13 行传输失败后，真实库"确实到过模型"的产出率是 4/11 ≈ 36%**，与 2048 下实测的 40% 同量级。
+也就是说：**原先那个 17% 主要是"传输故障 + 运行账跳过"造成的，不是分类器不行。**
+
+> **最重要的单条发现**：真正的**主导**原因是**标签空间太窄**，而且它是**唯一能真正解开那 20 行卡住单元的改变**
+> —— 因为 `label_space_version` **在** `plan_digest` 里，而 `max_output_tokens` 不在。
+> 诊断臂给那 20 个失败单元加上 4 个标签（`data-science` / `software-engineering` /
+> `business-and-markets` / `other`）后，**20/20 全部分类成功**，且用的是语义上确实成立的标签
+> —— **`other` 一次都没被用过**。这说明模型没有硬塞，是那 4 个 arXiv 分类标签**没有地方放**
+> kdnuggets / MCP / app-builder 这类内容。
+> ⇒ **这是"目录会腐烂"（§2.8）在标签空间上的同一形态**：标签空间必须随语料生长，而不是钉死在种子分类上。
+> 该改动**属于注册表配置**（生产数据），且会让**每个单元重新规划**，因此不在 T-105 范围内，需显式决策。
+>
+> **✅ 已决策并落地（2026-10-26）**：用户在实际打标时反馈"非 arXiv 内容没有合适的行业标签"，
+> 与上面的诊断完全一致。已在真实 store 上追加这 4 个行业
+> （`data-science` / `software-engineering` / `business-and-markets` / `other`，配置版本 v8–v11），
+> `label_space` **4 → 8**，渠道默认归属**未改**；T-105 **没有重跑**
+> （现有 `proposed_claims` 仍是 4 标签空间的产物）。详见 §6.5 的
+> 「2026-10-26 首批真实标签与标签空间扩展」。
+
+#### 幂等键与摘要（公式是契约的一部分）
+
+```
+claim_key    = "pcl_" + sha256(raw_id ␟ unit_id ␟ kind ␟ value ␟ quote ␟ status ␟ reason)[:32]
+output_digest= sha256(json({value, quote, confidence(round 6), status, reason}, sort_keys, ensure_ascii=False))
+plan_digest  = stable_digest([unit_digest, code_version, config_version, model_version, label_space_version])
+```
+
+- ␟ 是**字段分隔符**（`0x1f`），`stable_digest` 逐字段追加分隔符——因此 `"ab"+"c"` 与 `"a"+"bc"` **不相撞**。
+- **两张表的幂等键刻意不同**（这是 `proposal_runs` 必须存在的理由）：
+
+| 表 | 回答 | 幂等键 | 重复写入的语义 |
+|---|---|---|---|
+| `proposed_claims` | 这个单元产出了**什么** | 行身份 `claim_key` + 内容指纹 `output_digest` | 同 `(claim_key, output_digest)` 已存在 ⇒ **无变化**，返回既有行，**版本不推进**；输出不同 ⇒ **追加新版本** |
+| `proposal_runs` | 这个单元跑过没有、花了多少 | `(unit_id, plan_digest)` | 已存在 ⇒ **无变化**，不重复调用模型 |
+
+- `output_digest` **刻意不含** `created_at` / `elapsed_ms` / token 数——重跑时刻不同不代表产出不同；
+  `confidence` **参与**（模型给出不同置信度就是不同输出 ⇒ 新版本，旧版本保留）。
+- `plan_digest` **刻意不含**模型延迟 / token——那些是运行观测，不是计划的一部分。
+- **`unit_id` 必须参与 `claim_key`**：否则同一条 quote 出现在同一 raw 的两个条目里时，
+  两条**不同条目**的证据会塌成同一个 id，而它们指向**不同的原文区间**（锚点会跟着塌）。
+
+**版本链语义**：`version` 是**每条 `claim_key` 自己的单调版本**（从 1 起），
+`supersedes` 是它取代的那一版，**首版为 `0` 而不是 `NULL`**
+（`NULL` 在唯一索引里互不相等，会让"同一身份只允许一个首版"这条约束失效）。
+不变量：`CHECK (supersedes < version)`、`UNIQUE(claim_key, supersedes)`、`UNIQUE(claim_key, version)`。
+
+#### `status` 闭集与 CHECK 约束
+
+| `status` | `value` | `quote` | `confidence` | `reason` | 含义 |
+|---|---|---|---|---|---|
+| `classified` | **必非空** | **必非空** | **必非空且在 [0,1]** | **必须为空** | 正常分类（§2.5 闭环取值） |
+| `unclassified` | 必须为空 | 必须为空 | 必须为空 | **必非空** | **降级**：模型不可用（§2.14 决策四） |
+| `unattributed` | 可以存在 | **必须为空** | 必须为空 | **必非空** | 审计行：模型说了什么，但 quote 归不到**恰好一个**单元（**不得当证据**） |
+| `out_of_space` | 可以存在 | **必须为空** | 必须为空 | **必非空** | 审计行：取值落在**当前标签空间之外** ⇒ **不计入**分类结果（§2.5 的 C8 闭环在存储层强制） |
+
+> 这四条由 `CHECK` 在**存储层**强制，不是靠调用方自觉。
+> `classified` 必须有 `quote` ⇒ §2.2"证据锚点是真值"在 Proposed 层就成立。
+> `unattributed` / `out_of_space` 的 `quote` 必须为空 ⇒ 它们**在物理上不可能**被当成证据使用。
+
+`proposal_runs.status` 的闭集 = 上面四个 **+ `skipped`**。
+
+#### 原因码（**两个闭集，刻意不重叠**）
+
+| 层 | 闭集 | 取值 |
+|---|---|---|
+| T-003 降级原因（`DegradeReason`，§2.14） | 7 | `unreachable_model` / `timeout` / `http_error` / `model_deprecated` / `empty_completion` / `unparseable_output` / `sidecar_error` |
+| **T-105 本层原因** | 4 | `no_claim_extracted` / `unattributed_quote` / `label_out_of_space` / `retry_exhausted` |
+
+- 值域**刻意不重叠**：避免把"模型不可用"与"模型说了但没有可归属的输出"混成一类。
+- **可重试**（`RETRYABLE_REASONS`，6 个）：`timeout` / `empty_completion` / `unparseable_output` / `unreachable_model` / `http_error` / `sidecar_error`
+- **不可重试**（`PERMANENT_REASONS`）：`model_deprecated`（重试一万次也是同一个结果，只会烧钱）
+- 实证依据：失败是**瞬时**的（同一份输入重跑常常成功），因此必须有界重试；而重试必须**缩到单单元**。
+
+#### 归属规则（"某一条没返回"如何记账——不得静默丢）
+
+归属**不依赖模型输出任何 ID**（输出契约是冻结的 `{kind, value, quote, confidence}`，加字段即契约违例）。
+模型只给 `quote`，系统做**确定性匹配**（§2.2 的同一条分工）：恰好命中**一个**单元 → 归属它；
+命中**零个**或**多个** → **不猜**，记为 `unattributed` 行。
+
+批次里**每个**单元都必须有一行结果：
+
+| 情形 | 落库 |
+|---|---|
+| 单元被赋予 ≥1 条 quote | 每个标签一行 `classified` |
+| 单元一条 quote 都没有 | 一行 `unclassified` + `no_claim_extracted` |
+| 整批降级（模型不可用） | **每个**单元一行 `unclassified` + 该批的降级原因码 |
+| 归属不了的 quote | 一行 `unattributed`（不丢，也不硬塞给某个单元） |
+| 取值在标签空间之外 | 一行 `out_of_space`（记下模型说了什么，**不计入**分类结果） |
+| feed 里没有可分类内容 | 由 `classify` 判为 `skipped` + 理由码（`SkipReason` 闭集，**不进本层**） |
+
+对账恒等式在 `ProposalOutcome.__post_init__` 里**强制**（不满足即抛，不是告警）：
+`attributed_claims + unattributed_claims == extracted_claims`、`units_run == classified_units + unclassified_units`。
+`out_of_space` 行既不是 claim 也不是单元，单独计在 `rows_out_of_space`。
+
+**分流（`classify.py`）的判据是看内容，不看 `endpoint`**（§2.16 明确 `endpoint` 有双语义）：
+
+| 顺序 | 判据 | 结论 |
+|---|---|---|
+| 1 | `parse_entries` 成功且条目数 ≥1 | **是 feed** ⇒ 单元 = 条目（`unit_kind=entry`） |
+| 2 | `parse_entries` 成功但 0 条 | 跳过，`empty_feed` |
+| 3 | `EntryParseError`，内容以 `{`/`[` 开头 | 跳过，`unsupported_content_json` |
+| 4 | `EntryParseError`，内容以 `<!doctype html`/`<html` 开头 | 跳过，`unsupported_content_html`（**不做 HTML 正文抽取**：那等于给错误页编一篇正文） |
+| 5 | 其它（纯文本 / 非良构 XML） | **整篇即一个单元**（`unit_kind=article`） |
+
+`SkipReason` 闭集 5 个：`unsupported_content_json` / `unsupported_content_html` / `unsupported_content_xml` / `empty_feed` / `empty_content`。
+`EntryParseError` **绝不被 catch 成"0 个条目"**——"不是 feed"与"feed 是空的"是两件不同的事。
+
+**给模型的单元文本是确定性纯函数**：`text = reduce(title) + "\n\n" + reduce(entry_text)`，
+`reduce` = 解实体 → 按空白切词再单空格拼回（与 `atlas.entries.sanitize_for_quote` 同一口径）。
+因此"模型看到的文字"与"折回单元的判据所用文字"**是同一份**，`unit_digest` 就是它的指纹
+⇒ 换 reduce 规则必然改变幂等键，**不会**出现"文本变了但幂等键没变"。
+
+> ⚠️ **更正（2026-10-09 实测）**：上面这句**只对 T-105 自己的归属步骤成立**。
+> **T-107 做锚点匹配时搜的不是这份文字**，而是 T-104 的 `normalize(raw)` 输出——**两份不同的文本**。
+> 代价已量化：1303 条引文里 **7 条（0.5%）** 仅因"标点前的空白"两侧口径不同而判定失败
+> （模型给 `CLM-8B ,`，归一化文本是 `CLM-8B,`）。这是**保守方向的失败**（不写库、响亮报告），
+> 但它是真实存在的缝。完整数字与逐条机制见下文「T-107 在真实 store 上的实测产出」。
+
+#### 证据锚点必须落在它自己的单元区间内（T-107 落地时定的不变量）
+
+`proposed_claims` 的每个单元行带真值区间 `[unit_char_start, unit_char_end)`（§2.2 的形状）。
+T-107 由 quote 重算出的锚点**必须**满足：
+
+```
+unit_char_start <= anchor.char_start < anchor.char_end <= unit_char_end
+```
+
+**违反即响亮失败**（`EvidenceStageError`），**且在任何写入之前判定** ——
+因为 `evidence_spans` 是 append-only，一条越界的锚点写进去就**永远删不掉**。
+这条不变量把"证据属于哪个单元"从"调用方自觉"变成"机器可判"，
+也是 `proposed_claims` 必须同时存 `unit_id` 与两个字符列（而不只存 `unit_id`）的直接原因。
+
+> 它同时解释了**为什么 `unit_id` 只是派生量**（§2.1/§2.2）：`unit_id` 换解析器会漂移，
+> 而 `(raw_id, char_start, char_end)` 是稳定的真值。判定"这条证据属于哪个单元"因此是
+> **纯整数比较**，不需要任何新映射。
+
+#### T-107 在真实 store 上的实测产出（2026-10-09）
+
+一条**离线**命令（不采集、不打网络）：
+
+```bash
+PYTHONPATH=src ./.venv-new/bin/python -m atlas.compose evidence --store-root data/store
+```
+
+**先在完整副本上彩排、再写真实库**（真实库先备份到 `.tmp_atlas/backup/`，前后 sha256 可查——
+`evidence_spans` 是 append-only，写错一行就永远删不掉，因此"先判后写"之外还要"先彩排"）。
+
+| 项 | 实测值 |
+|---|---|
+| 范围内的 raw | **75**（= 归档全部） |
+| 投影进 `evidence` 的 `classified` 行 | **1303** |
+| `verified` | **1268** |
+| `verification_failed` | **35**（2.7%） |
+| `skipped_unclassified` | **57**（= `unclassified` 50 + `unattributed` 7；审计行没有 `quote`，**必须显式跳过而不是静默丢弃**） |
+| `spans_written` / `spans_unchanged` | **1268** / 0 |
+| `evidence_spans` | **0 行 → 1268 行** |
+| 库文件 sha256 / 字节数 | `3907fd7d…` → `6834a9d3…` / 9,961,472 → 10,674,176 |
+| 其余各表 | **逐表不变**（`proposed_claims` 1379 / `proposal_runs` 895 / `confirmed_labels` 2 / `raw_records` 75） |
+
+**1303 与 `classified` 总数 1322 的差（19）已被解释，不是漏算**：真实库里已有 **19 个 `claim_key`
+带版本链**（>1 版），而 `current_for_raw()` **只投影最新版** ⇒ 1322 − 19 = 1303。
+那 19 行是**被取代的旧版本**，本来就不该有锚点（这也正面证明版本链语义在真实数据上生效了）。
+
+**逐 raw 也收口了**：75 个 raw 里 **61** 个有 `classified` 行、**60** 个有 span；
+差的那一个是 `raw_6f71ae6a…`——它只有 **1** 条 `classified`，而那条正是"原文里根本没有"的 18 条之一
+⇒ 0 span（不是漏写）。另外 **14** 个 raw 既无 `classified` 也无 span，
+与报告里的 `raws_without_claims=14` 完全一致。**1268 + 35 = 1303** 三方对得上。
+
+**落库的 1268 行被逐行独立复核**（主代理，另开只读连接，不复用产线断言；
+输出存 `.tmp_atlas/t107_evidence/logs/step6_audit_real.txt`）：
+对不上 `proposed_claims` 的行 **0**、非 `classified` 的锚点行 **0**、
+`raw_sha256` 与 `raw_records` 不符 **0**、越出自己单元区间的行 **0**、区间本身非法 **0**、
+`(claim_id, claim_version)` 重复 **0**。
+⇒ 上面那条单元包含不变量在**真实数据的每一行**上都成立，而不是只在测试里成立。
+
+**再加一条更强的（"重算优先于采信"）**：用 `atlas.evidence.highlight_for_span()`——它本身就会
+按 quote 重算锚点、与记录不符即抛 `EvidenceMismatchError`——对**按 raw 分层的确定性抽样
+94 行（60 个 raw，每 raw 最多 2 行）**逐条复核：**94/94 重算一致**（锚点与归一化区间都相同）、
+不一致 **0**。这是**抽样**而非全量，报告如实这么写（全量重算曾 ≈ 再花一次 20 分钟归一化；
+2026-10-25 起按 raw 复用归一化后 ≈ 2 分钟，见本节「归一化按 raw 复用」）。
+
+> ⚠️ **这 1268 行目前没有任何"终端消费者"（必须写明，否则会重演 §7.3 失败模式 1）**：
+> 运行时的唯一读者是 T-107 自己的**幂等检查**（`span_for()` 决定 `spans_written` 还是 `spans_unchanged`）。
+> `build_highlight()`（注释里说的"T-109 渲染高亮所需的载荷"）在全仓**只被 `atlas.evidence` 包内部**引用，
+> `webui` / `webapp` / `feed` 都没有用它；**界面的高亮走的是 T-130 的条目区间**
+> （`/entry` 的 `<mark>` 是 `entry.char_start/char_end`，不是 `evidence_spans` 的坐标）。
+> ⇒ 这一步交付的是一个**可校验、可重算的证据索引**，**不是"用户看得见的证据"**。
+> 把它当后者会正好落进 §7.3 失败模式 1（"字段存在但永为空"的温和版本：字段有真数据、但没人读）。
+> 让证据可见（把 span 接进 `/entry` 的高亮）**未登记为任务**，属显式决策。
+
+**35 条 `verification_failed` 的机制（逐条判定，不是估计）**
+
+| 机制 | 条数 | 判据（主代理实测） |
+|---|---|---|
+| 引文只差一个**源文没有的空白** | **7** | 把匹配放宽到"词间允许零个空白"后命中：模型给 `…released CLM-8B , the first…`，归一化文本是 `…released CLM-8B, the first…`。`match_quote` 的退化路径只能**折叠**空白（`\s+`），**不能容忍多出来的**空白 |
+| 引文在**原文**里、但不在**归一化文本**里 | **10** | 把原文字节做实体解码 + 去掉全部空白后能找到它；在归一化文本里（同样放宽空白）找不到 |
+| 引文在原文里**根本没有** | **18** | 实体解码 + 去空白后在原文里也找不到。样本：`SEEDS is a generative AI model…` 在 `raw_e37e4c1d…` 上**验证成功**，却被当成 `raw_15dccda5…` 的引文 ⇒ 模型**串文/改写** |
+
+⇒ **三类都不是接线错误**：没有伪造坐标，也没有写入任何一行（`FAILED` 不落库）。
+但后两类合起来（28 条）都指向同一个**真实的缝**：T-105 给模型看的文字是 T-130 的 `reduce_text`
+（`sanitize_for_quote`：解实体 + **去标签** + 折叠空白），而 T-107 匹配时搜的是
+T-104 的 `normalize(raw)` 输出——**两份不同的文本**。它们在"标点前的空白"与"标签边界怎么变成空白"
+上口径不同，于是同一句引文在一侧成立、在另一侧不成立。
+
+> ⚠️ **登记为已知残留**：**与这条缝直接相关的代价是 7（纯空白口径）+ 10（原文里有、归一化文本里没有）
+> = 17/1303 ≈ 1.3%**；剩下 18 条是**模型自己串文/改写**，与这条缝无关，改口径也救不回来。
+> 残留的方向是保守的（失败即不落库，并逐条打印）。
+> 是否统一这两份文本的口径（或让匹配容忍"多余空白"）**属于显式决策**，**未登记为任务**。
+
+#### 归一化按 raw 复用（2026-10-25 性能修正）
+
+`verify_quote()` 原先**每次调用**都 `normalize(raw_bytes)`。真实 store 有 **1322 条 `classified`**
+（1303 个当前版本），而 T-107 的投影形状是"一份 raw × 多条 quote"（单份最多 **462 条**），
+于是同一次全量校验会把同一份原文归一化上百次。实测后果：`pytest tests` 卡在
+`test_evidence_realdata.py` 的一条用例上 **>20 分钟**（CPU 时间持续增长，**不是死锁**）。
+
+修法（`src/atlas/evidence/verify.py` 的 `_normalized_for()`）：以
+`(raw_sha256, raw_bytes, content_type)` 为键做**有界 LRU（8 份原文）**复用归一化结果。
+这不改变语义：
+
+- `normalize` 是**纯函数**（§2.10：归一化是 raw 的纯函数、可重建），相同输入必然相同输出；
+- `NormalizedText` 是冻结契约记录，调用方无法就地修改；
+- **quote → 锚点的确定性匹配仍然每次都重新执行**（"重算优先于采信"不变）；
+- 键里同时放摘要与字节，使"摘要相同但字节不同"（只可能哈希碰撞）不会命中另一份原文。
+
+| 项 | 修正前 | 修正后 |
+|---|---|---|
+| `tests/test_evidence_realdata.py` | **>20 min**（跑不完） | **101.78 s**，7 passed |
+| 归一化次数（1322 条 claim / 61 个有 claim 的 raw） | 1322 | ≤ 61（每 raw 一次） |
+
+新增 3 条等价性测试（`tests/test_evidence_verify.py`）：同 raw 只归一化一次、
+`content_type` 参与键、缓存命中与"清空后重算"逐字段相等。
+
+#### 真实数据测试的判据必须随数据长大而更新（2026-10-25）
+
+同一轮还发现：`tests/test_evidence_realdata.py` 的三条测试写于真实库只有
+**4 条 `classified`** 的时候，真实库长到 **1322 条（1303 个当前版本）** 后仍然断言
+"每条都校验成功、每条都落库"。而**本节自己已经记录了 35 条匹配失败**——测试与规格
+互相矛盾，门禁因此**永远不可能绿**。这不是"测试坏了"，是**判据随数据增长过期了**。
+
+修法不是放宽成"永远通过"，而是换成**可证伪的余量 + 对账恒等式**：
+
+| 断言 | 新口径 |
+|---|---|
+| 每条 VERIFIED 的锚点落在自己的单元区间内 | **不变**（硬不变量） |
+| 每条 FAILED **没有坐标** | **新增**（不得编造位置） |
+| 校验失败率 | ≤ **5%**（实测 35/1322 = 2.65%；超过即"残留扩大"） |
+| 单元区间里找不到 quote 首尾字符 | ≤ **1%**（实测 1/1322 = 0.08%） |
+| `verified + failed == classified`、`spans_written == verified` | **新增**（对账恒等式） |
+| 单 raw 测试按**当前版本**（`current_for_raw`）算期望值 | **修正**（1303 与 1322 的差 19 是旧版本） |
+
+> **教训**：`assert len(x) == 4` 这类"把当时的数量写进判据"的测试，在数据只增不改的系统里
+> **必然过期**。可证伪的写法是断言**关系**（对账恒等式、包含关系、比例上限），
+> 而不是断言**总量**。
+
+#### 索引与触发器
+
+- 索引 7 个：`proposed_claims` 上 5 个（`raw_id` / `unit_id` / `status` / `(code_version, config_version, model_version)` / `batch_id`）、`proposal_runs` 上 2 个（`unit_id` / `batch_id`）。
+- 触发器 4 个：两表各 `BEFORE UPDATE` + `BEFORE DELETE`，理由文本含 `append-only`。
+
+> ⚠️ **一处与 §2.10 原文的偏离，在此显式裁决**：§2.10 原写 `proposed_claims`
+> "**刻意不加** append-only 触发器……加触发器与'可覆写'自相矛盾"。
+> **实现加了这两个触发器**，且这是**对的方向**——因为"可覆写"在 Proposed 层的正确表达
+> 从来不是就地 `UPDATE`，而是**追加新版本 + 保留版本链**（§2.3 的四条不变量里
+> Proposed 是"可覆写"，而 T-107/T-108 的 `(claim_id, claim_version)` 早已是同一纪律）。
+> 就地 `UPDATE` 会**销毁版本痕迹**，那才真正违背 §3 的"版本化"。
+> ⇒ 本节的表述取代 §2.10 那一句：**`proposed_claims` 与 `proposal_runs` 都是 append-only**，
+> "可覆写"由新增版本行实现。这与 §2.13"存储层可严于契约，单向"同一先例。
+
+#### T-105 在真实 store 上的实测产出
+
+**(a) 早期小样本（2026-09-26，24 行）**
+
+| 项 | 实测值 |
+|---|---|
+| `proposed_claims` | **24 行**，`status` 分布 `unclassified=20` / `classified=4` |
+| `proposed_claims` 行身份 | **24 行 / 24 个不同 `claim_key`，全部 `version=1`、`supersedes=0`** ⇒ 尚无版本链分叉 |
+| `proposal_runs` | **23 行**，`unclassified=20` / `classified=3` |
+| 未分类原因分布 | `timeout` = **13**、`no_claim_extracted` = **7** |
+| 版本三元组 | `code_version=cognition-extract-prompt/1`、`config_version=cognition-config/1`、`model_version=deepseek-flash` |
+| 标签空间版本 | `cfg-v0007-39f0540a983e#2303895ae70154a921ccf07122d2405e`（§2.5 闭环：来自配置） |
+| provider / model / 凭据路由 | `deepseek` / `deepseek-flash` / `deepseek@api.deepseek.com#b8faa230739d2fa8`（**记录路由，不记录密钥**） |
+
+> 这个 24 行的小样本曾经给出"产出率 17%"的印象。**全量跑完后那个数字是错的**（见下），
+> 它主要是"传输故障 + 运行账跳过 + 小样本偏差"三件事的合成，不是分类器的能力。
+
+**(b) 全量 895 个单元（2026-10-08 实际执行完毕，`CLASSIFY_EXIT=0`）**
+
+| 项 | 实测值 |
+|---|---|
+| 跑过的**不同单元** | **895 / 895**（`proposal_runs` = 895 行） |
+| 覆盖的 raw | **73**（895 个单元来自 8 份 feed 的 830 条目 + 65 篇文章；另 2 条 raw 无内容） |
+| **单元级产出率** | **845 / 895 = 94.4%** `classified` |
+| 未分类 | **50 / 895 = 5.6%**，其中 `no_claim_extracted` = 37、`timeout` = 13 |
+| `proposed_claims` 行数 | **1379**（`classified` 1322 / `unclassified` 50 / `unattributed` 7） |
+| 每条 raw 的单元数分布 | 331 / 199 / 191 / 54 / 25 / 10 / 10 / 10（长尾：54 条 raw 各只有 1 个单元） |
+| 成本（`proposal_runs` 合计） | **calls=895**、input **859,046**、output **1,213,145**、**reasoning 1,007,828**、模型侧合计 **6,491,144 ms ≈ 108.2 min** |
+| 标签实际用量 | `machine-learning` 573 / `natural-language` 344 / `computer-vision` 263 / `statistical-learning` 142（**四个标签都在用**，没有闲置标签） |
+
+> **`reasoning` 占 `output` 的 83%**（1,007,828 / 1,213,145）—— 与分离实验量到的 87–92% 同量级，
+> 再次印证"推理把输出预算吃光"是这个模型的结构性特征，也是 `max_output_tokens=4096` 的依据。
+
+**⚠️ 那个 94.4% 必须按渠道拆开看，否则会得出错误结论**
+
+| 渠道 | 单元产出率 |
+|---|---|
+| `arxiv-computer-vision` / `arxiv-natural-language` / `arxiv-machine-learning` / `arxiv-statistical-learning` | **98.5% / 97.4% / 96.7% / 96.3%** |
+| `google-ai-blog` / `marktechpost` | 96.0% / 95.2% |
+| `ai-techpark` | 70.0% |
+| **`synced-review`** | **50.0%**（10/20） |
+| **`kdnuggets`** | **31.6%**（6/19） |
+
+**94.4% 是被 arXiv 拉高的**（830 / 895 = **93% 的单元来自 4 个 arXiv feed**，它们天然贴合那 4 个
+arXiv 分类标签）。**在非 arXiv 内容上产出率断崖式下跌**：`kdnuggets` 只有 31.6%、
+`synced-review` 50% —— 16 个 `no_claim_extracted` 集中在 `kdnuggets` 的 raw 上。
+
+⇒ **这正面印证了分离实验的结论，而不是推翻它**：标签空间是按 arXiv 分类
+（`cs.LG`/`cs.CV`/`cs.CL`/`stat.ML`）播种的，遇到"用 Python 自动化重复劳动""MCP 集成"这类
+工程/商业内容时**没有地方可放**。诊断臂实测：同样那批失败单元，4 标签 → 9/20，**8 标签 → 20/20**。
+**所以整体 94.4% 这个数字本身是"语料以 arXiv 为主"的产物，不是"分类器已经很准"的证据。**
+
+> **结论**：全量跑完**没有**改变"标签空间需要生长"这个判断，反而把它的**代价量化**了：
+> 在非 arXiv 渠道上，当前标签空间会丢掉 **约一半到七成** 的内容。
+> 这与 §2.8"目录会腐烂"同源：**标签空间必须随语料生长**。
+
+#### 组合根接线（T-105 / T-107 接进 `atlas.compose`，`223da32`）
+
+| 项 | 值 |
+|---|---|
+| 新节点 | `classify`（T-105）、`evidence`（T-107），**声明顺序**排在 `normalize` 之后、`classify` 在 `evidence` 之前 |
+| 依赖 | `classify` 声明 `depends_on=(normalize,)`（§4.5 的 `T-104→T-105`）。`evidence` **只**声明 `(normalize,)` |
+| **`T-105→T-107` 是数据边，不是节点依赖** | 离线入口（`collect_evidence_input()`）没有 `classify` 的执行记录，把边声明成节点依赖就只能伪造上游产物。真正保证"新 claim 必被校验"的是**把 claims 投影进 `evidence` 的输入快照**（`_evidence_claims`），并由**同层声明顺序**保证 `classify` 先跑 |
+| **模型调用默认关闭** | `run` 需要 `--classify` 或 `ATLAS_COGNITION=1`；关闭时 `classify` 节点照常出现在 DAG 与报告里、`observed` 明确记账 `enabled=false`，且**端口一次都不构造** |
+| 离线一条命令 | `python -m atlas.compose classify --store-root <root> [--raw-id …]`（不采集、不打网络，**但会调用模型**——这是该命令的全部内容） |
+| 标签空间 | 组合根读注册表 → `LabelSpace.of(labels, config_version=…)` → 写进节点输入快照；**空标签空间响亮失败且一行不写**（§2.5 闭环） |
+| 成本 | 全量语料 ≈ 334 次调用 ≈ 64 min（§2.17 的批次策略）；`--raw-id` 用于收窄 |
+
+> 🔴 **一条必须记住的实测缺陷：不要把 T-104 嗅探出的 `Content-Type` 喂进 T-105 的分流**
+>
+> 实测（真实 `data/store` 的 75 条 raw）：
+>
+> | 分流用的 content_type | 结果 |
+> |---|---|
+> | **字节（`""`，生产口径）** | 8 feed / **830 条目** + 65 文章 + 2 跳过 = **895 单元** |
+> | T-104 的 `normalize().content_type` | 6 feed + 67 文章 = **877 单元** ⇒ **静默丢掉 18 个单元** |
+>
+> 根因：`normalize()` 的兜底嗅探 `looks_like_html()` **只看前 4096 字符**，两份**良构 RSS**
+> （`syncedreview` / `marktechpost`，字节以 `<?xml version="1.0"?><rss version="2.0"` 开头）
+> 因正文里含 `<p>` 被判成 `text/html`；而 T-130 的 `_reject_non_xml` 对 `text/html` **一律拒绝**
+> 条目化 ⇒ **整份 feed 被当成 1 篇文章**（10 个条目塌成 1 条）。
+>
+> 处理：生产路径按**字节**分流（`DISPATCH_CONTENT_TYPE = ""`，与 `test_classify_realdata` /
+> `tools/t105_real_evidence.py` 的实测口径一致），并把不一致作为
+> `observed.content_type_conflicts` **显式打印**（有回归测试）。**未改** T-104 / T-130。
+>
+> ⚠️ **推论（写给下一个人）**：T-104 的 `content_type` 是**嗅探**值，不是声明的 HTTP 类型
+> （`RawRecord` **根本没有** content_type 字段）。**不要**把它当成真值再喂回去——
+> 那会让**同一个 raw 在不同代码路径下产出不同的单元集合**，而 `unit_id` 参与 `plan_digest`，
+> 于是同一个 raw 的两套单元会被当成"都没跑过"而**双份调用、双份写行**。
+
+---
+
+## 3. 任务规范（引擎可替换的前提）
+
+```
+任务 = f(输入快照, 配置快照) → 输出（新版本对象）
+
+幂等    同输入 + 同配置 → 同输出，或明确的"无变化"
+可重试  失败不留半成品
+可重算  输出能从 输入 + 配置 重新生成
+版本化  每次输出携带 (code_version, config_version, model_version)
+边界    Raw 只增不改 / Proposed 可覆写 / Confirmed 只增不改
+```
+
+首期执行器（T-110）只需"读依赖图 + 幂等执行 + 重试 + 日志"，**不需要**任何编排引擎特性（分布式、可视化、复杂重试策略）。这样将来替换为 Windmill / Prefect / Dagster 时，**图不变、任务不改**。
+
+---
+
+## 4. DAG（23 个任务）
+
+### 4.0 包布局约定（避免多子代理互相踩）
+
+| 包 | 归属 | 职责 |
+|---|---|---|
+| `src/atlas/contracts/` | T-002 ✅ | 三态契约、锚点、任务规范、ID 策略 |
+| `src/atlas/collectors/` | 保留资产 | 现有采集器（RSS / 网页 / HTTP / 限速） |
+| `src/atlas/core/` | 保留资产 | 配置、日志、存储 |
+| `src/atlas/models/` | 保留资产 | 文档模型 |
+| `src/atlas/registry/` | T-004 ✅ / T-101 | 配置契约与源注册表 |
+| `src/atlas/runner/` | T-110 ✅ | 任务运行器（DAG 执行） |
+| `src/atlas/collect/` | T-102 | 采集执行器（幂等 / 限速 / robots） |
+| `src/atlas/archive/` | T-103 | 不可变原文归档 |
+| `src/atlas/normalize/` | T-104 | 归一化文本层 + 偏移映射 |
+| `src/atlas/catalog/` | T-111 | 目录聚合与保鲜 |
+| `src/atlas/cognition/` | T-003 / T-105 | PI 边界与认知适配器（T-003，见 §2.14）；机器分类与提议（T-105） |
+| `src/atlas/evidence/` | T-107 | 证据校验与高亮 |
+| `src/atlas/feed/` | T-106 | Feed 查询 API |
+| `src/atlas/labels/` | T-108 | 人工打标存储（Confirmed） |
+| `src/atlas/webui/` | T-109 | 打标前端 |
+| `src/atlas/compose/` | T-120 | **组合根**：把各包接成一条可运行的流水线 |
+| `src/atlas/search/` | T-205 ✅ | 全文检索（FTS5/BM25）+ 排序/高亮；**只读投影，索引可全量重建** |
+| `src/atlas/chunk/` | T-206 ✅ | 分块（纯函数、可重建）；**分块 ID 是派生物，永不作人工产物锚点** |
+
+
+**规则（2026-09-26 修订）**：一个包只由一个任务负责；跨包 import **只允许指向自己在 §4.5 DAG 中的上游**（生产者），外加 `atlas.contracts` 与 `atlas.registry.schema`。
+
+2026-10-26 的网页接线补充（§6.17–6.20）：`atlas.webapp` 组合根可通过 `atlas.cognition`
+的公开只读入口 `read_classifications` / `read_articles` 及简介纯函数读取、组装后注入页面；`atlas.feed` / `atlas.webui`
+仍不直接依赖认知层或其持久化实现。组合根也可通过 `atlas.archive` 的公开只读正文入口注入留存状态与单篇正文。读取不建表、不调用模型。
+**禁止**：兄弟包互相 import、被下游 import（成环）、import 别人的实现细节。这让同一波次的子代理可以安全并行。
+
+> **为什么修订**：原表述为"跨包只允许依赖 `contracts` + `registry.schema`（类型）"，在 T-205 / T-206 落地时被证明**过严**——消费者必须能 import 生产者的**输入类型**（`NormalizedText` / `SegmentTable`），而这些类型按"一个包一个任务"的归属就定义在 T-104 的包里，**没有别的合法位置**。
+>
+> 原规则真正要防的是**兄弟包互相踩**（并行安全），而不是禁止沿 DAG 读上游类型。彻底消除这一例外的唯一干净做法是把 `NormalizedText` 等类型**上移到 `atlas.contracts`**；**当前不做**——那会牵动 T-104 / 106 / 107 / 205 / 206 五个包，收益仅是形式统一。
+
+### 4.1 L0 地基
+
+| ID | 任务 | 规模 | 依赖 | 产出 |
+|---|---|---|---|---|
+| T-001 | 项目基线与资产处置 | S | — | 新结构落地 + 保留清单执行；归档 tag 保持不动 |
+| T-002 | 领域契约与共享类型 | M | T-001 | 三态语义契约、anchor 结构、任务规范、ID 与版本策略 |
+| T-003 | PI 隔离与最小结构化调用 | M | T-002 | 🔒**门槛**：隔离方案 + 一次返回 JSON 的真实调用 + 降级路径 |
+| T-004 | 行业/渠道配置外部契约 | M | T-002 | 可配字段定义、校验规则、版本化与回滚；**目录数据模型 + OPML 导入导出**；验收含 §2.7 判据 |
+
+**T-002 验收判据（先于实现定义）**
+
+1. `src/atlas/contracts/` 的类型定义必须**在代码层强制不变量**——构造非法状态必须抛错，不接受"约定俗成"。
+2. 必须有一个**最小端到端桩**（`Raw → Proposed → Confirmed`）实际跑通，证明四条不变量：
+   - Raw 只增不改（修改尝试必须失败）
+   - Proposed 可覆写（新版本取代旧版本，且保留版本痕迹）
+   - Confirmed 只增不改（修改/删除尝试必须失败）
+   - Proposed 携带证据锚点（quote + anchor）；**未经校验的证据不得进入 Confirmed**
+3. `pytest` 用例覆盖上述不变量并**全部通过**。
+4. **不新增第三方依赖**（只用已装依赖；见 `CLAUDE.md` 的环境约束）。
+
+> 这条判据针对归档基线的具体失败模式：`entities` / `categories` 字段"类型存在但没有一条路径真的写进去"，最终成为空壳。三态契约必须**自证其被强制执行**。
+
+### 4.2 L1 首期价值链路
+
+| ID | 任务 | 规模 | 依赖 | 产出 |
+|---|---|---|---|---|
+| T-101 | 源注册表与行业本体 | M | T-004 | 配置存储 + CRUD + 变更审计；**选配体验 = 从预置目录勾选 + 覆盖默认值** |
+| T-102 | 采集执行器 | M | T-101 | 幂等、可重试、限速、UA 声明、**robots.txt 遵守**、结构化失败日志 |
+| T-103 | 不可变原文归档 | S | T-102 | 原始字节 + sha256 + 抓取元数据；写入即不可变 |
+| T-104 | 归一化文本层 + 偏移映射 | **L** | T-103 | raw → 归一化文本（可重建）+ 字符区间映射 + 派生块 ID；HTML 先行 |
+| T-105 | 机器分类与提议（Proposed） | M | T-003, T-104 | 按行业配置多标签分类 + 抽取；**只输出 quote**；带置信度与 model/prompt 版本 |
+| T-106 | Feed 查询 API | M | T-104 | 可筛选、可排序、分页；只读投影，不产生事实 |
+| T-107 | 证据校验与高亮展示 | M | T-104, T-105 | quote → 确定性匹配 → 字符区间；失败标"未验证"；打开原文 + 高亮 |
+| T-108 | 人工打标存储（Confirmed） | S | T-103 | 文档级标签写入 + **导出与备份** + 审计 |
+| T-109 | 打标前端 | **L** | T-106, T-108（T-107 为增强） | feed 浏览 + 一条一次点击打标；**数据可流转优先于界面精美** |
+| T-110 | 最小任务运行器（DAG 种子） | M | T-002 | 声明式依赖 + 幂等执行 + 重试 + 日志；引擎无关 |
+| T-111 | 目录聚合与保鲜 | M | T-101 | 聚合现成清单（OPML/awesome 列表）→ 去死链 → 分类入库；**定期健康检查** |
+| **T-120** | **端到端集成与接线（组合根）** | **M** | T-102,103,104,106,108,110,101,**105,107** | 把各包接成**一条可运行的流水线**，并用**真实数据**跑通一次：采集 → 归档 → 归一化 → feed → 打标 → **机器分类（T-105，默认关闭）** → **证据校验（T-107）**。⚠️ 依赖列在 T-105/T-107 接进组合根后（`223da32`）补齐：组合根现在真的 import `atlas.cognition` 与 `atlas.evidence` |
+| **T-130** | **条目化派生层（feed → 条目）** | **L** | T-103, T-104 | 把一份 feed 拆成**条目**（标题 / 链接 / 时间 / 正文区间）；**纯函数、可重建、带解析器版本**；条目 ID 是**派生**量，**永不作人工/证据锚点**，但必须暴露 §2.2 的真值形状 `(raw_id, raw_sha256, char_start, char_end)`（见 §6.3 裁决 B） |
+| **T-131** | **旧语料导入** | **M** | T-103 | 把旧系统 `data/raw/**/*.json` 按篇导入 `data/store/raw/`（当作新 Raw 写入并生成版本）；内容寻址自然收敛；**不得迁移任何人工标签**（§2.4）；见 §5 登记 #12 |
+| **T-207** | **最小调度器（按 `interval_seconds` 只采到期的渠道）** | **S** | T-101, T-103（状态源） | 纯函数判"这一轮到没到" + 组合根/CLI 接线 + 系统 cron。**不新建表、不建常驻进程**；状态取自 `raw_records.fetched_at` 的 `MAX`。闭合 §6.7 的第四个缺口 |
+
+> **T-120 为什么必须存在**：DAG 原先只把包一个个建起来，**没有任何任务负责把它们接起来**。归档基线正是这样失败的——25,937 行代码、四层齐备的模块与文档，而端到端数据流一步没通。SPEC 硬规则 1（"完成必须能用**跑通的数据流**证明"）要求系统级证据，而不只是模块级测试。
+
+### 4.3 L2 延后能力（不进首期）
+
+| ID | 任务 | 来源 | 状态 |
+|---|---|---|---|
+| T-112 | 本体与标签空间生长（由标注数据反向扩展） | 延后登记 #1 衍生 | ⏸️ 等真实标注数据 |
+| T-201 | 向量索引与语义检索 | C9 / 延后登记 #2 | ⏸️ 等触发条件 |
+| T-202 | 分析模板（PEST / 五力 / SWOT，必须引用证据） | C9 / 延后登记 #9 | ⏸️ 等打标数据 |
+| T-203 | 多用户与权限（"我允许的人"） | A2 / 延后登记 #10 | ⏸️ 等第二个真实用户 |
+| T-204 | 编排引擎替换（Windmill / Prefect / Dagster） | 延后登记 #3 | ✅ **关闭为"不需要"**（见下） |
+| T-205 | 检索排序（FTS / 混合） | 延后登记 #11 | ✅ `6d001b4`（只做 FTS；混合属 T-201） |
+| T-206 | 分块策略（纯函数、可重建） | 延后登记 #7 | ✅ `5da3b25` |
+
+> **T-204 为什么关闭为"不需要"**：它的触发条件是"**第一个多步依赖任务之前**"。这个任务已经出现——**T-120 组合根**。
+> 实测 `src/atlas/compose/pipeline.py` 用的是 `atlas.runner.TaskGraph` + `TaskRunner`（T-110），
+> 采集 → 归档 → 归一化 → feed → 打标整条链路已按拓扑序跑通（幂等跳过 / 有界重试 / 失败可见）。
+> 也就是说：**触发条件已到达，而自研的最小运行器够用**——引入 Windmill / Prefect / Dagster 只会换来
+> 分布式、可视化与复杂重试策略，这些**当前没有任何需求拉动**。保留的接口（任务为幂等纯函数、不依赖引擎特有语义，
+> §3）继续有效，将来真需要时仍是"换引擎不改任务"。
+
+### 4.4 分层视图
+
+```
+L0   T-001 项目基线与资产处置
+L1   T-002 领域契约与共享类型
+L2   T-003 PI隔离 🔒        T-004 配置外部契约        T-110 任务运行器
+L3              T-101 源注册表与行业本体
+L4              T-102 采集执行器          T-111 目录聚合与保鲜
+L5              T-103 不可变原文归档
+L6              T-104 归一化文本层        T-108 人工打标存储(Confirmed)
+L7   T-105 机器分类(Proposed)   T-106 Feed API   T-112 本体生长 ⟨L2延后⟩
+L8   T-107 证据校验与高亮
+L9              T-109 打标前端
+```
+
+### 4.5 边
+
+```
+T-001→T-002
+T-002→T-003      T-002→T-004      T-002→T-110
+T-004→T-101
+T-101→T-102      T-101→T-111
+T-102→T-103
+T-103→T-104      T-103→T-108
+T-104→T-105      T-104→T-106      T-104→T-107
+T-003→T-105
+T-105→T-107
+T-106→T-109      T-108→T-109      T-107→T-109(增强)      T-108→T-112
+T-101→T-207      T-103→T-207
+```
+
+> **T-207 的边为什么是 T-101 与 T-103**：它读**配置**（`interval_seconds`，来自 T-101）
+> 与**归档事实**（`raw_records.fetched_at`，来自 T-103），两者都是它的上游生产者。
+> 它**不 import** `atlas.collect` / `atlas.compose`（接线由组合根做），也**不被**它们 import 成环：
+> 组合根（T-120）import 它是"组合根 import 各包"，不是包间依赖。
+
+### 4.6 路径
+
+| 路径 | 组成 | 任务数 |
+|---|---|---|
+| **关键路径**（最长链） | T-001→002→004→101→102→103→104→105→107→109 | 10 |
+| **最小可验证路径**（到"能打标"） | T-001→002→004→101→102→103→104→106→109，另需并行 T-108 | **10** |
+| **首期全量**（L0+L1） | 上述 + T-003 + T-105 + T-107 + T-110 + T-111 | 15 |
+
+三条增量环，均不在最小可验证路径上：
+
+```
+AI + 证据环 : T-003 → T-105 → T-107
+运行器      : T-110（并行地基；应在第一个重复任务出现前就位）
+选配目录    : T-111（与 T-102 并行，是"使用时直接选配"的真正来源）
+```
+
+**执行建议**：先走最小可验证路径拿到**第一次真实打标**，再上 AI 与证据。理由：T-105 的抽取质量与 T-107 的匹配精度，在没有真实标注数据之前**无法调优**。
+
+分类的第一版不做 AI，而是**"渠道继承行业"**（T-101 配置里的渠道归属哪个行业，抓来的信息就归哪个行业），零 AI 成本即可满足"分门别类归档"。
+
+### 4.7 硬门槛
+
+> **T-003 完成前，PI 不得接触任何外部抓取内容。**
+
+PI 不含权限系统、不沙箱化工具调用（其官方文档明确说明）。用能执行命令、读写文件的 agent 去处理不可信的外部网页内容，会把 prompt injection 升级为任意代码执行。这是 D10"服务化"下的硬性前提，不可延后到生产。
+
+---
+
+## 5. 延后决策登记表
+
+| # | 延后的决策 | 触发条件 | 现在必须留出的接口 |
+|---|---|---|---|
+| 1 | 三态模型的**物理表结构** | ✅ **已定**（见 §2.10）：文件系统 + 标准库 `sqlite3`，零新依赖 | — |
+| 2 | 向量库选型（C9） | **精确化**：首次检索任务（T-205 FTS）**已落地但未触发本项**——词面检索已够用。真正的触发条件是"**第一个语义/相似度需求，即 FTS 词面匹配被证明不够用**时" | 原文不可变 + 归一化可重建 + 向量条目**可全量重建**（记录 embedding 模型与版本）；T-205 已留出 `search(..., boost=...)` 作为第二打分源的接入点 |
+| 3 | 编排引擎（Windmill/Prefect/Dagster/Temporal） | 第一个多步依赖任务前 | 任务为幂等纯函数，不依赖引擎特有语义 |
+| 4 | 抽取 prompt / 模型 / provider | 第一个认知层任务 | 抽取结果带 **quote 而非坐标**；记录 model/prompt 版本；PI 隔离运行 |
+| 5 | 打标前端框架 | 第一个打标 UI | 标签写入走统一 API 契约，不与前端耦合 |
+| 6 | 行业/渠道配置的**内部 schema** | 第一个配置化加渠道落地时 | 外部契约先定（T-004） |
+| 7 | 分块（chunking）策略 | ✅ **已落地**（T-206 `5da3b25`）——但**不由此触发 RAG**：分块的真正消费者是 T-201（embedding 的上下文窗口），T-205 的 FTS 检索刻意不分块 | 分块是 raw 的**纯函数、可重建**；永不作人工产物锚点 |
+| 8 | 去重策略与阈值 | 重复率开始影响 feed 质量时 | 已定：只隐藏不合并（§2.4） |
+| 9 | 分析模板（PEST/五力/SWOT） | 有足够打标数据之后 | 分析输出必须引用证据锚点，不得裸结论 |
+| 10 | 多用户与权限 | 第二个真实用户出现前 | ⚠️ **审计结论：这条"现在必须留出的接口"没做到**（见下）。实体当前**没有** `owner`/可见性字段，只有 `ConfirmedLabel.actor`（那是"谁做的判断"，不是"谁可以看"）。**但补上的代价实测很低**，所以这不是紧急缺陷，而是一条**未兑现的承诺**，应择机补 || 11 | 检索实现（FTS / 混合排序） | ✅ **FTS 部分已落地**（T-205 `6d001b4`）；**混合排序仍延后**（属 T-201） | 索引可重建；打分可组合（`search(..., boost=...)` 已留位置，非占位类） |
+| 12 | **旧系统语料导入**（`data/raw/` → `data/store/raw/`） | **旧系统退役时**（当前旧栈仍在跑并共享 `data/`，见 §8.4） | 当作**新 Raw** 写入并生成版本（§2.10）；内容寻址会自然收敛（实测 534 JSON → **65** 篇、420 个 rss_feed → **91** 篇）；**不得**把任何人工标签迁移过去（§2.4：标签锚在 `raw_id` 上，条目身份一变就漂移） |
+
+> **第 12 项为什么必须登记**：§2.10 早已写明"旧系统退役时，已有文件通过一个导入任务纳入
+> `data/store/raw/`"，但 DAG 里**没有任何任务承担它**，§5 也没登记。一条被描述却没有归属的能力，
+> 在项目里就等于不存在——这正是归档基线"字段存在但永为空"的同一类问题。
+> 现在它有触发条件（旧系统退役）与明确接口，因此是**有意的延后**，而不是遗漏。
+
+**§5 第 10 项的实测补充（为什么"未兑现"却不紧急）**
+
+主代理在**副本**上实测（绝不动真实库）：
+
+| 检查 | 结果 |
+|---|---|
+| 现有实体有 `owner`/可见性字段吗 | **没有**（`owner` 仅出现在 `registry/opml.py` 的 OPML `ownerName` 元素，是 OPML 标准字段，不是实体字段） |
+| 活对照：`UPDATE confirmed_labels` 被拦吗 | **被拦**（`append-only: UPDATE is forbidden`）——证明下面的结论不是空转 |
+| **`ALTER TABLE ADD COLUMN owner TEXT NOT NULL DEFAULT 'me'` 会被触发器拦吗** | **不会**。DDL 不受行级触发器约束；存量行直接读到默认值 `'me'` |
+| 加完列后 append-only 还生效吗 | **仍生效**（`UPDATE` 依旧被拦）——不变量没被 DDL 破坏 |
+| 真实库是否被污染 | **否**（已核 `PRAGMA table_info`，无 `owner` 列） |
+
+> **结论**：`owner`/可见性**可以事后加**，代价是一次 `ALTER TABLE ADD COLUMN`（带默认值），
+> 存量行自动读默认值，且不必也不能用 `UPDATE` 回填（append-only 会拦——这点反而是好事，
+> 它逼我们用"加列 + 默认值"而不是"改历史"）。
+> 所以第 10 项的风险是**承诺未兑现**，不是**技术债爆炸**。择机补即可，不必打断当前主线。
+
+---
+
+## 6. 待决项
+
+| 项 | 状态 | 影响 |
+|---|---|---|
+| **T-001 资产处置是否执行** | ✅ 已完成（`6ed1492`） | DAG 起点已落地 |
+| **PI 用哪一层** | ✅ **已裁决**：`pi-ai` + **零工具**（见 §2.14 决策一） | 无执行面 ⇒ §4.7 门槛**由构造满足**，T-003 不需要容器 / 微VM |
+| **远端模型凭据** | ✅ **已就位**（实测可调用）；⏸️ **DeepSeek 官方端点待补 `DEEPSEEK_API_KEY`** | 环境内 OpenAI 兼容凭据实测 HTTP 200 + 合法 JSON。见 §2.14 决策二 |
+| **环境：WSL 联网** | ✅ **已解决** | WSL 为镜像网络模式，走宿主代理 `export HTTPS_PROXY=http://127.0.0.1:7897`；`uv.lock` 已据此重建（42 包）。详见 §8.5 |
+| **PI 的可获得性** | ✅ **已验证** | `@earendil-works/pi-coding-agent` / `pi-ai` / `pi-agent-core` 均可经代理从 npm 获取（当前 **0.87.1**）。**注意坑**：WSL 内 `node` 会先解析到 DSH 自带的 wrapper 并失败（`npm` 正常，走系统 nodejs）；安装/调用时需要显式指定可用的 node |
+| **C8 外部契约的具体字段** | ✅ 已定义（见 §2.9） | T-004 按其实现 |
+| PI 隔离方案选型 | ✅ **已裁决**（见 §2.14）：**零工具边车**，不做容器 | 若将来给模型工具，门槛复活，那时才需要真隔离 |
+| **新结构归档是否真实落盘** | ✅ **已落盘**（2026-09-26，见 §6.1） | `data/store/` 已存在：4 个行业 / 13 个渠道 / **10 篇真实归档**（3.7 MB 原始字节）+ 归一化缓存 + 元数据库 |
+| **采集/归档粒度：feed 还是条目？** | 🔴 **待裁决**（见 §6.3） | 实测新结构归档的是**整个 feed**：10 条归档记录里含 **830 篇文章**，全部未成为独立文档。§1.4 的成功信号因此在实践上只能"给整份 feed 打标" |
+
+> **编排结论**：上述所有前置**均已闭合**，因此 AI 环（T-003 → T-105 → T-107）现在可以启动。
+> 这将使关键路径 `T-001→002→004→101→102→103→104→105→107→109` 得以走完。
+
+### 6.1 首次真实落盘（2026-09-26，已闭合）
+
+**此前的事实**：T-205 / T-206 找真实数据时查遍 `data/` —— `data/store/` 不存在、
+`data/raw/<频道>/*.json` 是**旧系统**的产物、`data/atlas.db` / `.backup` / `demo.db` 是**三套互不相同的旧 schema**。
+即：T-120 的端到端证据与 A1 的成功信号**都跑在 pytest 的临时目录里**。
+
+**现在已闭合**：按 §2.9 / C8 设计的"从预置目录勾选"路径（`RegistryService.apply_catalog`
++ `default_catalog()`，行业种子取自 arXiv 现成分类）引导了一次真实落盘运行。
+
+| 项 | 实测值 |
+|---|---|
+| 行业 | 4：`machine-learning` / `computer-vision` / `natural-language` / `statistical-learning` |
+| 渠道 | 13（预置目录 8 + 旧 `config/sources.yaml` 迁移 5） |
+| 采集成功 | **10 / 13**（HTTP 200） |
+| 归档 | `raw_records` **10 行**；`data/store/raw` **3.7 MB**；`data/store` 共 15 MB |
+| 归一化缓存 | `data/store/normalized` 20 个文件（10 `.txt` + 10 `.map`） |
+| 配置版本 | `config_versions` 7 条（append-only 版本链生效） |
+| Confirmed 标签 | **1**——但**不是人工判断**，是上表那次 A1 复验留下的探针（`actor=e2e-verify`）。**真实人工打标仍是 0 次** |
+
+**失败的三条（已如实记录，不是静默丢失）**：
+
+| 渠道 | 类型 | 原因 |
+|---|---|---|
+| `ai-techpark` | `robots_denied` | `robots.txt` 返回 **403** → 按 §2.12 保守拒绝（**这是设计意图，不是缺陷**） |
+| `openai-blog` | `http_status` | HTTP **403** Forbidden |
+| `venturebeat-ai` | `http_status` | HTTP **429** Too Many Requests（重试 3 次后放弃） |
+
+**顺带验证到的合规行为（真实数字）**：arXiv 四个渠道共享同域节流，
+`--rate-limit-seconds 3` 生效——前三条的 `waited_seconds` 为 0.22 / 0.23 / 0.26 秒，
+即每次请求距上一次恰好补足 3 秒。§2.12 的"同域最小请求间隔"因此**在真实站点上被证实**。
+
+> ⚠️ **本次落盘暴露的第一个真缺陷已被修复**（`162e201`）：
+> `render_report()` 只打印 `artifacts["identity"]`，而渠道级失败在**另一个**键
+> `artifacts["observed"]` 里 —— 于是输出是"`failed: 0`、一切正常"，
+> 操作者**完全看不出 13 个源里有 3 个没采到**。数据被记录了却没有被呈现，等于没记录
+> （§7.3 失败模式 3「静默失效」）。已新增 `render_observed()` 并补了测试。
+>
+> **教训**：`render_report` 此前**没有任何测试覆盖**。运维输出没人测，"静默失效"就会从这里回来。
+
+**A1 成功信号已在真实 store 上复验（此前只在临时目录里验过）**
+
+用**用户真正会走的路径**（T-109 前端 HTTP 接口）在 `data/store` 上跑完整闭环，全部通过：
+
+| 检查 | 结果 |
+|---|---|
+| `GET /feed` | **200**，10 篇真实文档，**每条都有 `industry`**（C8 闭环已接通） |
+| `POST /label`（合法行业） | **303** |
+| 重复 `POST /label` 同内容 | 303，且**幂等**——两次运行得到**同一个 `label_id`** |
+| `POST /label`（不存在的行业） | **400**（C8 闭环被**强制**，不是装饰） |
+| `GET /feed` 再次 | 标签正常回显 |
+| 独立开 `sqlite3` 复核（不经任何前端代码） | `confirmed_labels` **1 行**，actor=`e2e-verify` |
+| 非法行业是否写入 | **没有**（负向对照成立） |
+| append-only 触发器 | **10 个**（`config_versions` / `confirmed_labels` / `label_space` / `raw_records` / `registry_label_ref*` 各 no_update + no_delete） |
+
+> ⚠️ 这次复验在 `confirmed_labels` 里留下**一条**验证标签
+> （`raw_0a57b660…` / `industry=machine-learning` / **actor=`e2e-verify`**）。
+> Confirmed 是 append-only，因此它不可删除。actor 字段就是为区分这种情况存在的：
+> 用 `actor='e2e-verify'` 过滤即可排除。**这不是人工判断，是探针。**
+
+**§3 的两条任务规范也在真实数据上被验证**
+
+| 规范 | 真实运行结果 |
+|---|---|
+| **幂等**（同输入 + 同配置 → 同输出或明确"无变化"） | 同一窗口重跑：**5 个节点全部跳过**，各自打印幂等键与"输入与配置均未变化"。`succeeded: 0 / skipped: 5` |
+| **失败不留半成品**（SS3「可重试」） | 一次**不带 `--allow-partial`** 的重跑在 collect 失败（3 个死源令整轮中止）。事后 `raw_records` 仍 **10**、`confirmed_labels` 仍 **1**、`config_versions` 仍 **7** —— 一个字节都没写坏 |
+
+> 两次重跑的差异本身也说明 `--allow-partial` 的语义是**明确的**：
+> 不加它，个别渠道失败就**中止整轮**（严格）；加了它，继续但把失败**显式列出**。
+
+**§2.3 的四条不变量也在真实归档上核验过**
+
+| 不变量 | 真实结果 |
+|---|---|
+| Raw 字节完整性 | **10/10**：磁盘 `content.bin` 的 sha256 与 `raw_records.content_sha256` 逐条相符，`byte_length` 也相符 |
+| 归一化**可重建** | **10/10**：从 raw 重新 `normalize` 得到的文本与缓存 `.txt` **逐字节相同**；且**无需原始 content-type 头**（靠内容自识别），正是"raw 的纯函数"该有的强度 |
+| Raw **只增不改** | `UPDATE` / `DELETE` 均被触发器拒绝：`raw_records is append-only: UPDATE is forbidden (SPEC 2.10)` |
+| Confirmed **只增不改** | 同上（`confirmed_labels`） |
+| 磁盘即事实 | `data/store/raw/` 下 **10 个目录** == DB **10 行**，归档字节合计 **3,773,289** |
+
+> 核验方法遵循硬规则 4 新增的那条：**先跑活对照**（合法的 `SELECT` 必须成功），
+> 再断言 `UPDATE` / `DELETE` 被拒绝——否则语法写错也会伪装成"不变量生效"。
+
+### 6.2 旧数据导入时的预期收敛
+
+`data/raw/` 的旧产物**未去重**（同一篇文章被重复采集约 10 次）。按内容寻址导入时：
+- T-205 实测：534 个 JSON → **65** 条不同文档
+- T-206 实测：420 个 `rss_feed` JSON → **91** 条不同文档（筛选条件不同，故与上不同）
+
+导入**不是**丢数据，是内容寻址的自然收敛。另注意 `data/raw/` 里混有旧系统的非文档产物
+（`empty_*.json` / `summary_*.json`，`document_type` 为空），按目录遍历的消费者会踩到。
+
+**导入结果（主代理在真实 store 上独立核验，2026-09-26）**
+
+| 检查 | 结果 |
+|---|---|
+| `raw_records` | **75** = 10 份新采集 feed + **65 篇导入文章**（与"474 篇有正文 → 约 65 条"的预测一致） |
+| `raw_id` 唯一性 | 75 行 / **75 唯一** |
+| 内容寻址自洽 | `raw_id == raw_id_for(channel, endpoint, sha256)` —— **0 处不符** |
+| 磁盘 vs DB | `data/store/raw/` **75 个目录** == DB **75 行**，**两个方向都没有孤儿** |
+| 逐条字节完整性 | sha256 与 `byte_length` **0 处不符** |
+| **标签是否被迁移** | **没有**——`confirmed_labels` 仍是 **1**（只有主代理那条 `actor=e2e-verify` 探针） |
+| feed 可见性 | `total = 75`，**缺 `industry` 的 0 条**，覆盖 4 个行业 |
+
+> **导入的文章是逐篇的**：它们的 `endpoint` 是**文章 URL**（不是 feed 地址），因此 `raw_id` 标识**一篇文章**。
+> 也就是说 store 里现在**两种粒度并存**：历史语料 65 条逐篇 + 新采集 10 条整份 feed。
+> 这正好说明 §6.3 的问题**只出在新采集路径上**，不是数据模型的限制——
+> 旧系统当年就是按篇存的，我们新写的采集链把它退化了。
+
+> ⚠️ 一处**语义差异**要记住：新采集记录的 `endpoint` 是 **feed 地址**，
+> 导入记录的 `endpoint` 是**文章地址**。同一个字段两种含义，将来做 UI / 去重 / 溯源时要区分清楚。
+
+### 6.2.1 检索链路首次跑在**新结构 store** 上 + 一个必须承认的事实
+**首次端到端**（主代理执行，2026-09-26）：此前 T-205 只能拿旧系统 `data/raw/` 的 JSON 当语料，
+**新 store 从未被索引过**。现在 `data/store` 有 75 条真实文档，检索链路第一次真的跑通：
+
+| 项 | 实测 |
+|---|---|
+| `rebuild()` 覆盖 | **75 篇**（10 份 feed + 65 篇导入文章），`empty_text_count = 0` |
+| rebuild 耗时 | 6.61 s |
+| 真实英文查询 | `model` **56** / `data` **61** / `machine learning` **27** / `artificial intelligence` **13** / `bm25` **1** |
+| 索引进真实 store 后 | `raw_records` 仍 **75**、`confirmed_labels` 仍 **1**、`config_versions` 仍 **7**——检索表是**纯增量**，没碰任何事实表 |
+
+**必须承认的事实：两个语料都没有中文。**
+
+| 语料 | 含 CJK 的文档 |
+|---|---|
+| 旧系统 `data/raw/`（474 篇有正文） | **0**（T-205 实测） |
+| 新结构 `data/store/`（75 条） | **0**（主代理本轮实测，CJK 字符总数也是 0） |
+
+因此：**中文检索功能是正确的，但在真实数据上"零行使"。** 它的全部证据都是合成的
+（T-205 自造的真实中文文档走完整链路；主代理复核时也是自造文档）。
+
+这不是说它白做了——缺口是真的（`查"中文"命不中`），用户也已裁决要做，而
+`GPT模型` / `Transformer架构` 这类混写是中文技术文本的常态；用户将来加中文源时它就在。
+但**现在没有任何真实中文内容能证明它在真实语料上有效**，这一点必须写下来，
+免得将来误以为"中文检索已经过了真实数据检验"。
+
+> 另：`bm25` 在新 store 上命中 **1** 篇，而 T-205 在旧语料上测得 **0**——新增的那一篇来自
+> 导入的 65 篇文章。这也说明**导入的语料确实进了检索链路**，不是躺在磁盘上。
+
+---
+
+### 6.3 🔴 已裁决的重大缺口：采集/归档的**粒度**是 feed，不是条目
+
+> **✅ 已裁决（2026-09-26）：采用方案 B —— 条目作为可重建派生层。**
+> 同时决定：**旧语料导入提前到现在做**（不再等"旧系统退役"）。
+> 落地任务：**T-130 条目化派生层**、**T-131 旧语料导入**（见 §4.2）。
+> **T-105 必须等 T-130 完成后再开工**——否则它会按 feed 粒度分类。
+
+**T-130 已交出，主代理独立复核（2026-09-26）**
+
+| 检查 | 实测 |
+|---|---|
+| 真实 feed 上拆出的条目 | **830 条** —— 与主代理先前用**另一种方法**（正则数 `<item>`/`<entry>`）数出的 830 **完全一致**。两条独立路径互相印证 |
+| 成功解析的 raw | **8 / 10** 份 feed（4 个 arXiv + `google-ai-blog` + `kdnuggets` + `marktechpost` + `synced-review`） |
+| 区间回环 / ID 重算 | **0 失败 / 0 失败**（`verify_offsets` / `verify_ids`） |
+| 非 feed 输入 | **响亮失败**且理由准确：`hacker-news-frontpage` → "输入不是 feed 而是 JSON（通常是 JSON API 响应）"；`ai-news-blog` → "输入不是良构 XML" |
+| 65 篇导入文章喂进 feed 解析器 | → `EntryParseError`（"不是良构 XML"）。**这是正确行为**，它们本来就不是 feed |
+| `anchor()` vs `as_anchor()` | 前者给出**合法** `EvidenceAnchor`（feed 的 `raw_id` + `raw_sha256` + 字符区间）；后者**抛 `EntryNotAnchorError`** ✓ —— 正是"ID 不作锚点、字符区间正是锚点"那条 |
+
+> ⚠️ **给 T-105 的直接结论：raw 是异质的，必须先分流。**
+> store 里 75 条 raw 实际是三类：
+> - **8 条是 feed** → 走 `parse_entries` → 产出 **830 个条目**（这是分类对象）
+> - **65 条已经是逐篇文章**（`endpoint` = 文章 URL）→ 它**本身就是一个可分类单元**，
+>   **不该**再喂给 feed 解析器（会响亮失败）
+> - **2 条既不是 feed 也没有可分类内容**
+>
+> 所以 T-105 不能假设"输入永远是 feed"或"永远是文档"，**必须先判断 raw 的种类**，
+> 再决定"分类条目"还是"分类整篇文档"。这是 §6.3 裁决 B 落到 T-105 上的真实形状。
+
+**T-130 提出的问题与裁决（它正确地没有自行决定）**
+
+T-130 报告了一个它没有自行处理的事实，并请我裁决：
+
+> 65 条 T-131 导入的**按篇文章页**在 T-130 下**同样响亮失败**（它们不是 feed）。
+> 这可能意味着 §6.3 的结论需要修正——**如果文章已经被按篇归档，条目层对它们就是多余的**。
+
+**裁决：§6.3 的结论不变，但必须补一条区分——容器 vs 条目。**
+
+| raw 种类 | 是什么 | 在 feed 流里 |
+|---|---|---|
+| **8 条 feed-Raw** | **容器**，不是条目 | **不应作为条目出现**；它们的 **830 个派生条目**才是条目 |
+| **65 条 article-Raw** | **本身就是条目**（一篇一 Raw） | 直接出现（T-131 已经按篇归档，无需条目层） |
+| **2 条既非 feed 也非按篇的文章/API 记录** | `ai-news-blog`（552,714 字符 **HTML**）与 `hacker-news-frontpage`（15,841 字节 **JSON**） | **按"整篇即条目"出现**（每篇 1 个条目） |
+
+⇒ **真实可浏览条目数是 897（830 派生 + 67 直接），不是 75，也不是 895。** 之前把 75 当作"75 条可浏览内容"是错的——
+其中 8 条是装东西的容器。
+
+> **⚠️ 本节原写"895"与"2 条无内容"，两处都不准，已按 T-109 的实测更正。**
+> 那 2 条**有内容**（一条是 552 KB 的 HTML 页面、一条是 15.8 KB 的 JSON API 响应），
+> 只是既不是 feed 也不是"按篇归档的文章"。把它们记作"无内容"会导出**错误设计**——
+> 一旦排除它们，它们就变成不可浏览、不可打标，**正是本节要消灭的那种静默消失**。
+> 正确做法是把它们当"整篇即条目"呈现（T-109 已如此实现）。
+> **这条更正来自实现者，不是主代理自己发现的**——记在这里，因为主代理当时是凭
+> "AI-TechPark 与 Hacker News 没拆出条目"就推断成"无内容"，而没有去看它们的字节数。
+
+**为什么两条路径的粒度不同，以及为什么这不矛盾**：
+T-131 导入的是**旧系统当年按篇存下来的东西**，所以进来就是逐篇；
+而 T-102/T-120 的采集把**整个响应体**存下来，所以需要 T-130 派生。
+**同一个结果（逐篇可分类单元）由两条不同机制达成**，这不是设计不一致，是两条真实来源的历史差异。
+
+> T-130 那句"若文章已被按篇归档，条目层就多余"在**新采集**路径上是成立的论证——
+> 它其实是在为**方案 A（按篇抓取归档）**说话。但方案 A 的代价是每轮约 830 次 HTTP 请求
+> （仅 arXiv 单域 3 秒节流就约 40 分钟），而方案 B 是**零额外请求**。
+> 用户已裁决 B，因此**条目层对新采集是必需的**，对导入的 65 条是多余的——
+> 这个不对称是真实的，记录在案，不必消除。
+
+**集成到 T-106 / T-108 / T-109 要改什么（T-130 报告，主代理未动手）**
+
+| 任务 | 要改什么 | 关键约束 |
+|---|---|---|
+| **T-106**（Feed API） | 把 `entries` 作为**派生视图**挂在 `raw_id` 下（新端点或 `GET /feed/{raw_id}/entries`），暴露 `entry_id / title / link / published_at / char_start / char_end` | **`Entry` 必须带 `raw_id` + `raw_sha256` 一起输出**，否则前端只拿到"某个 feed 里的第 N 条"，**无法构造锚点**。任何以 `entry_id` 为**标签锚点**的设计都是错的 |
+| **T-108**（标签锚点） | **存储与契约都不用改**——`ConfirmedLabel.anchor` 已经是 `EvidenceAnchor`，`Entry.anchor()` 直接产出合法的那个 | 要做的是**允许"条目区间"作为一种打标目标**：§2.1 那句"仅文档级"需按裁决 B 更新为"文档级 + 条目级"。**人工标签不得存 `entry_id`**（换解析器版本会漂移） |
+
+> **上面这条"存储不用改"原本只是断言，主代理已在副本上预验证为真（2026-09-26）**
+> （在 `data/store/atlas.db` 的**副本**上做，真实库未动）：
+>
+> | 检查 | 结果 |
+> |---|---|
+> | 从真实 `arxiv-computer-vision` feed 取 `entry[0]` | span `(876, 2975)`；`entry.anchor()` 给出合法 `EvidenceAnchor`，其 `raw_id` 就是该 feed 的 `raw_id` |
+> | **活对照**：不带 anchor 的标签 | 可存可读（既有行为不变） |
+> | **关键**：带**条目区间**锚点的标签 | **可以存入** ✓ |
+> | 独立开 `sqlite3` 读回 | `anchor_char_start=876`、`anchor_char_end=2975`、`anchor_raw_id == label.raw_id` —— 全对 |
+> | **负向 + 活对照**：锚点跨 raw（证据在 B、标签在 A） | **被拒**，抛 `AnchorError` ✓ |
+>
+> ⇒ **唯一缺的一环就是 `ConfirmedLabel.human()` 不接受 `anchor` 参数。** 契约层加一个可选参数即可，
+> 不需要新表、不需要迁移、不需要升 `raw_store_meta.schema_version`。
+>
+> （顺带一个对 UI 有用的事实：真实 arXiv 标题里含 LaTeX 标记，
+> 如 `'$\unicode{x1F493}$Heartian: Physiology-Aware…'`——**渲染必须继续走 `escape()`**。）
+| **T-109**（前端） | 从"只显示 raw_id/渠道/字节数"改为**按条目渲染**（标题 + 链接 + 时间），并提供"打开原文并高亮条目区间" | 条目正文是**标记文本**：`Entry.content_slice()` 只去标签与 CDATA 外壳、**不解实体**（解实体会让字符数与偏移解耦）；拿去匹配 quote 用 `sanitize_for_quote()`，但**坐标只能由确定性匹配产出，不得从 sanitize 的产物反推偏移** |
+| **T-105**（机器分类） | 应**按条目分类**（输入 `Entry.title` / `content_slice`，quote 走 `sanitize_for_quote`），而不是按 feed | 已按此派发 |
+
+> **T-130 的 `char_start/char_end` 口径**（本任务最关键的决策）：是**解码后 feed 文本**上的字符偏移
+> （左闭右开），切片 = `<item>…</item>` / `<entry>…</entry>`（**含**结束标签），**不是字节偏移**。
+> 参照系与 `NormalizedText.raw_text` / `EvidenceAnchor.char_start/char_end` 一致
+> ⇒ **判定"某条证据属于哪个条目"是纯整数比较**，不需要任何新映射。这与其他候选口径（字节偏移、
+> 归一化后偏移）相比，省掉了一整层换算与随之而来的错位风险。
+
+**这是主代理在真实落盘之后核验发现的，不是任何一个子代理报告的。**
+
+**事实（实测）**：新结构把**整个 HTTP 响应体**当作一篇文档归档。逐条数过 `data/store` 的原始字节：
+
+| 渠道 | 归档字节 | 内含 `<item>`/`<entry>` | 归一化字符 |
+|---|---|---|---|
+| arxiv-machine-learning | 706,417 | **331** | 682,621 |
+| arxiv-computer-vision | 432,950 | **199** | 419,213 |
+| arxiv-natural-language | 406,206 | **191** | 392,644 |
+| arxiv-statistical-learning | 118,556 | **54** | 114,469 |
+| google-ai-blog | 575,715 | **25** | 572,697 |
+| synced-review | 560,596 | **10** | 93,862 |
+| marktechpost | 392,530 | **10** | 89,623 |
+| kdnuggets | 8,486 | **10** | 7,086 |
+| ai-news-blog / hacker-news-frontpage | 552,749 / 15,841 | 0 / 0 | 16,783 / 15,840 |
+| **合计** | | **830** | |
+
+**即：10 条归档记录 = 10 份 feed，里面 830 篇文章没有一篇成为独立文档。**
+
+**后果（逐条对着 §1.4 的成功信号看）**
+
+- `raw_id` 唯一标识一份 **feed**；而 §2.1 规定人工标签锚在 `raw_id` 上
+  ⇒ **只能给"整份 synced-review feed"打有效/无效**。这不是 §1.4 说的
+  "给收集到的**信息**打标"，是给一个容器打标。
+- 830 篇真实文章在新结构里**不可浏览、不可打标、不可分类**。
+- T-105（机器分类）将来分类的对象会是 **feed**，不是文章。
+- T-107 的 quote→锚点会落在一份 570 KB 的 feed 里：一条引文对应整份 feed 的标签。
+- T-109 前端只能显示 `raw_id` / 渠道 / 字节数 —— 连"这是什么"都看不出来。
+- **这是相对旧系统的回退**：旧系统是**按篇**存的（§7.1 称之为"534 个原始文档"，
+  `data/raw/<频道>/*.json`）。新结构没有延续这一点。
+
+**成因：SPEC 从未裁定过粒度。** 通篇没有一句话说"一篇文档 = 一份 feed"还是"= 一篇文章"。
+§2.1 只说"锚在 `raw_id` 上"，§2.6 只说 rss 的 `fetch_spec` 为空。
+于是这个决定被 T-102 / T-103 / T-120 **隐式**做出——把响应体直接归档——
+**没有任何任务或文档讨论过它**。这与 §7.3 的失败模式同类：不是做错了决定，是**漏掉了决定**。
+
+**可选方向（待用户裁决）**
+
+| 方案 | 做法 | 代价 |
+|---|---|---|
+| **A 按篇抓取** | feed 只用来发现链接；每篇文章单独 GET、单独 `raw_id` 归档 | 约 **830 请求/轮**；arXiv 单域 3 秒节流 ⇒ 仅 arXiv 就约 40 分钟；且大量站点会 403（本轮已有 3 个源连 feed 都拿不到）；robots 要逐篇判 |
+| **B 条目作为可重建派生层** | feed 仍是 Raw（`raw_id` 不变，Raw 只增不改保住）；另建"条目"派生层，条目真值 = `(raw_id, char_start, char_end)` | **零额外网络请求**（正文已在 feed 里）；零 schema 迁移（见下）；条目是派生的，换解析器会漂移 |
+| **C A + B** | feed 存档作溯源，同时按篇抓取归档 | 最完整，也最贵 |
+| **D 承认现状** | 明确写"打标只到 feed 级" | 诚实，但等于放弃 §1.4 的实质 |
+
+> **B 不是新发明——§2.1 自己就是这条升级路径**。§2.1 原文：
+> "**缓解**：2C 的锚点机制已就位，升级到句级**不需要任何 schema 迁移**，
+> 只付出人工重标成本。这是一次'**安全的延后**'。"
+>
+> §2.2 也已把真值定义为 `{raw_id, raw_sha256, char_start, char_end}`。
+> 也就是说：**条目化的锚点形状早就定好了**，只是没人把它接到采集粒度上。
+> 选 B 需要改的只有 §2.1 那句"仅文档级"的措辞。
+
+> ⚠️ 在裁决之前，**不应**让 T-105 开工——它会按当前粒度分类 feed，
+> 产出的是"这整份 feed 属于哪个行业"，而不是"这篇文章属于哪个行业"。
+
+---
+
+### 6.5 受限任务的触发条件复审（2026-09-26）——复审比原判断更重要
+
+四个 L2 任务**仍未触发**，但复审暴露了**两件比它们都重要的事**。
+
+> **本轮复审（2026-09-26 晚，T-105 交付之后）**：四个任务的结论**逐条重新审过，没有沿用上一轮的判断**，
+> 结论**仍然全部未触发**——但**理由变了，而且变得更硬**。详见本节末尾的"§6.5 补记"。
+
+| 任务 | 触发条件 | 复审结论 |
+|---|---|---|
+| T-112 本体与标签空间生长 | 由标注数据反向扩展 | ⛔ **未触发**：2026-09-26 时真实人工标签 0 条；**2026-10-26 起为 2 条**（`valid=invalid`），仍远达不到"数量多了" |
+| T-201 向量索引与语义检索 | 第一个语义/相似度需求（FTS 词面不够用） | ⛔ **未触发**：FTS 中英文都已验证可用，**没有任何证据表明词面匹配不够用** |
+| T-202 分析模板（PEST/五力/SWOT） | 有足够打标数据之后 | ⛔ **未触发**：同 T-112 |
+| T-203 多用户与权限 | 第二个真实用户出现前 | ⏸️ 承诺未兑现，但**代价实测很低**（见 §5 #10） |
+
+**① 语料规模已经超过"人工浏览"了。**
+真实条目数是 **897**（830 派生 + 67 直接，见 §6.3；本节原写 895，是 §6.3 已更正过的旧数），**不是 75**。
+§5 #11 给 T-205 的触发条件正是"数据量超过人工浏览"——这条**现在成立**，
+说明 T-205（FTS 检索与排序）不只是提前做了，而是**已经变成必需品**。
+⇒ **排序与筛选的质量从现在起真的重要了**（尽管 T-201 的*语义*检索仍未被证明需要）。
+
+**② 项目的核心策略目前被"没有人打标"卡住，而卡点在界面上。**
+§1.3 的策略是"归档 → 人工打标 → **等数量多了之后由标注数据反向回答"什么信息有效"**"。
+当时（2026-09-26）真实人工标签是 **0 条**。这不是任务没做完，而是**用户还没法方便地打标**——
+因为 T-109 的 feed 页当前只显示 `raw_id` / 渠道 / 字节数，**连"这是什么"都看不出来**（§6.3 已记）。
+
+**⇒ 结论：真正该做的下一个任务不是那四个受限任务，而是把 T-130 的条目接进 feed 与前端。**
+这**不是新增范围**——它是 **T-109 自己那句"feed 浏览"的完成**：
+「浏览」而不是「看见一串 ID」。T-130 落地之前这件事做不到（那时没有条目可用），现在可以了。
+具体改动点见 §6.3 的集成路线图。
+
+> 所以本项目的**下一个瓶颈是人，不是代码**：把界面做到"能看懂、能打标"，
+> 用户才会产出第一条真实标签，§1.3 的闭环才可能启动。
+> 在此之前，T-112 / T-202 这类"从标注数据生长"的任务**永远等不到触发条件**。
+
+#### §6.5 补记（2026-09-26 晚，T-105 交付之后的**重新**复审）
+
+上面那句"下一个瓶颈是人"**已经兑现了一半、也失手了一半**，必须如实记下：
+
+| 当时的预期 | 实际发生 |
+|---|---|
+| T-109 把条目接进前端 ⇒ 界面"能看懂、能打标" | ✅ **已交付**（`65aaadf`）：`python -m atlas.webapp` 一条命令起服务，按条目渲染，可一次点击打标 |
+| 于是用户会产出**第一条真实标签** | ⚠️ **当时没有发生**（0 条）；**2026-10-26 已发生**：首批 2 条 `valid=invalid`（`actor=me`） |
+| 界面是那个卡点 | ❌ **判断错了**：界面已经通了，卡点**不在代码里**——它在"有没有人去用" |
+
+**这一次我不能再把结论写成"下一个任务是把界面做好"**——界面已经做好了。
+把"没有人打标"继续归因于某个待做的任务，是**逃避**：§1.3 的核心策略
+（由标注数据反向回答"什么信息有效"）要求的是**真的去打标**，而这是一个**人的动作**，
+不是再派一个子任务能解决的。
+
+⇒ **本轮的准确结论**：T-112 / T-201 / T-202 / T-203 **仍未触发**。
+2026-10-26 已出现首批 2 条真实人工标签（见本节末），但**远不足以**触发 T-112 / T-202；
+真正能解锁它们的仍是**持续、成规模地打标**，而不是再派一个代码任务。
+
+> **✅ 「界面可用」这一句已被实测复核（2026-10-09，主代理）**，不再是断言：
+> `PYTHONPATH=src ./.venv-new/bin/python -m atlas.webapp` 起服务后，
+> 启动横幅自报**归档 75 条 = 容器 8 + 本身即条目 67 ⇒ 可浏览条目 897 条**
+> （与 §6.3 的 897 口径一致）；`GET /feed?limit=5` 渲染 **5 个条目**、
+> **5 个「标记有效」+ 5 个「标记无效」按钮**、**10 个「修正行业」下拉**（每页各 2 + 1），
+> 行业取值来自配置（4 个）；`GET /entry?...` 返回 200。
+> **打标动作只挂在 `/feed` 列表页**（`/entry` 只用来读原文与高亮，不带按钮）——这是 2026-10-09
+> 实测的事实，不是设计意图。
+>
+> **同一次复核确认"浏览界面不改用户的库"**：`data/store/atlas.db` 的 sha256 在
+> 「起点 → 跑完只读复核 → 起过一次界面并只发 GET」三点上**完全一致**（`6834a9d3…`）。
+> 这条按 §2.10 的判据（**只读必须比对库文件摘要**，不能只看有没有插行）执行。
+>
+> **打标的写入路径也在副本 store 上往返验证过**（真实库 sha256 前后一致，一行未写）：
+> 「标记有效」与「修正行业」两个维度各自 `POST /label` → **303 回到 feed** →
+> 副本库 `confirmed_labels` 真的多出一行（锚点与服务端认定的一致）→ 回读 `/feed` 显示「已打标」。
+> 因此 §1.4 的成功信号**只差"人去点"这一步**。
+>
+> ⚠️ **一处必须写明的事实（截至 2026-10-09）**：真实库当时 `confirmed_labels` **2 行都是
+> `label_key=industry`、`label_value=machine-learning` 的探针**（`e2e-verify` 无锚点 /
+> `e2e-t109` 有锚点）。也就是说 `label_key=valid`（「这条信息有效」）的**真实数据当时是 0 行**
+> ——§1.3 要反向回答的那个问题，当时**一个数据点都没有**。
+> **（2026-10-26 已改变：首批 2 条真实 `valid=invalid`，见下一节。）**
+
+#### 2026-10-26 首批真实标签与标签空间扩展
+
+上面那句"一个数据点都没有"**已经过期**。用户在实际使用界面后：
+
+| 项 | 实测 |
+|---|---|
+| 真实人工标签 | **2 行**：`actor=me`、`label_key=valid`、`label_value=invalid` |
+| 时间 | 2026-10-26T00:24:38Z / 00:24:48Z |
+| 锚点 | `raw_1f736…` `[0, 552714)`（整篇 HTML）；`raw_f4e01…` `[0, 15841)`（整篇 JSON） |
+| `confirmed_labels` 总行数 | **4**（2 条真实 + 2 条 2026-09-26 探针） |
+| 库文件 sha256 | `6834a9d3…` → `9f0673c5…`（append-only 增长，符合预期） |
+
+**用户同时反馈了第一个真实的可用性问题**："有的未打标没有给合适的标签"——即非 arXiv 内容
+（kdnuggets / Hacker News / Synced 等）在"修正行业"下拉里**没有地方放**。这正是 §2.17
+诊断臂预测的那条：4 个 arXiv 分类太窄。已按诊断臂的 4 个候选扩展：
+
+| 新行业 | 名称 | 来源 |
+|---|---|---|
+| `data-science` | 数据科学 | §2.17 诊断臂 |
+| `software-engineering` | 软件工程 | 同上 |
+| `business-and-markets` | 商业与市场 | 同上 |
+| `other` | 其他 | 同上 |
+
+- 通过 `RegistryService.create_industry` 写入，**配置版本 v8–v11**，
+  `config_version = cfg-v0011-185a4e5a2219`；`label_space` **4 → 8**，全部 `enabled=True`。
+- **未改**渠道的默认行业归属（13 个渠道仍指向原 4 个行业）；**未重跑** T-105
+  （`proposed_claims` 仍是旧标签空间的产物；界面展示的是**人工标签**，不受影响）。
+- UI 复核：重启后启动横幅 `行业 8 个`；`/feed?limit=3` 每个条目下拉含 8 个选项；
+  用户的 2 条 `valid=invalid` 仍显示为"已打标"。
+
+> **历史 UI 问题（已于 §6.9 修复）**：`已打标` 快捷筛选曾返回 **22 条**，其中 **20 条**来自
+> 2026-09-26 的两条**探针**（`e2e-verify` 给 `raw_0a57b660…` 标的 `industry=machine-learning`；
+> `e2e-t109` 给 `raw_15094c8d…` 标的同名标签）。它们锚在**容器 feed** 上，因此其派生的
+> 10 + 10 个条目全部显示"已打标"。界面目前**不区分 actor**；用户看到的是探针标签，
+> 不是自己打的。现采用**按启动时的 actor 展示和筛选标签**，默认 `me`；探针与审计记录完整保留。
+
+**T-112 / T-202 仍不触发**：2 条标签远达不到"数量多了"。但 §1.3 所要求的第一步
+（"真的去打标"）**已经发生**，这是本项目从"能打标"到"有人打标"的转折点。
+
+**第四个同类实例（本轮新发现，与 §6.6 那三条同类）**
+
+T-105（机器分类）交付后，我把"机器的分类结果"与"人的标注"摆在一起看，得到一个必须写明的事实：
+
+> **机器提议（24 行 `proposed_claims`）不能替代人工标注。**
+> §1.3 的留白是"**什么信息是有效的**"，而 `proposed_claims` 回答的是"这条属于哪个行业"。
+> 前者是**判断**，后者是**归类**——它们不是同一个问题。
+> 把 `proposed_claims` 的行数当作"有标注数据了"，正是 §7.3"用静态产物包装进度"的形态。
+
+而且 T-105 的实测产出率**很低**：24 行里 20 行是 `unclassified`（**83%** 未分类），
+其中 13 行是 `timeout`（§2.17 有完整数字）。**因此即便有人愿意用机器结果，现在也不够用。**
+这解释了为什么"AI 环"走通之后，§1.3 的闭环**一步都没有前进**。
+
+**③ 复审中发现的第三个同类实例：这个项目根本没法启动 Web UI**
+
+查证（2026-09-26）：全仓只有**一个** `__main__.py`，是 `src/atlas/compose/__main__.py`（跑采集流水线）。
+`src/atlas/webui/` 只有 `build_application(...)`，要求调用方自己把 `source` / `db_path` /
+`industry_provider` / `raw_exists` 全部组好——**没有任何 CLI 入口**，README 里也没提。
+
+⇒ 就算 T-109 把界面渲染得再好，**用户也只能自己手写 Python 脚本来打开它**。
+而 §1.5 写的运行形态是"**永不停歇的在线服务**"、使用频率"约每天一次"。
+所以这条不补，T-109 那句"feed 浏览"仍然交付不了。已要求 T-109 一并补 `python -m atlas.webapp`
+（最小入口：argparse + 打印真实 URL + store 缺失时响亮失败 + **默认只绑回环**）。
+
+### 6.6 一个反复出现的模式：**"任务做完了" ≠ "系统能用了"**
+
+本项目的这一点值得单独记下来，因为它已经出现**四次**，而且每次都是主代理复核时才发现的：
+
+| # | 现象 | 当时的状态 |
+|---|---|---|
+| 1 | feed 页只显示 `raw_id` / 渠道 / 字节数，**看不出"这是什么"** | T-109 标记为已交付 |
+| 2 | 8 条 feed-Raw 是**容器**，却被当成 8 条内容（真实条目 **897** 不是 75） | T-130/T-131 都已交付 |
+| 3 | **没有任何命令能启动 Web UI** | T-109 标记为已交付 |
+| 4 | 一个"活对照"**从未提交**，所以它对"接线是否正确"什么都没证明 | T-131 的判据被 T-105 复核时仍判为"通过" |
+
+四次共同点：
+- 每个任务**自己的判据都满足了**（有文件、有测试、有真实数字）；
+- 但**把系统端到端当成一个用户会用它的东西**来看，就还差一步；
+- 而这一步**没有任何单个任务**在负责。
+
+> 这正是 §7.3 里归档基线失败模式的**温和版本**——那边是"25,937 行代码而端到端一步没通"，
+> 这边是"每一步都通了，但拼起来还不可用"。
+> **对应的做法**：主代理必须定期以"**用户照着一条命令能不能用**"为判据复审，
+> 而不是逐个核对任务的判据清单。前者才是 §1.4 成功信号的真实形态。
+
+#### 第 4 条：一个"不会失败的活对照"（主代理本轮独立实测）
+
+`tests/test_migrate_realdata.py::test_real_raw_records_are_still_append_only_with_live_controls`
+自称有"活对照"（硬规则 4 要求："断言 X 被拒绝时，同一路径对合法输入必须成功"）。
+**它的活对照是假的**：那句"合法 `INSERT` 必须成功"插入的行**从未提交**。
+
+成因是 `sqlite3` 的一个默认行为：`sqlite3.connect(path)` 的 `isolation_level` 默认是 `""`
+（不是 `None`），此时 **DML 会自动开启一个隐式事务**，而测试里没有 `commit()`；
+`close()` 会把未提交事务**回滚**。于是：
+
+| 检查（主代理在**副本**上实测，真实库未动） | 结果 |
+|---|---|
+| 测试断言的那句（同一连接内 `COUNT(*) == count + 1`） | **True** —— "通过" |
+| `connection.in_transaction` | **True**（确实开着事务） |
+| **另开一个连接**看得见这一行吗 | **False** |
+| `close()` 之后，另一个连接看得见吗 | **False** |
+| 行数（外部连接口径） | 75 → **75**（**没变**）⇒ INSERT 从未提交 |
+| 活对照 + `isolation_level=None`（autocommit）后跨连接 | 75 → **76**，**可见** ⇒ 这样写才是真的活对照 |
+
+⇒ **同一连接的 `COUNT(*)` 只证明"它看得见自己未提交的写"，与"触发器是否生效"无关。**
+（`git show --name-only` 之外的一条独立佐证：真实库 `raw_records` 至今是 **75** 行、
+`channel_id LIKE 't131%'` 的探针行 **0 条**——这个测试跑过多次，一次都没留下 `t131-probe`。）
+
+**精确的结论（不能夸大）**：这个测试**整体仍然有效**——把副本里 `raw_records` 的两个
+append-only 触发器删掉后，它会以 `DID NOT RAISE DatabaseError` **失败**，
+所以 `UPDATE` / `DELETE` 那两条否定断言是真的在验证东西。
+**失效的是"活对照"这一半**：它无法证明"合法写入真的能成功"，
+而这正是硬规则 4 加那条要求的原因。**一个不会成功的对照，和一个不会失败的测试一样没有价值。**
+
+> **✅ 已修（2026-09-26，同轮）**，修法与验证：
+>
+> 1. 活对照改成**autocommit（`isolation_level=None`）+ 写入后另开连接确认可见**
+>    —— 跨连接可见才叫"真的写进去了"，同一连接的自我可见不算。
+> 2. 那条"合法 INSERT"**不再写真实库**：`raw_records` 是 append-only，探针行写进去
+>    就永远删不掉，而 `data/store` 是用户的真实数据、不是测试夹具。改为**先复制一份库**，
+>    在副本上做可写的活对照（副本行数先与真实库对齐，证据才成立）；
+>    真实库上只做**只读断言 + `UPDATE`/`DELETE` 的否定断言**（取一行真实存在的记录，
+>    不靠不存在的 id 蒙混）。
+> 3. 双向复验（不是只跑一遍绿的）：
+>    - 副本**保留**触发器 → **通过**，且打印"副本 75 → 76，跨连接可见"；
+>    - 副本**删掉**两个触发器 → **失败**（`DID NOT RAISE DatabaseError`）；
+>    - 真实库行数**前后都是 75**（本测试现在不往真实库写任何东西）。
+>
+> 原版其实也没写进真实库——但那是靠 `close()` 回滚**侥幸**的，
+> 不是设计；一旦哪天有人给那句 INSERT 加上 `commit()`，就会**静默污染真实库**。
+> 现在这条风险消失了。
+
+---
+
+### 6.7 ✅ 第四个缺口（已由 T-207 闭合）：**两个"周期性"能力，没有任何调度器**
+
+这条与 §6.6 的三条不同类。§6.6 那三条是"能用但不好用"，
+这一条是 **"被写进规格、被配置、却对行为没有任何影响"**——正是 §7.3 警告的归档基线失败模式
+（"`entities` 字段存在但永为空"）。
+
+**事实（可证）**
+
+1. **`channel.interval_seconds` 是一个数学上恒等于常数的无操作参数。**
+   它在全仓只被读**一处**：`src/atlas/collect/throttle.py:128` `min_interval_for()`：
+
+   ```python
+   return max(
+       min(float(channel.interval_seconds), self.global_min_interval),
+       self.global_min_interval,
+   )
+   ```
+
+   该表达式的值**恒为 `self.global_min_interval`**（`global_min_interval` 默认 1 秒，
+   而 §2.12 规定 `interval_seconds` ≥ 60 秒，故 `min(...)` 恒取下界）。
+   ⇒ **`interval_seconds` 配成 1800 还是 7200，对抓取行为毫无差别。**
+
+2. **没有任何调度器。** `src/atlas/` 下不存在周期执行采集的循环
+   （仅有的 `while True` 都是请求处理 / 边车读帧 / 解析器 / 摘要生成，与周期采集无关）。
+   采集**只在有人手工敲 `python -m atlas.compose run` 时发生**。
+
+3. **两个能力都假设了"定期执行"，却都没有执行者**：
+   - §2.12 说 `interval_seconds` 是"**轮询周期**"——但没有东西按它轮询；
+   - §4.2 的 T-111 写着"**定期**健康检查"——`probe_registry` 没有任何周期性调用者。
+
+4. **§5 延后登记表里没有"调度"这一项。** 第 3 项是"编排引擎"（已关闭为不需要），
+   而**调度 ≠ 编排**：编排是"一次多步依赖怎么跑"，调度是"什么时候再跑一次"。
+   后者从未被登记，因此不是"有意的延后"，而是**漏掉的需求**。
+
+**与 §1.5 的冲突**：§1.5 写"运行形态：**永不停歇的在线服务**"、使用频率"约每天一次"。
+现状是：服务**启动不了**（§6.6 第 3 条），就算启动了也**不会自己采集**（本条）。
+
+> **✅ 已裁决（2026-09-26，用户批准）：补一个最小调度器，不由 cron 之外的常驻循环承担。**
+> 落地任务 **T-207**（见 §4.2）。裁决内容与理由：
+>
+> 1. **调度 ≠ 编排**（本节第 4 条已区分）：本项**不是**把 T-204 的编排引擎重新打开——
+>    T-204 关的是"一次多步依赖怎么跑"，本项是"什么时候再跑一次"。T-110 的 `TaskRunner` 仍然是执行者。
+> 2. **触发者用系统 cron**，不新增常驻进程、不新增常驻状态：cron 每 5 分钟调一次
+>    `python -m atlas.compose run --due-only`，由流水线自己按 `interval_seconds` 判"这一轮该采哪些渠道"。
+>    §1.5 的"永不停歇的在线服务"因此由**两件已存在的东西**组成（Web UI 常驻 + cron 定时），
+>    而不是一个新的守护进程。
+> 3. **`interval_seconds` 从"已配置但无效"变成真正的判据**，且判据落在**它自己的语义**上：
+>    它是**轮询周期**（§2.12），因此只能决定"这个渠道这一轮到没到"，**不得**再被当成同域请求间隔
+>    （§2.12 已明确那是 `rate_limit_seconds` 的职责）——`throttle.min_interval_for()` 的取值规则**不动**。
+> 4. **"到期状态"不新建表、不新建状态文件**：它可以从**已有的** `raw_records.fetched_at`
+>    按渠道取 `MAX` 算出来（Raw 是 append-only 的事实来源，本来就要留着）。
+>    §2.10 的"新增表必须先登记"因此不被触发。
+> 5. **两层职责必须分开报，不能混成一个"成功"**：调度层决定"**尝试**哪些渠道"，
+>    执行层的幂等（同渠道配置 + 同窗口 id ⇒ 跳过）决定"**是否真的采**"。
+>    默认窗口是 **UTC 小时桶**（`parse_window`），其下限大于任何合法 `interval_seconds`（≥60s），
+>    因此同一小时内一个已到期的渠道**可能被判为 due 但实际跳过**。这是**有意的失败安全**，
+>    不是缺陷；但必须**显式报告**，否则又会变成 §7.3 失败模式 3（静默失效）。
+>
+> ⚠️ **历史状态（已不再成立）**：在 T-207 落地**之前**，`interval_seconds` 是"已配置但无效"的。
+
+> **✅ 已落地（T-207，`f342e97`），§6.7 的缺口闭合。** 落地时有两处必须写明的差异：
+>
+> 1. **CLI 旗标是 `--due-only`，不是本节最初写的 `--only-due`**。2026-10-25 实测：
+>    `python -m atlas.compose plan --only-due` 被 argparse 拒绝（**exit 2**，
+>    `unrecognized arguments: --only-due`），`plan --due-only` 正常（exit 0）。
+>    本节已按实现更正——照旧抄进 crontab 只会每 5 分钟报一次参数错误。
+> 2. `run` 仍然要求 `ATLAS_LIVE=1`（§2.12 的合规默认值是"不主动抓"），cron 行必须显式设置；
+>    `atlas.schedule` 的模块文档给出了一行可直接抄的示例。
+>
+> 调度层与执行层的分工、以及"同一小时桶内可能 due 但被幂等跳过"这条**有意的失败安全**，
+> 都已由 `tests/test_compose_cli_schedule.py` 钉死（含"没有到期渠道 ⇒ 退出码 0"的边界）。
+
+---
+
+### 6.8 测试判据自身的前提也会不成立（T-208）
+
+`tests/test_feed_http.py::test_server_close_releases_port` 原先断言"服务 `close()` 之后再连
+**必须**抛 `urllib.error.URLError`"。这条判据依赖两个前提，**两个都被实测推翻**：
+
+| 前提 | 实测（2026-10-09，本机 WSL） |
+|---|---|
+| "关掉之后就连不上了" | 内核允许刚 `close()` 的端口被新的监听者接管：不带 `SO_REUSEADDR` 的 `bind` 一律 `EADDRINUSE`（**400/400**），带 `SO_REUSEADDR` 的 `bind`+`listen` 可以盖着 TIME_WAIT 成功（**400/400**）。本仓库每台 `FeedHTTPServer` 都设了 `allow_reuse_address = True` |
+| "失败一定抛 `URLError`" | `urllib` 只把 **connect/send** 阶段的 `OSError` 包成 `URLError`（`getresponse()` 在 `try` 之外）：端口被接管后，接管者以 RST 收尾 ⇒ 裸 `ConnectionResetError [Errno 104]`（**30/30**），静默收尾 ⇒ 裸 `RemoteDisconnected`（**30/30**） |
+
+因此那条断言会在**接线完全正确**时偶发失败——它测的是环境时序，不是本服务的关闭行为。
+
+**现判据分两层**（都不依赖异常类型）：
+
+1. **实例级、确定性**：`close()` 后本服务的监听套接字必须 `fileno() == -1`；
+2. **端到端**：同一路径不得再收到任何 HTTP 响应（连接层失败都算通过；**收到响应即判红**），
+   并以关闭前同一路径的 200 作活对照。
+
+**控制探针**（`ALL_CONTROLS_OK`，2026-10-25 独立重跑 3 轮）：`close()` 正常 ⇒ PASS；
+`close()` 换成 no-op 或只 `shutdown()` 不 `server_close()` ⇒ **必红**（命中第 1 层）；
+服务不关时第 2 层确实收到响应 ⇒ 说明"收到响应即判红"有牙。
+
+> **一条不能省略的否定结果**：把第 2 跳强制 self-connect（原本以为能让旧判据"必红"），
+> 旧版与新版**各 10 次全部 PASS** ⇒ 这个控制**不能**证明"旧判据会失败"。
+> 能证明 flake 机制的是上面的端口复用探针（400/400 的 bind 覆盖），不是它。
+> 记在这里，是因为**一个不会失败的控制，和一个不会失败的测试一样没有价值**（§6.6 第 4 条）。
+
+---
+
+### 6.9 OMV 运行恢复与首次持续采集（2026-10-26）
+
+用户在本轮进度复核后授权恢复运行、解决探针标签干扰，并启用定时采集。
+当前机器为 OMV Linux；下述命令替代 §8 与 `CLAUDE.md` 中历史 WSL 路径。
+
+**运行环境与部署**
+
+- Python **3.13.5**，环境为 `.venv-new`，按现有锁文件恢复，无新增第三方依赖：
+  `UV_PROJECT_ENVIRONMENT=.venv-new uv sync --frozen --python /usr/bin/python3.13`。
+- 认知边车在 `src/atlas/cognition/sidecar` 执行 `npm ci --no-audit --no-fund` 恢复。
+  本轮**未调用付费模型**；定时任务显式关闭机器分类。
+- `atlas-web.service` 已安装并设为开机自启，监听 **127.0.0.1:8765**，署名 `me`。
+  仓库模板为 `config/atlas-web.service.in`，部署时把 `@ATLAS_ROOT@` 替换为项目绝对路径，
+  写入 `/etc/systemd/system/atlas-web.service`，再 `systemctl daemon-reload` / `enable --now`。
+- 随后用户明确要求绑定 **`atlas.sharany.com`**。已复用本机现有 Cloudflare Tunnel
+  `e7a2474a-87e3-40fc-8f2f-a0c2a014eda4`，在 `/etc/cloudflared/config.yml` 增加
+  `atlas.sharany.com → http://127.0.0.1:8765`，并创建指向该隧道的 DNS CNAME。
+  ingress 校验与 hostname 匹配通过，重启 `cloudflared.service` 后四条连接注册成功。
+  HTTPS 外网请求先跳转到**现有 Cloudflare Access 登录页**；该结果验证的是边缘访问入口，
+  并非未登录即可读取应用。原站 `/health` 已独立验证 HTTP 200 / `service=atlas-webui`。
+  配置备份：`.tmp_atlas/cloudflared-20261026T013313Z/config.yml.before`。
+- `/etc/cron.d/atlas` 每 **5 分钟**调用 `scripts/collect-due.sh`，只采到期渠道。
+  真实采集开关只在机器的 cron 中显式开启；cron 同时携带本机可用的网络代理设置。
+  脚本用 `flock` 避免重叠，外层 `timeout` 限制单轮 20 分钟。
+- Web 日志：`journalctl -u atlas-web.service`；采集日志：`logs/compose-run.log`。
+  `/etc/logrotate.d/atlas` 已配置压缩轮转。
+
+**两项运行接线修正**
+
+1. **标签投影按当前署名过滤**：生产装配把 `actor` 注入 `StoreLabelAccess`，
+   标签键、最新取值、条目详情、已打标/未打标筛选使用相同范围，页面显示当前署名。
+   默认署名 `me`，实测已打标从 22 条变为 **2 条**。
+   这只是浏览投影，**不是鉴权**；无署名限制的审计入口与全部 4 行历史标签保留。
+2. **在线采集不要求重启 Web**：不再在启动时冻结 raw 清单与容器类别；
+   新 raw 的存在与条目化按需读取，单份不可变 raw 的类别仍可缓存。
+   回归测试用另一条归档连接追加 feed，随后在原 Web 实例上浏览并提交带锚点的标签。
+
+**首轮真实数据与部分失败的边界**
+
+- 首轮采集收到 **10/13** 个渠道的响应，归档从 **75 → 84**（同内容归档自然复用）。
+  3 个渠道明确失败：`ai-techpark` 的 robots.txt 为 403、`openai-blog` 为 HTTP 403、
+  `venturebeat-ai` 为 HTTP 429；未尝试绕过限制。
+- `ai-news-blog` 虽返回 HTTP 202，实际是验证码跳转 HTML，归一化后为空。
+  原严格模式因此让整条链路停在 normalize；原始响应已正确归档。
+- **本轮明确扩展 `--allow-partial`**：除渠道采集失败外，允许把**空正文**逐条记入
+  `normalize.observed.failures`（`kind=empty_text`，含 channel/raw/reason），
+  不为其写归一化缓存、不传给下游，其余可用正文继续。
+  **默认严格模式不变；整轮全部空正文仍失败；指纹与偏移不变量错误仍立即失败。**
+- 使用同一窗口的已持久化采集/归档产物恢复后，链路退出码 **0**：
+  normalize **10 输入 / 9 可用 / 1 明确拒绝**，没有失败或阻塞的任务节点。
+  这是**部分渠道可用**，不是“13 个渠道全部采集成功”。恢复日志为 `logs/compose-recovery.log`。
+- Web 未重启（同一 PID），可浏览条目从 **897 → 933**；`/health`、feed、已打标筛选均 HTTP 200。
+  人工标签仍 4 行（真实 2 + 探针 2），机器提议 1379、运行账 895、证据锚点 1268 均未增长。
+
+**真实回归测试与在线事实分开取数**
+
+历史回归里的 75 份原文 / 830 个派生条目是**固定语料的期望值**，不应约束持续增长的在线库。
+`tests._realdata.real_store_root()` 现在默认读取 **`data/test-baseline/store`**：
+它是启用采集前保存的完整真实快照，不含本轮新采集数据，仍不进 git。
+可用 `ATLAS_TEST_STORE_ROOT` 指向同一基线的其它完整副本；缺失时真实数据测试自跳过。
+迁移机器时需同时保留这份快照，不能拿已增长的在线库直接替换固定语料。
+在线新增内容的可浏览、可打标行为由使用临时归档与真实 HTTP 的联调测试独立验证。
+
+最终门禁：`ATLAS_COGNITION_LIVE_TESTS=0 .venv-new/bin/python -m pytest tests -ra`，
+**1708 passed / 6 skipped，158.93 s，退出码 0**；6 条跳过均为默认关闭的付费模型调用。
+此外已验证采集入口的显式开启门禁、重叠任务跳过，以及 systemd 单元语法与启动状态。
+**09:30 的 cron 已实际触发并跑通**：本轮 6 个到期渠道，3 个采集成功、3 个明确失败，
+3 份归档均有可用正文，7 个任务节点成功，无失败或阻塞节点。
+
+本轮采集前的完整可恢复备份位于 `.tmp_atlas/before-runtime-20261026T011757Z/`，
+内有 `store/` 与记录表计数、库摘要、全部人工标签的 `manifest.json`。
+停止运行可执行 `systemctl disable --now atlas-web.service`，再移除 `/etc/cron.d/atlas`。
+代码回退不需要回滚数据：本轮未新增物理表，原文与人工记录保持 append-only。
+
+---
+
+### 6.10 手机浏览反馈：空订阅与归档信息展示（2026-10-26）
+
+用户的手机截图暴露了两项实际问题：没有文章的 arXiv RSS 被当成整篇文章；
+默认卡片展示 raw id、字符区间、HTTP 状态与指纹，挤占了标题和打标操作。
+
+- **修正容器判据**：内容已识别为 RSS/Atom 即为订阅容器，是否有条目是另一件事。
+  `RawEntriesView` 可选的 `is_feed` / `problems` 区分“已确认是订阅，但没有可展示文章”
+  与“没有解析结论”。前者不生成整篇文章卡片，原因进入 `FeedResult.notices`，
+  页面可在“订阅与浏览提示”中展开查看；原始归档在文档粒度仍可查询。
+  未识别的 XML 与既有无判形信息的调用方继续显示原文，不静默隐藏解析失败。
+  既有 JSON HTTP 响应形状不变，本轮未增加 JSON 文章解析器。
+- **移动端卡片**：默认展示标题、来源、日期、行业与打标操作；归档区间、指纹、
+  raw id、完整时间戳和原文链接仍保留在原生 `details` 中。
+  行业修正与筛选器也可展开，标签状态切换显示当前选中项。
+- 按钮与表单控件使用 16px 字号和至少 44px 高度，支持键盘焦点、深色模式，
+  不增加前端框架、构建步骤或第三方依赖。
+- **回归**：新增 RSS / Atom 空订阅及未知 XML 的真实 HTTP 测试，验证正文条目正常、
+  空订阅有提示且不冒充文章、原文在文档视图保留、浏览前后库摘要相同。
+  完整测试 **1710 passed / 6 skipped，159.98 s，退出码 0**；跳过项仍为付费模型调用。
+- **浏览器验证**：Chromium 实测 375px 手机、812px 横屏、1366px 桌面及手机深色模式，
+  均无横向溢出；展开归档、行业修正与筛选器后仍无溢出。
+  截图和测量脚本保存在 `.tmp_atlas/mobile-review/`，不是新的进度文档。
+
+---
+
+### 6.11 付费模型调用调试（2026-10-26）
+
+用户明确授权调试此前默认跳过的真实付费调用。本轮先检查配置与 Node 边车，
+再分别验证两条路由，以及使用当前 8 个行业标签的有界分类样本。
+
+| 直接调用 | 请求模型 | 端到端耗时 | input / output | 结果 |
+|---|---|---|---|---|
+| DeepSeek 官方 | `deepseek-flash` | 4315 ms | 375 / 624 | OK，3 条提议，3/3 引文逐字存在 |
+| OpenRouter 兼容路由 | `deepseek/deepseek-v4-flash` | 5795 ms | 428 / 473 | OK，3 条提议，3/3 引文逐字存在 |
+
+两条路由均声明零工具、调用零工具。调用记录未提供可核对的实付金额，因此登记 token
+与耗时，不将它们换算成账单；`response_model` 未报告，表中登记的是请求模型。
+
+**本轮发现并修复测试的费用边界错误**：`SAMPLE_FEED_UNITS=8` 原先只声明了常量，
+`_sample_jobs()` 实际传的是整份 feed 字节，之后会再次展开全部条目。
+现在先从原文建立分类单元，再明确截取 **8 个 feed 单元 + 3 篇文章 = 11 个单元**，
+保留每个单元原始指纹与锚点。测试按批次上限 4、重试 0 执行，新增不付费的样本边界断言。
+
+**真实分类结果**：11 个单元全部有分类产出，7 次请求全部成功、无降级或重试；
+23 条提议均可归属，引文逐字匹配所在单元。独立重开临时库读到 23 行 classified 与
+11 行运行账。input **6436**、output **8436**（其中 reasoning **7086**），合计 **14872**
+token；模型调用累计 **54682 ms**，整条测试 **60.75 s**。这是样本产出率，不是人工评估的准确率。
+
+验证命令与结果：
+
+- `ATLAS_COGNITION_LIVE_TESTS=1 .venv-new/bin/python -m pytest tests/test_cognition_real_call.py -k criterion -ra -s`
+  → **5 passed**，17.08 s。
+- 同一环境下运行 `tests/test_classify_realdata.py::test_real_pipeline_writes_and_reads_back`
+  → **1 passed**，60.75 s。
+- 关闭 live 开关后，两个相关测试文件 → **8 passed / 6 skipped**，0.72 s；
+  付费调用仍需显式开启，默认门禁保持有效。
+
+证据保存于 `.tmp_atlas/paid-debug/`，分类数据库仅写入其 `pytest-live/` 临时目录。
+正式库核对：人工标签 **4**、机器提议 **1379**、运行账 **895**、证据锚点 **1268**，
+均与调试前一致。本轮没有触发整库重分类或改变定时任务的模型开关。
+
+---
+
+### 6.12 OpenCode Go 路由与正式库处理前盘点（2026-10-26）
+
+用户询问正式库处理方式后，盘点得到 **86 份 raw / 925 个可分类单元**：
+旧标签空间已分类 **845**、未分类 **50**，新入库尚未分类 **30**。
+已用 SQLite backup 保存一致性备份于 `.tmp_atlas/before-production-classify-20261026T022838Z/`，
+另存全部人工标签与表计数、增量 80 单元的计划。
+用户随后指定“先把 opencode go 加上，key 可以找 Hermes 的”，因此先完成本节接入。
+正式库处理范围（补 80 个单元或全量重跑 925 个）尚未选定，本轮未进行正式库分类写入。
+
+**独立路由**：`ATLAS_COGNITION_ROUTE=opencode-go`，provider `opencode-go`。
+下表记录首次接入时的配置；当前默认模型已按 §6.13 切换。
+
+| 配置 | 默认 / 来源 |
+|---|---|
+| 凭据 | `OPENCODE_GO_API_KEY`，按用户指令从 Hermes `.env` 一次性导入 Atlas `.env.local` |
+| 模型 | `glm-5.3-flash`，可用 `OPENCODE_GO_MODEL` 覆盖 |
+| API 根 | `https://opencode.ai/inference/go/openai/v1`，可用 `OPENCODE_GO_BASE_URL` 覆盖 |
+| 客户端标识 | `User-Agent: Atlas/0.1` |
+| 会话标识 | `x-opencode-session: atlas-<raw_id 的 SHA256 前 32 位>`，同一原文的批次保持一致 |
+
+端点与请求头依据 [OpenCode Go 官方文档](https://opencode.ai/v2/docs/console/go)，
+并通过实际模型列表接口及真实调用核验。Atlas 使用自己的客户端标识。
+运行时只读自己的配置，不依赖或扫描 Hermes 凭据目录；本地 `.env.local` 权限 **0600**，
+已确认被 git 忽略。三条路由各用独立凭据，不覆盖 OpenRouter 的配置。
+默认路由保持 DeepSeek，切换需显式指定上述环境变量。
+
+**实测**：Go 的 `glm-5.3-flash` 返回结构化 OK，端到端 **3159 ms**（模型侧 **3011 ms**），
+input **353** / output **136**（reasoning **67**）/ total **489** token，
+1 条提议的引文逐字存在于原文，声明与调用工具均为 0。
+随后单独开启 Go 真实测试 → **1 passed，2.77 s**。
+本机 HTTP 对照测试确认 Go 凭据、Atlas 客户端头与稳定会话头真正到达服务端，
+且相同 raw 的不同批次会话相同、不同 raw 的会话不同。
+
+完整默认门禁 → **1716 passed / 7 skipped，160.64 s，退出码 0**。
+7 条付费测试仍由 live 开关控制；本节 Go 真实测试另行显式运行并通过。
+测量结果保存在 `.tmp_atlas/paid-debug/opencode-go.json` 与同目录的 live 测试日志。
+
+单独验证 Go 可运行：
+
+```bash
+.venv-new/bin/python tools/t003_real_call.py --route opencode-go --json
+```
+
+---
+
+### 6.13 提交推送与 Go 默认模型切换（2026-10-26）
+
+用户要求先提交并推送已有工作，再把 Go 模型换成免费的 LongCat。
+运行恢复、手机浏览修复、Go 接入已提交为 `679aeaf`，
+独立 worktree 复核发现只读快照测试虽然选择了冻结数据，诊断函数仍引用正式库路径；
+修正测试接线后单独提交为 `32df787`，相关 8 项测试通过。
+最终提交在独立 worktree 完整复核 **1697 passed / 26 skipped，146.27 s，退出码 0**；
+随后已推送到 GitHub `rebaseline`，并读取远端 ref 确认是 `32df787`。
+缺少旧系统归档的真实数据测试及 live 调用测试按约定跳过，边车依赖与冻结快照已提供。
+
+**模型切换**：Go 默认模型由 `glm-5.3-flash` 改为 `longcat-2.5-preview-free`，
+仍支持 `OPENCODE_GO_MODEL` 显式覆盖，沿用 Go 独立凭据、端点及会话头。
+DeepSeek / OpenRouter 的模型与默认路由不变，没有增加自动切换模型的逻辑。
+
+**实际可用性优先于模型清单**：本轮官方文档与 `/inference/go/v1/models` 未列出该免费模型，
+但用 Atlas 自身客户端与会话标识直接调用成功；因此不把“清单缺失”当作“不可调用”。
+完整链路实测 **OK**，端到端 **9515 ms**（模型侧 **9365 ms**），
+input **375** / output **461** / total **836** token；
+3 条提议的引文全部逐字命中原文，工具声明与调用均为 0。
+响应未提供金额，不能从本次响应独立确认结算费用。
+证据：`.tmp_atlas/paid-debug/opencode-go-longcat.json`。
+本次模型选择仅调用测量脚本，未写正式库分类结果。
+Go 配置、调用幂等与降级相关测试 **45 passed，17.61 s**。
+
+---
+
+### 6.14 第二次手机反馈：Hacker News JSON 与验证码页（2026-10-26）
+
+截图仍把 `hn.algolia.com/api/v1/search_by_date` 作为一篇文章展示。
+只读检查确认：该响应实际包含 20 条新闻；同期 `ai-news-blog` 返回 HTTP 202
+与跳转到 `/.well-known/sgcaptcha/` 的 HTML，不能视为文章。
+
+**浏览适配**：新增 `atlas.entries.adapters`，从 Algolia 的 `hits` 数组派生新闻条目，
+使用真实标题、外链及 `created_at`；无外链时使用真实 `objectID` 对应的 HN 讨论页。
+缺标题、链接或日期均保留诊断，不生成虚构字段。
+`JSONDecoder.raw_decode` 在解码后的原始文本上定位每个对象，锚点区间不通过重新序列化推算。
+嵌套对象、转义字符串、重复标题和中文输入均有回归覆盖；
+JSON 条目使用独立的 `algolia-hn-v1` ID 版本，既有 XML 解析器与 ID 不变。
+组合根沿用 `EntryView` 接线，归档查看与单条打标均通过本机 HTTP 验证。
+
+**不可用响应**：按 HTML 的实际 meta refresh 目标识别验证码页，
+通过可选 `unavailable_reason` 把它展示为订阅提示，不作为文章卡片。
+相同提示去重；文档粒度仍可查看原始归档，未知 XML 与其他内容保持可检查。
+启动统计排除明确不可用的响应，与文章列表采用一致口径。
+
+**实测**：当前 89 份归档含 4 份 HN 响应（80 条新闻）和 3 份验证码页；
+浏览可用条目 **1016**，其中容器派生 950、直接条目 66。
+冻结的 75 份真实快照则由旧浏览口径 897 调整为 **916**：
+8 份 XML 的 830 条 + 1 份 HN 的 20 条 + 66 份整篇。
+原始归档未变化，测试逐页核对不重不漏。
+
+**验证与部署**：完整默认回归其余 **1724 passed / 7 skipped**，两处旧浏览统计断言
+按新增的 HN 条目更新后，包含该文件的相关 **80 项全部通过（4.35 s）**。
+本机浏览器检查手机、横屏、桌面、深色模式，无横向溢出，按钮高度至少 44 px；
+截图和日志保存在 `.tmp_atlas/subscription-review/`。
+已重启 `atlas-web.service`，原站 `/health` HTTP 200，首页显示真实新闻标题；
+Cloudflare Tunnel 服务仍为 active。
+部署前后核对 confirmed 5、proposed 1379、runs 895、evidence 1268，
+人工标签完整内容摘要相同，未写入正式库机器分类结果。
+
+本节仅改变浏览投影；行业仍来自现有配置 / 人工标签，不把浏览新增的 JSON 新闻计作
+已经完成的 AI 分类。后续全量重分类授权与实际阻塞见 §6.15。
+
+---
+
+### 6.15 已授权全量重分类，免费 LongCat 被服务端下架阻断（2026-10-26）
+
+用户明确指定使用免费的 LongCat 重跑正式库全量，§6.12 的范围选择已确定为**全量**。
+14:19（Asia/Shanghai）冻结快照：**99** 份原始归档，按现有 8 个行业标签
+`cfg-v0011-185a4e5a2219` 共 **1509** 个分类单元，包含 **140** 条 HN 新闻。
+另有 7 份不支持的 HTML 与 5 份空订阅，逐项保留跳过原因。
+HN 采用既有浏览适配器的原始 JSON 对象区间与 ID，构造 `Unit` 交给 `propose_units`；
+输入只截取对象原始文本前 2000 字符，未用重新序列化的 JSON 计算区间。
+
+**执行前备份与计划**：SQLite backup 与完整人工标签、逐 raw 计划保存在
+`.tmp_atlas/longcat-full/20261026T061936Z/`，备份为 `before.db`。
+模型固定为 `opencode-go / longcat-2.5-preview-free`，没有切到付费的 `longcat-2.0`。
+批次沿用 ≤4 单元 / ≤6000 字符 / 最多 2 次重试，3 路请求并行，数据库写入由存储锁串行化。
+522 个初始批次的完整输入与设置已保存，支持审计与后续续跑。
+
+**实际阻塞**：14:22 开始调用后，服务端统一返回：
+
+```text
+410: {"type":"ModelDeprecated","message":"Model longcat-2.5-preview-free has been deprecated."}
+```
+
+这与 §6.13 上午的真实成功记录并存：上午可调用，当前已明确下架，不能沿用旧验证结果。
+再次查询当前模型接口只列出 `longcat-2.0`，未列免费 LongCat。
+[当前官方 Go 文档](https://opencode.ai/v2/docs/console/go) 中仍有收费的 LongCat-2.0
+与限时免费的 Beam；后者有地区限制，不将两者视为免费 LongCat 的自动替代。
+
+**没有完成重分类**：批处理已停止；初始停止条件漏掉 410 / `model_deprecated`，
+导致 51 次请求重复遇到同一下架错误，input/output token 均为 0。
+已有 **108** 个单元追加明确的 `unclassified / model_deprecated` 审计记录，
+**0** 个成功分类；没有把这次错误当作完成，也没有删除失败记录掩盖事实。
+停止条件已补齐，且新增正式库写入前的单批可用性检查；
+用同一路径的 410 拒绝和成功对照验证保护，无额外网络调用或正式库写入。
+
+**数据完整性**：以备份为基准对五张表做整行 EXCEPT 比对，旧记录缺失 / 改写均为 0。
+原始归档 99、人工标签 5、证据 1268 保持；proposed 1379 → 1487、runs 895 → 1003，
+增加部分全部为上述下架失败。原有分类与人工判断完整保留，备份摘要核验一致。
+详细观测在该目录的 `calls.jsonl`、`batches.jsonl`、`stopped-report.json`、
+`baseline-retention.json`；`progress.json` 状态明确为 `stopped_model_deprecated`。
+随后用户明确改用 DeepSeek V4.1 Flash，后续执行见 §6.16；未调用 Beam。
+
+---
+
+### 6.16 DeepSeek V4.1 Flash 正式库全量重分类（2026-10-26，已执行并对账）
+
+用户在免费 LongCat 下架后明确指定 **DeepSeek V4.1 Flash**，继续先前已授权的全量任务。
+使用现有 `opencode-go` 路由与独立凭据，模型固定为 `deepseek-v4.1-flash`；
+已通过当前模型接口确认标识存在，并在正式库写入前完成真实单批校验，
+响应结构正常且引文可归属，随后才启动全量执行。
+Go 默认模型与协议表、配置回归断言同步更新；相关 **45 项测试通过（18.53 s）**。
+DeepSeek 官方直连 / OpenRouter 的既有默认配置未改，定时采集仍不调用模型。
+
+**14:31（Asia/Shanghai）一致性快照**：99 份原始归档、1509 个可分类单元（含 140 条 HN），
+8 个行业、`cfg-v0011-185a4e5a2219`；12 份空订阅 / 不支持的 HTML 显式跳过。
+备份和逐单元输入保存在 `.tmp_atlas/deepseek41-full/20261026T063132Z/`，
+本轮入口为 `.tmp_atlas/deepseek41-full/run.py`。
+原有 5 条人工标签、旧分类结果以及 LongCat 下架失败审计均保留。
+批次和重试沿用既定策略，3 路模型请求并行，存储锁串行化数据库写入；
+每批独立记运行账，已完成的单元不会因中断而丢失。
+
+**全量执行结果**：主快照 **1509 / 1509** 单元全部执行，1458 分类、51 未分类，
+耗时 **2027.3 s**。随后在采集锁内补齐期间新增的 2 份归档：1 份 HN 的 20 条新闻
+与 1 份验证码页，补跑 20 单元耗时 **20.4 s**，16 分类、4 未分类。
+最终范围 **101** 份归档，**1529 / 1529** 个单元均有新模型运行账：
+**1474 已分类（96.4%）/ 55 未分类**，后者全部为 `no_claim_extracted`，不强行生成标签。
+13 份无可分类单元的原始响应（8 HTML / 5 空订阅）保留明确跳过原因。
+当前归档清单与原快照 + 补齐清单对账一致，没有遗漏范围内单元。
+
+共 **577** 次请求尝试（包含 2 次单批预检），其中 561 OK、16 降级，瞬时失败经过有界重试恢复。
+input **709460** / output **540158** token；reasoning **420090** 已包含于 output，
+不重复相加。响应未提供结算金额；客户端声明及调用工具均为 0。
+
+**提议与证据**：新写提议 **2050** 行：1991 分类、53 未分类、6 未归属审计；
+另有 **89** 行按内容幂等复用旧版本，故不能把新模型提议行数当作单元覆盖率。
+覆盖率以新模型的 **1529** 条运行账与冻结单元 ID 集合逐一核对。
+1991 条新分类提议经原文与所属单元区间核验：**1947** 条验证通过，
+**39** 条未找到引文、**5** 条匹配落在所属单元之外，后两类保留未验证，不写伪造锚点。
+本次核验新增证据 1930 条（其余 17 条已由同期管线写入并幂等复用），
+证据库最终 **3215** 行。
+
+新分类提议按标签计数（多标签 / 多引文按行计，不等于单元数）：
+machine-learning 746、natural-language 427、computer-vision 414、
+software-engineering 122、statistical-learning 121、other 71、
+data-science 46、business-and-markets 44。
+
+**完整性与交付**：对 raw / confirmed / proposed / runs / evidence 五张表做备份整行 EXCEPT
+比对，旧记录缺失或改写均为 0；101 份原始归档内容 SHA256 全部匹配。
+原有 confirmed **5 → 5**；proposed **1487 → 3537**、runs **1003 → 2532**、
+evidence **1268 → 3215**。Web 与 Tunnel 仍 active，`/health` 与 `/feed` HTTP 200。
+逐次调用、批次与进度为该目录的 `calls.jsonl`、`batches.jsonl`、`progress.json`；
+补齐观测在 `catchup/`，完整对账为 `final-report.json`，引文校验为 `evidence-final.json`。
+`coverage.csv` 提供全部 1529 个单元的状态 / 原因；`new-proposals.csv` 导出本轮新写提议。
+本轮仅写机器提议、运行账和已验证证据，没有把机器建议转换成人工确认；
+本节结束时网页仍沿用渠道配置 / 人工标签；随后已由 §6.17 接上逐篇分类显示。
+
+---
+
+### 6.17 网页展示逐篇 AI 分类与人工修正优先级（2026-10-26）
+
+用户追问 `atlas.sharany.com` 为什么未反映刚跑出的分类，确认此前只完成入库，
+网页仍按渠道默认行业展示。本轮补齐正式网页的数据接线并重启线上服务。
+
+**只读分类入口**：`atlas.cognition.read_classifications` 用 SQLite `mode=ro` 与一致快照
+按每个 unit 最新运行决定状态；不创建库 / 表，不调用模型，不长期缓存旧结果。
+通过组合根注入逐条目投影，查询 / 渲染包仍不 import 认知层实现。
+有新运行但未分类时明确显示“AI 未分类”，不能退回显示旧模型标签。
+没有运行的数据以“渠道配置”标明来源；人工行业修正显示“人工确认”并优先。
+当前可追溯的 1423 个新 plan 分类显示“AI 建议”；51 个因内容幂等而只保存旧提议的
+分类单元显示“历史 AI 建议”，不能把历史标签集合冒充新模型的完整输出。
+
+**逐篇人工判断**：仅使用当前署名的文档级与完全匹配原文四元组的条目级标签；
+条目级覆盖文档级，同一标签取该范围的最新判断，不能将一篇的行业套给同订阅其它文章。
+AI 建议不计入“已打标”。行业（含多行业建议）、标签及已打标筛选先作用到逐篇投影，
+再计算 total 和分页；保留既有标签 OR 筛选口径。
+列表与归档详情页显示相同来源；投影强制保持 raw_id / raw_sha256 / entry_id / 字符区间，
+不允许展示接线改动原始锚点。
+
+**实测与上线**：完整默认回归 **1731 passed / 7 skipped，163.68 s，退出码 0**。
+覆盖只读文件摘要、不创建缺失数据库、半缺失结构响亮失败、历史复用来源、
+最新失败不显示旧标签、动态入库无需重启、人工逐篇优先、筛选后分页、AI 不算人工打标，
+以及锚点被修改时拒绝返回（含同路径成功对照）。
+手机 / 横屏 / 桌面 / 深色模式无横向溢出，按钮至少 44 px，
+浏览器产物位于 `.tmp_atlas/ai-web-review/`。
+已更新 `atlas-web.service`，原站 `/health` 与 `/feed` HTTP 200；
+软件工程建议已出现在首页，`industry=business-and-markets` 返回 44 篇并显示对应 AI 建议，
+详情页也可见相同建议。Cloudflare 入口仍使用原有 Access 登录，无访问策略变更。
+页面验证前后 confirmed 5、proposed 3537、runs 2532、evidence 3215 不变，
+人工标签完整内容摘要一致。此轮没有发起新的模型调用或写人工判断。
+
+---
+
+### 6.18 Feed 中文文章简介（2026-10-26）
+
+Feed 卡片增加最多 **300 个 Unicode 字符**的文章简介，优先中文。
+原文已有中文简介时直接使用，否则展示已生成的中文缓存；尚未缓存的新文章先显示
+原文摘录。RSS / Atom 使用条目正文或摘要，整篇归档使用正文摘录；
+Hacker News 仅取实际 `story_text` / `text`，不能把 JSON 元数据当作文章正文。
+只有标题的条目只做标题译述，明确标记“标题译述”，不编造正文内容；
+其余生成结果标记“AI 中文简介”。专有名词、项目名和文件名可保留原文。
+
+**缓存与边界**：新增 `atlas.cognition.briefs`，以版本、标题、正文及来源类型的摘要
+作为缓存键，去重相同来源内容，独立保存在 `data/store/briefs.db`。
+SQLite 长度约束与页面输出均限制 300 字；读取使用只读连接，不创建缺失数据库。
+简介属于派生展示数据，不作为分类证据，不改原始归档、条目锚点、人工标签或原有分类。
+组合根注入 `FeedEntry.summary` / `summary_origin`，查询与页面层不直接依赖认知实现。
+
+**显式生成**：使用 `.venv-new/bin/python -m atlas.briefs_cli` 补齐缓存，
+按最新采集优先，跳过已有缓存及原生中文内容；每组最多 8 条、24000 个输入字符，
+默认 3 路并发，瞬时错误最多尝试 3 次，永久错误停止继续派发，重跑复用已完成缓存。
+使用 Go 路由的 DeepSeek V4.1 Flash，独立简介 JSON 合同，关闭 thinking，无工具调用；
+不改变既有行业提议合同。短编号映射回来源摘要，要求返回条目集合完全匹配，
+对缺项、重复项及非中文输出拒绝落库；只有标题的原样文件名可转为忠实的中文标题句。
+页面刷新、翻页及现有定时采集均不触发付费简介调用；新增内容可再次执行 CLI 补齐。
+
+**实测与上线**：已缓存 **1475** 份去重后的中文简介，平均 179.7 字，最长 300 字。
+逐页检查正式 Feed 的 **1570** 张卡片，全部含中文且不超过 300 字，
+其中 1407 张显示“AI 中文简介”，163 张显示“标题译述”。再次执行 CLI 新增 0 条，
+没有模型调用。中途的编号不匹配和纯文件名输出均被拒绝，修正后续跑完成，未保存错误对应关系。
+完整回归 **1740 passed / 7 skipped，177.32 s**；针对性回归 53 passed。
+手机、横屏、桌面及深色模式检查通过，浏览器与分页验证产物位于
+`.tmp_atlas/brief-review/`，生成记录位于 `.tmp_atlas/briefs/`。
+已重启 `atlas-web.service`，原站 `/health` 与 `/feed` HTTP 200，隧道服务正常，
+Cloudflare Access 策略不变。验证前后 confirmed 5、proposed 3537、runs 2532、
+evidence 3215 不变，人工标签完整内容摘要一致。
+
+---
+
+### 6.19 结合正文的独立译题、简介与正式库持久化（2026-10-26）
+
+用户进一步明确四项要求，本节取代 §6.18 的标题译述、原生中文跳过和独立缓存显示策略：
+
+- 英文原标题保留，中文译题紧跟其下；模型结合正文语境翻译，译题与简介分开。
+- 无有效摘要时先读取原文正文，再生成简介，不能把标题翻译冒充简介。
+- 译题、简介写入正式 `data/store/atlas.db` 的 `feed_articles.title_zh`、`summary_zh` 新列。
+- 中文原标题保留，`title_zh` 为空，但仍调用模型生成不超过 300 字的中文简介。
+
+**正式库模型**：Raw 一行可容纳整个订阅，不能在 `raw_records` 的一列存一篇文章的译题。
+因此新增逐篇 `feed_articles` 表，以版本、标题、订阅正文与原文 URL 的来源摘要为键，
+相同输入共享生成结果。表内独立保存 `original_title`、`source_url`、`title_zh`、`summary_zh`、
+`article_text`、`body_source`、`body_sha256`、`resolved_url`、`status`、`error`、`policy`、`model`、
+`updated_at`，保留用于生成的正文与抓取结果；原始标题不会被译题覆盖。
+`summary_zh` 的 SQL 长度约束、保存和页面输出均限制 300 个 Unicode 字符。
+页面通过公开 `read_articles` 只读正式库，不再读取旧 `briefs.db`；旧库仅保留历史产物。
+机器展示结果不成为人工标签或原文证据，Raw / Confirmed / 既有分类表不改动。
+
+**正文读取**：订阅有足够的可读摘要 / 正文时直接作为输入；空白、仅有标题或有效内容不足时，
+由 `atlas.collect.article.ArticleReader` 读取原文链接。声明 Atlas 身份，检查 robots，
+逐跳处理重定向，拒绝非公网目的地；本机代理网络优先 IPv4，缺失时回退 IPv6，
+避免不可用的 IPv6 占位记录误挡公开站点。请求超时有界，响应最多 5 MiB。
+HTML 优先完整文章 / 主内容区及 WordPress 正文容器，去掉脚本、导航、推荐区及页脚；
+不能拿第一个推荐文章卡片替代正文，纯链接目录和 JavaScript 空壳不作为正文。支持 PDF 文字提取（最多前 60 页），
+正文最多保存 100000 字符，长输入向模型提供开头和结尾合计约 12000 字符。
+PDF 使用新增 `pypdf>=6.0.0`；标准库和现有 HTML/XML 库不能完成 PDF 文字提取，
+因此通过 `uv` 显式更新声明、锁和独立虚拟环境，并扩展依赖集合门禁（§2.11）。
+HTTP 拒绝、验证页、robots 拒绝或没有可读正文时保存 `unavailable` 与真实原因，
+页面显示“简介暂缺”，不生成猜测简介；新入库尚未生成的条目显示“简介待生成”。
+
+**生成与续跑**：保留 `python -m atlas.briefs_cli` 正式入口，默认模型并发 3（最多 4），
+抓取并发 4（最多 8），每组最多 8 篇、约 24000 输入字符；提供 `--limit`、`--fetch-only`、
+`--retry-unavailable`、`--refresh-originals` 和可重复指定的 `--source-key`。
+重新提取时正文相同的成功行直接复用；正文改变或读取失败时先清空旧译题、简介，
+避免未完成状态留下错误内容。成功行与已保存正文可复用，纯中文输入也进入简介生成。
+继续使用 Go 路由的 DeepSeek V4.1 Flash，关闭 thinking，模型零工具；服务器先取正文，
+模型一次返回每篇的 `title_zh` / `summary_zh`。短编号严格映射回来源键，缺项、重复、
+旧版形状、非中文简介及缺失译题拒绝入库；无正文禁止调用模型。
+瞬时网络 / 服务错误有界重试；结构不合格时按半拆组直至单篇，单篇最多三次尝试，
+不修补错误 JSON，不放宽对应关系。永久服务拒绝停止后续派发，已完成记录保留。
+页面访问和既有采集定时任务均不会触发付费生成。
+
+**验证与上线**：正式库当前 1496 份去重来源，**1449 ready / 47 unavailable / 0 pending**。
+最长简介 300 字；逐页验证正式 Feed 的 **1590** 张卡片，其中 **1537** 张有独立中文译题与简介，
+**53** 张对应暂不可读的来源并显示“简介暂缺”（跨采集记录的重复文章共享生成结果）。
+所有译题均紧跟原标题，简介均含中文且不超过 300 字；当前正式数据没有中文原标题，
+中文原标题不重复翻译但仍生成简介的行为由真实 HTTP 页面与生成客户端测试覆盖。
+重新执行批处理选择 0 条、生成 0 条、模型配置为 null，无重复付费调用。
+原文提取抽查发现的推荐列表误取已纠正并回填：可可树文章现基于 11207 字符的实际种植指南，
+PAUSE 目录页则改为简介暂缺，不保留猜测；短正文复核中 3 条内容相同直接复用。
+完整回归 **1754 passed / 7 skipped，170.72 s**；最终提取器定向回归 **21 passed，0.50 s**。
+新增覆盖正式库列、只读摘要、中文不重复译题、读取原文后再生成、原文失败不调用模型、
+结构错误缩组、PDF 文字提取、重定向逐跳检查、IPv4 / IPv6 回退及推荐区 / 链接目录排除。
+手机、横屏、桌面与深色模式无横向溢出，打标按钮保持至少 44 px。
+已重启 `atlas-web.service`，原站 `/health`、`/feed` HTTP 200；Cloudflare 入口仍返回原有
+Access 登录跳转（302），隧道和访问策略不变。原有 confirmed 5、proposed 3537、runs 2532、
+evidence 3215 的完整内容摘要不变；迁移前 Raw 元数据全行保留，当前 106 份归档完整性检查无错误。
+浏览器产物位于 `.tmp_atlas/article-review/`；迁移前快照、批处理、续跑、原文重提取、
+短正文复核与最终报告位于 `.tmp_atlas/feed-articles/`。
+
+---
+
+### 6.20 清洗正文留存、论文全文补抓与失败分类（2026-10-26）
+
+用户要求正文也正式入库、进行清洗，并归类无法获取原文的记录；进一步明确包括 arXiv 论文全文。
+核查发现 §6.19 的 `feed_articles.article_text` 混合 1271 份摘要、66 份片段和 112 份原文正文，
+不能把这些全部称为全文。本轮保留这列作为历史模型输入，新增独立正文留存模型。
+
+**正式库与可追溯性**：`data/store/atlas.db.article_contents` 按获取快照追加，
+主键 `id`，按原始文章 URL 去重并读取最新状态；相同输入、清洗版本、状态的快照幂等。
+`cleaned_text` 是清洗后的正文，`body_chars` / `cleaned_sha256` 校验长度与内容；
+`raw_gzip` / `raw_sha256` 留存实际 HTTP 原始响应的压缩副本与指纹，支持离线重新清洗。
+同时保存 `source_url`、`resolved_url`、`content_kind`、`cleaner_version`、`truncated`、
+`http_status`、`fetched_at`、`status` 及结构化失败字段。
+`ready` 仅用于取得文章 / 论文正文；`partial` 明确用于摘要 / 片段；`unavailable` 必须有失败代码。
+旧内容首次导入标记 `legacy-summary-input-v1`，不编造缺失的原始响应；新正文标记 `article-clean-v3`。
+表有禁止 UPDATE / DELETE 的触发器，失败重试不会抹去历史正文；单篇读取可取最近的成功快照。
+批量导入一次事务提交，避免机械盘逐行同步长时间占用正式库。页面元数据使用覆盖索引，
+不会为了显示获取状态加载所有论文全文或压缩响应。
+
+**清洗边界**：HTML 优先完整文章、主内容与常见正文容器；过滤脚本、导航、广告、Cookie 提示、
+社交分享、作者推广和推荐文章区域，排除纯链接目录和没有正文的空壳。
+清理零宽字符、NUL 等不可见控制字符、空白与相邻重复段落，保留标题、段落及代码块缩进；
+保留 TAB / 换行，不把所有内容压成一行。PDF 中的 NUL 会导致 SQLite `length` 与 Python
+计数不一致，因此在正文清洗层明确移除并以真实长度约束测试覆盖。
+PDF 提取文字；正文读取上限调整为 32 MiB 响应、500 页 PDF、200 万字符，
+若触及提取页数或字符上限则写 `truncated` 并在页面明确标记，不能静默冒充无截断全文。
+压缩的原始响应仍完整保留至响应大小上限。
+
+**失败分类**：`failure_code`、`failure_category`、`failure_label`、`failure_detail`、
+`retryable` 分别保存稳定子类型、类别、中文名称、原始原因和是否适合重试。
+区分 robots 拒绝、HTTP 拒绝、失效链接、证书 / 网络 / 超时、未取得可读正文、视频无文本、
+动态加载、格式解析和读取限制等；仅凭 HTTP 403 不推断是付费墙。
+原先 47 条失败记录（46 个去重 URL）已无网络回填分类：访问受限 **19**、
+网络或证书问题 **6**、视频页无可读正文 **8**、目录 / 无有效正文 **13**、链接失效 **1**。
+新正文补抓的失败也使用相同字段入库，原始失败记录保留。已成功获取的原始响应才允许离线重新清洗，不能将 HTTP 拒绝页重新解释为文章正文。
+
+**批处理与论文**：新增 `python -m atlas.article_content_cli`，零模型调用。
+支持 `--scope all|news|papers`、`--seed-only`、`--limit`、`--reclean`、`--refresh`、
+`--retry-transient`、`--retry-unavailable`；网络补抓跨范围使用全局文件锁避免重复任务，
+纯离线重新清洗使用独立锁，可与补抓并行。离线清洗保留论文类型及原始获取时间。
+默认 4 个工作线程，共享同源串行限速器，遵守 robots Crawl-delay；arXiv 至少 15 秒间隔，
+优先官方论文 HTML，有效正文不可用时读取官方 PDF；访问拒绝 / 验证失败不通过换格式绕过。
+不把 `/abs/` 摘要页当论文全文。相同文章跨订阅复用正文。
+先处理新闻、博客，之后处理论文；同源连续 5 次可重试故障暂停该源一小时，继续其它来源。
+进度、每次结果和暂停状态持久化，重启跳过成功项；暂时失败由服务 15 分钟后重启续跑。
+显式简介批处理也优先复用已留存的清洗正文，避免重复抓取，不自动重跑既有译题和简介。
+
+**部署与网页**：服务模板为 `config/atlas-article-content.service.in`，已渲染安装到
+`/etc/systemd/system/atlas-article-content.service` 并启用后台补抓。
+只注入运行所需的代理环境，未向正文任务传入模型凭据。
+长期进度位于 `data/store/article-content-job/progress.json`，结果为同目录 `results.jsonl`；
+重启失败间隔 900 秒，同源冷却状态也会持久化。初始来源 1496 条、去重 URL 1346 个，
+其中论文去重 URL 1067 个；全量论文补抓需要数小时，当前明确处于后台运行状态。
+网页“归档详情”显示正文 / 摘要留存状态与失败类别；单篇归档页可读本地清洗正文，
+HTML 统一转义，保留原先不可变归档与证据字符区间。正文恢复后明确显示“简介待生成：正文已留存”，
+不再沿用过期的无法读取提示，也不会自动触发付费调用。
+
+**实测**：论文小批成功获取 `2609.28502` 的官方 PDF，清洗文本 102024 字符，
+压缩原始 PDF 1627764 字节，保存为论文正文而非摘要。
+正文抓取服务已实际完成多站点获取并持续运行，模型调用 0；后续全量完成度以正式库和服务进度为准，
+不能把已启动补抓写成全部留存完成。
+针对性回归覆盖快照不可变与幂等、事务回滚、清洗段落 / 代码、失败分类、原始响应往返、
+断点复用、HTML / PDF 回退、已保存正文用于生成、临时失败保留历史正文、网页只读与安全转义。
+旧的文件时间戳守门测试与后台合法入库出现竞态，已改为在测试进程拦截正式库连接，
+保留合法临时库成功对照及正式路径阻断对照，不靠暂停业务写入通过检查。
+清洗器升级后，239 份已获取内容从原始响应离线重新清洗，239 成功 / 0 失败 / 0 模型调用，
+95.0 秒完成，旧快照继续保留；另验证 22 份 HTML 论文的离线处理保留论文类型，
+22 成功 / 0 失败，16.0 秒完成。后台服务已从断点恢复并继续获取新论文。
+完整默认回归 **1771 passed / 7 skipped，166.09 秒**；新版清洗器与正文相关定向回归
+**67 passed，4.76 秒**。手机、横屏、桌面、深色模式验证通过，无横向溢出，打标按钮至少 44 px。
+线上 `/health`、`/feed` 与本地清洗正文阅读 HTTP 200，Cloudflare Access 仍为原有 302 登录跳转。
+原有人工标签、分类、证据完整内容摘要不变，旧 Raw 元数据全行保留，已有译题 / 简介不改写，
+归档完整性检查无错误。最终数据 / 后台状态核对产物为 `.tmp_atlas/body-review/final-report.json`。
+产物在 `.tmp_atlas/body-review/`；正式补抓的持续进度保存在 `data/store/article-content-job/`。
+
+---
+
+### 6.21 修复正文补抓期间网页加载超时（2026-10-26）
+
+用户报告 `atlas.sharany.com` 一直加载 / 超时。网页服务与隧道均存活，
+Cloudflare Access 公网入口仍正常跳转；源站日志出现请求取消及 BrokenPipe。
+正式库仍使用 SQLite 默认 `DELETE` 日志，大正文 / PDF 快照写入时的排他锁会阻塞新的网页读取。
+新增回归在默认日志模式下直接复现写事务阻塞读取，并验证 WAL 消除这项阻塞。
+
+**修复**：先在无写事务的窗口暂停后台进程，使用 SQLite backup API 保存
+`.tmp_atlas/availability/before-wal.db`，短暂停止网页后将正式库切换为持久 `WAL`，
+恢复网页和原正文补抓进程。没有删除归档、改动标签或放宽 Cloudflare Access。
+新增公开入口 `atlas.archive.enable_wal`，仅由网页 CLI 与正文 CLI 的显式启动阶段调用；
+缺失库拒绝创建，重复调用幂等，页面只读路径不执行配置写入。
+这是同机本地 SQLite 的运行配置，不改变各域的表归属及不可变约束。
+WAL 是数据库持久状态的一部分，运行中备份使用 SQLite backup API，不单独复制主文件后丢弃 sidecar。
+
+**验证与上线**：受控 HTTP 测试证明后台写事务尚未提交时 Feed 即能成功返回；
+同路径负对照证明默认日志模式下读被阻塞，回滚后恢复，切为 WAL 后可同时读取且提交可见。
+相关回归 **62 passed，4.10 秒**，涵盖缺失库不创建、内容保留、模式持久及网页真实读写并发。
+正式环境连续 **28** 次请求均 HTTP 200，耗时 **0.718–1.029 秒**；
+期间正文快照从 **1981 增至 1983**，证明没有靠停掉后台任务获得通过结果。
+已用新启动代码重启网页，源站首页正常，公网入口维持 Access 登录跳转；
+旧人工标签、提议、运行账、证据、Raw、译题 / 简介与正文快照指纹均保留。
+三个服务保持运行。核对产物位于 `.tmp_atlas/availability/`。
+
+---
+
+### 6.22 修复新文章缺少译题 / 简介及异常订阅冒充文章（2026-10-26）
+
+用户刷新后发现首页没有译题、简介，且再次出现 `artificialintelligence-news.com/feed` 卡片。
+核查确认两条独立原因：原有 1449 份成功结果仍在正式库；新采集的 20 篇 HN 文章仅创建了
+待处理记录，原先显式生成流程没有接上增量处理。另一个已登记 RSS 端点返回 HTTP 200 的
+网站首页，XML 解析失败后被“整篇文章”兜底展示。
+
+**订阅异常边界**：新增 `atlas.registry.read_subscription_sources`，以只读方式获取当前登记的
+RSS / Atom / JSON API 渠道及其精确端点。组合根 `ArchiveEntriesAccess` 先按实际内容正常
+解析 RSS / Atom / HN JSON；已登记订阅端点返回 HTML、未知 XML 或不支持的响应时，
+记录来源异常，既不展示伪文章，也不作为简介生成输入。
+不按 URL 后缀猜类型；同一渠道下不同 URL 的真实整篇文章仍保留，原始异常响应仍可从
+文档粒度浏览，不删除归档 / 标签。网页、存储盘点和正文 / 简介 CLI 使用同一入口。
+冻结 75 份 Raw 的浏览基线修正为 9 容器、850 派生、65 真实整篇、1 来源异常，
+共 **915** 可浏览单元，旧预期 916 中多算的正是该网站首页响应，Raw 字节不改。
+
+**增量译题与简介**：本节取代 §6.18–§6.20 仅显式执行译题 / 简介批处理的运行策略。
+继续使用已选定的 Go / DeepSeek V4.1 Flash，仅处理未完成条目；保存于正式库原有列。
+采集入口 `scripts/collect-due.sh` 在采集成功且译题定时器已启用时，非阻塞唤起独立服务；
+`atlas-briefs.timer` 每次任务完成 60 秒后补查，避免漏接新文章。
+行业分类仍保持 `ATLAS_COGNITION=0`，页面刷新不发起模型调用。
+
+新增 `config/atlas-briefs.service.in` / `config/atlas-briefs.timer`，已安装并启用。
+单次最多 50 条、模型 / 原文抓取各 2 路并发，显式全局文件锁阻止并发重复调用。
+模型拒绝或生成失败后冷却 900 秒，冷却期间不再请求；已成功结果直接复用。
+已确认原文不可读且没有摘要的条目保留具体失败原因；正文恢复可读后自动成为待生成项，
+不再永久卡在旧 `unavailable`。已有清洗正文优先复用；新抓取的正文及原始响应也写入
+`article_contents`，供本地阅读与后续重清洗，不只保存在模型输入列。
+
+**上线实测**：当前批次 20 篇合法新文章，13 成功生成、7 保留原文获取失败原因，
+3 个成功请求、输入 16132 / 输出 1704 tokens，9.6 秒完成；异常 RSS 首页没有被送去生成。
+既有 1449 份成功译题 / 简介逐行核对未改写。随后真实下一次采集又进入 20 篇，
+自动任务无人工干预完成 16 篇生成、4 篇原文不可读，49.9 秒完成。
+再次定时运行选择 0 条、模型为 null、无重复调用。
+首页前 50 张卡片实测 36 张有独立译题与中文简介，其余显示具体失败原因；
+订阅地址伪文章已消失，来源提示保留。手机、横屏、桌面、深色模式验证通过。
+
+完整默认回归 **1782 passed / 7 skipped，168.27 秒**；最终定向回归 **67 passed**。
+覆盖新采集自动补齐且不重跑旧文、任务锁、服务拒绝冷却、原文恢复、新正文及原始响应入库，
+以及真实配置下 HTML / 未知 XML 订阅响应排除、正常订阅与同渠道真实文章保留、
+只读浏览和异常响应仍可归档查看。
+正式库仍为 WAL，网页、正文补抓与增量译题定时器正常，Cloudflare Access 策略不变。
+产物位于 `.tmp_atlas/feed-refresh/`；持续生成状态在 `data/store/briefs-job/`。
+
+---
+
+## 7. 归档基线：保留、弃用、教训
+
+### 7.1 保留（可迁移到新结构）⚠️ 已被 §8.1 取代，见 §8.1
+
+| 资产 | 理由 |
+|---|---|
+| `data/`（534 个原始文档，8.09 MB） | **唯一有真实产物佐证**；**采集有时间价值**——分析可补做，历史补不回来 |
+| `collectors/`（2,301 行） | 真实跑通过（RSS + 网页 + HTTP + 限速） |
+| `core/{config,logging,storage}`（约 4,000 行） | 可用基础设施 |
+| `config/sources.yaml` | 配置驱动方向正确；且已内含 arXiv 分类种子 |
+| `docs/guidelines/`（实施准则 + 架构 Q&A） | 目标与原则的原始出处 |
+
+### 7.2 弃用（不迁移）⚠️ 已被 §8.1 取代，见 §8.1
+
+`web/`（两套 Web 应用 6,851 行）、`scheduler/`（Celery + DAG + queue 2,797 行）、`monitoring/`（1,914 行，无人引用）、`src/core/`（放错位置，1,316 行）、`src/atlas/cli/audit.py`（不可达）、`processors/` 中 3 份重复去重、`tests/` 全部、`docs/` 中除 guidelines 之外的大部分。
+
+### 7.3 失败模式（防止重演）
+
+归档基线（`src/` 25,937 行）的实测结论，作为本项目的反面判据：
+
+1. **用静态产物包装进度**——字段、模块、测试报告、文档四层齐备，而数据流未通。`processed_documents.entities` 字段存在但**永为空**，`categories` 硬编码 `[]`。
+2. **关键路径通向基础设施**——Growth 阶段承担了 Scale 级基础设施成本（队列/编排/对象存储/认证/监控），价值链路（采集 → 标准化 → 认知 → 判断）只走完第 1 步。
+3. **静默失效**——`except ImportError` 把接线错误降级成 no-op（`cli.py` 的 `init_database` 不存在却只打印一句警告）；Celery 任务体全为 mock，返回**编造的数字**（`"collected": 10`、`"indexed": 1000`）。
+4. **测试无法执行**——4 个文件共 **61 个测试连收集都做不到**（符号漂移 + 模块放错位置），导致整个"100% 通过"的说法无据。
+5. **文档体系自身制造熵**——49 篇文档给出 4 种互相矛盾的进度，29 个失效链接。
+
+**对应判据（写进各任务验收）**：
+
+- 任何"完成"必须能用**跑通的数据流**证明，不用"有文件/有字段/有报告"证明；
+- 不允许用 `except` 掩盖接线错误；未实现的部分必须**响亮失败**（`NotImplementedError`），不得返回编造结果；
+- 文档只保留单一事实来源（本文件），不再建立平行的文档体系。
+
+---
+
+## 8. T-001 执行记录（2026-09-25）
+
+> 本节**取代 §7.1 / §7.2 的清单**——那两份清单不闭合（漏了 `cli.py`、`models/`、`scripts/`、部署文件、根目录散件等）。以本节为准。
+
+### 8.1 处置清单（闭合）
+
+**保留（28 个跟踪文件）**
+
+| 路径 | 说明 |
+|---|---|
+| `src/atlas/collectors/`（6 文件） | 采集器；闭包已验证可运行 |
+| `src/atlas/core/{__init__,config,logging,storage,unified_storage,minio_adapter}.py` | 依赖闭包必需 |
+| `src/atlas/models/{__init__,documents}.py` | 被 `core/storage.py` 依赖 |
+| `src/atlas/__init__.py` | 包定义与版本 |
+| `config/{config.yaml,sources.yaml}` | 配置驱动 + arXiv 分类种子 |
+| `docs/guidelines/{atlas_技术与合规实施准则,workflow}.md` | 目标与协作原则的原始出处 |
+| `docs/tech/{architecture-questions,architecture-decisions,tech-architecture}.md` | 架构原始出处（`tech-architecture.md` 含被 D10 取消的分级演进，**仅作参考**） |
+| `SPEC.md`、`CLAUDE.md`、`README.md`、`LICENSE`、`.gitignore`、`pyproject.toml` | 规格与工程文件 |
+
+**本地保留、不进 git（不动）**：`data/`（534 个原始文档）、`logs/`、`.venv/`、`.env`、`.env.local`、`config/.env.development`、`.claude/settings.local.json`
+
+> ⚠️ `data/` 与 `logs/` **必须就地保留**：运行中的 Docker 旧栈（`atlas-beat` / `atlas-worker`）正把它们挂载为 `/app/data` 与 `/app/logs`。
+
+**弃用（194 个跟踪文件，历史完整保留在归档 tag）**
+
+| 类别 | 内容 |
+|---|---|
+| 已弃用栈 | `src/atlas/{web,scheduler,monitoring,processors,llm}/`、`core/{database,database_async,operations}.py`、`models/schema.py`、`cli.py`、`cli/audit.py`、`src/core/`、`__main__.py` |
+| 测试 | `tests/`（28 文件） |
+| 脚本 | `scripts/`（27 文件） |
+| 文档 | `docs/` 中除上表之外的 43 篇（含 PG / Redis 运维指南） |
+| 部署 | `Dockerfile`、`docker-compose*.yml`、`.dockerignore`、`get-docker.sh`、`manage.sh`、`DEPLOYMENT.md`、`QUICKSTART.md` |
+| 散件 | 6 个根目录 `test_*.py`、`audit_report.json`、`simple_dashboard.json`、`atlas_api.log`、`.env.*.example`、`examples/`（2 个 demo） |
+| 凭据 / 二进制 | `config/minio/minio.env`、`config/.env.minio.example`、`.local/bin/minio`（5.3 MB） |
+| 治理体制 | `.claude/config`、`.claude/README.md` |
+| 待重建 | `uv.lock`（依赖精简后失效，需 `uv lock` 重新生成） |
+
+同时精简 `pyproject.toml`：依赖从 40+ 项降至 12 项（闭包所需），移除 `atlas = "atlas.cli:main"` 入口。
+
+### 8.2 本次确定的三项
+
+| 项 | 结论 |
+|---|---|
+| 采集连续性 | 保留旧系统一份**可跑副本**：worktree `../Atlas-legacy` @ `main`，共享 `data/` 与 `.venv` |
+| `CLAUDE.md` / `.claude/config` | `CLAUDE.md` 重写为指向本规格的**薄指针**；`.claude/config` 弃用 |
+| `docs/` 范围 | 保留 `docs/guidelines/` + 3 篇 `docs/tech/` 原始文档；其余弃用 |
+
+### 8.3 环境实测（WSL 才是真实开发环境）
+
+```
+WSL Ubuntu-24.04 | uv 0.9.8 | .venv = Python 3.13.9
+保留清单 10 个模块 import 全部 OK
+```
+
+> 早前"本机跑不起来"的判断**仅对 Windows PowerShell 成立**。WSL 内可以真实执行代码，因此 §7.3 的"跑通的数据流"判据具备落地条件。
+
+### 8.4 旧系统可跑副本（`../Atlas-legacy`）
+
+```bash
+cd /mnt/c/Users/bestz/Documents/projects/Atlas-legacy
+PYTHONPATH=src ./.venv/bin/python -m atlas collect --dry-run   # 已验证可跑
+```
+
+- `data/` 与 `.venv/` 是指向主仓库的 **junction**：两者共享同一份数据与依赖，不分叉
+- Docker 旧栈（Postgres / Redis / MinIO / Worker / Beat / Flower）随 WSL 启动自动拉起；**无 crontab，采集并不自动运行**
+- ⚠️ 新结构必须使用**独立 venv**（见 `CLAUDE.md`），否则 `uv sync` 会裁剪共享 venv 并破坏旧副本
+
+### 8.5 验证结果（T-001 完成判据）
+
+| 检查 | 结果 |
+|---|---|
+| 保留模块 import | **10 / 10 OK** |
+| 弃用模块**不可导入** | **9 / 9 GONE**（`atlas.web` / `scheduler` / `cli` / `processors` / `llm` / `monitoring`、`core.database` / `operations`、`models.schema`） |
+| 真实数据流 | `config → sources.yaml(12 个源) → CollectorFactory → RSSCollector(openai-blog)` 通过 |
+
+**过程中发现并修复的一个陷阱**：`git rm` **不会**删除未跟踪的 `__pycache__`，于是 `src/atlas/{web,llm,processors,scheduler,monitoring}/` 变成空目录，而 Python 把空目录当作**命名空间包**——结果 `import atlas.web` **依然成功**。这是"静态残留伪装成存在"的又一形态：已删除的模块看起来还在。已显式清除残留目录并复验为 GONE。
+
+> 由此追加一条判据：**删除类任务必须验证"弃用项确实不可用"，而不只是"文件不在了"。**
+
+**未完成项 —— ✅ 已解决（见下方"网络解决记录"）**
+
+> **网络解决记录**：WSL 实为**镜像网络模式**（`eth1` 直接持有宿主 IP `192.168.1.8`），因此
+> **WSL 内 `127.0.0.1:7897` 即宿主代理**，显式设代理即可联网：
+> ```bash
+> export HTTPS_PROXY=http://127.0.0.1:7897
+> export HTTP_PROXY=http://127.0.0.1:7897
+> ```
+> 直连失败的原因不是"没有通路"，而是 fake-IP DNS 让 WSL 拿到无法路由的地址——**必须走代理**。
+> `uv lock` 已就此重建成功（42 个包）。
+
+| 项 | 原因 | 归属 |
+|---|---|---|
+| `uv.lock` 重新生成 | 代理（Clash `127.0.0.1:7897`）**仅监听本机回环**，`192.168.1.8:7897` 不可达 → WSL2(NAT) 无法借道；而 WSL 直连 PyPI 又因 fake-IP DNS 超时 | ✅ 已解决：WSL 走宿主代理（镜像网络模式，`127.0.0.1:7897`）后重建成功，42 个包 |
+
+> 可选修法（择一）：① 在 Clash 开启「允许局域网连接」后于 WSL 显式设 `HTTPS_PROXY=http://<宿主IP>:7897`；② 改用 `.wslconfig` 的 `networkingMode=mirrored`，使 WSL 内 `127.0.0.1` 直达宿主代理。
+> 注意：**Windows 侧直连抓取可用**（`web_search` 正常，`curl -x 127.0.0.1:7897` 已验证 200），受阻的只是 WSL。
+
+---
+
+*本文件遵循"单一事实来源"原则。修订请直接更新本文件，并在 §0 更新版本与日期。*
+
+
+### 6.23 入站 AI 审核与队列门禁（2026-10-26，v0.4.16）
+
+**用户新增决策**：纯广告／购买下载引流页、错误页和当前不支持的内容不得进入处理队列；**保留有具体技术细节或实质新闻的产品发布**。这是进入队列前的内容质量检查，不替代 §1.3 中由人工标注逐步形成的“有效性”判断，也不把来源中的主张当成经过独立事实核查。新闻、论文、教程、开源项目、实质观点及其他领域文章仍可入站；`other` 保持开放，行业配置不是排他白名单。
+
+- 采集仍留存不可变 Raw；已登记订阅端点返回非文章的规则校验仍先执行。新增 `atlas.admission_cli` 读取 RSS 摘要或留存的清洗正文；缺少内容时，按原有 robots／公开来源限速规则读取原文，并将清洗正文、原始响应和失败分类保存在正式 `article_contents` 表。AI 输出不是原文，也不改写历史归档。
+- 正式 `atlas.db` 新增 `admission_reviews`（追加式，禁止 UPDATE/DELETE）和显式门禁设置 `admission_settings`。每条审核记录保存来源键、URL、政策版本及领域指纹、实际审核输入指纹、模型、时间、决定、理由码、中文说明和原文证据。`accepted/substantive` 才可入队；`rejected` 分为 `advertisement/error_page/unsupported/content_mismatch`；`pending` 分为 `insufficient_content/source_unavailable/review_error`。无法读取和不确定的条目保持隔离，不凭标题放行，也不把 HTTP 403 推断为虚假内容。拦截必须提供输入正文的连续原文证据，身份缺失、重复、字段非法或引文不匹配均不得放行。
+- 门禁在 Feed **分页与计数之前**执行，也用于译题／简介 CLI、全文补抓 CLI，以及组合根的行业分类入口。分页不会因先分页后过滤而空缺。行业分类将政策及获准单元集合写入输入快照，审批变化改变节点幂等键；待审条目获准后不会被旧的空跑执行记录永久跳过。原文归档入口、已有人工标签、行业分类与证据历史全部保留。
+- `atlas-briefs.service` 在生成译题与简介前通过 `ExecStartPre` 执行审核，每轮上限 100、并发 2；既有采集完成触发与分钟级定时器沿用。锁防止重复审核；已通过或拦截的条目默认不重复请求；临时网络错误及 HTTP 429/5xx 有限重试，持续故障冷却 900 秒。结构错误拆到单条隔离，不让一条坏响应阻塞整库。`--retry-errors` 用于修复后的显式续跑，已完成项不重审。`--refresh --source-key` 可复核个别拦截，保留前次历史。
+- 摘要不足时，后续审核补读原文；正文恢复后可继续审核。原文仍无法读取时不进入译题、简介和分类队列。刷新网页只有只读查询，不触发付费调用。正式模型仍为 OpenCode Go 的 `deepseek-v4.1-flash`。
+- 正式调用的活对照：截图中的 `https://cleanyourtv.ai/` 以营销落地页拦截；同一主题的 `github.com/Gathin23/cleanyourtv` README 与论文摘要正常通过。首批首页 50 条均有既存译题与简介，营销页未出现。公网仍是 Cloudflare Access 302，源站 HTTP 200。
+- 验证：全套 **1794 passed / 7 skipped**；新增针对摘要不足后补读原文的回归另行通过。测试覆盖过滤早于分页、只读 GET 不落库、模型失败不放行／冷却不重复调用、原文证据及身份校验、增量简介只接收通过项、正文预读留存、审计记录不可改、领域配置变更需重审，以及行业分类的门禁与幂等失效。正式补审与误拦截复核结果见本节后续实测记录。
+
+**正式实测收尾**：1535 个不同来源键已全部建立审核记录；首轮补审后对 35 条拦截逐条复核，恢复 15 条有实质信息的文章、4 条转待审、16 条维持拦截；随后自动审核重试又处理 2 条模型响应错误。最后显式重试模型证据校验失败项后，最终 **1449 通过 / 17 拦截 / 69 隔离待审**（其中 62 条原文不可读取、6 条内容不足、1 条模型证据校验未通过，冷却后再试）。截图营销页维持拦截；相关开源 README、维基百科历史文章、品牌博客种植指南及 MCP 配置文档正常通过。正式库原有 **1478 条译题／简介完整保留**。服务预审核及简介任务均成功结束，定时器继续监听新增内容；通过审核的论文全文补抓已恢复，未宣称论文全文已全部抓完。
+
+审核预读、简介预读和正文任务共用公开原文读取器，arXiv 仍只将官方 HTML/PDF 视为全文，已有 `/abs/` 页面正文不会使全文任务永久跳过。新增失败获取和 arXiv 实际入口回归后，相关 **145 项测试通过**。诊断与正式调用记录位于 `.tmp_atlas/admission/`、`data/store/admission-job/`；正式网页验收为源站 HTTP 200、首页 50 条均保有译题和简介，截图营销页没有出现。

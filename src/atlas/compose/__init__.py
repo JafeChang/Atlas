@@ -1,0 +1,154 @@
+"""T-120 端到端集成与接线（组合根，SPEC §4.0 / §4.2）。
+
+本包是**唯一**允许 import 各域**实现**的地方：它的职责不是实现能力，而是把已经
+提交的包接成一条**可运行的流水线**，并用真实数据把它跑通（SPEC 硬规则 1）。
+
+```
+collect ──▶ archive ──▶ normalize ──┬──▶ feed
+（T-102）   （T-103）    （T-104）    ├──▶ label（T-108，人工产物）
+                          │         ├──▶ classify（T-105：写 proposed_claims 的行）
+                          │         └──▶ evidence（T-107，证据锚点）
+                          │                      ▲
+                          └── atlas.contracts 的  │ proposed_claims（T-105 的行，
+                              三态类型在阶段之间传递 │ 由组合根投影进输入快照）
+```
+
+> **`classify` 节点是"系统自己产出 claim"的唯一入口**：在它接进来之前，流水线能
+> 采集 / 归档 / 归一化 / 打标 / 校验证据，却**永远不会**写 `proposed_claims`，
+> 于是 `evidence` 在任何新 store 上都只能报 `classified_claims=0`。
+> 它的模型调用**默认关闭**（`run --classify` / `ATLAS_COGNITION=1` /
+> 离线的 `classify` 子命令），因为那是真金白银（SPEC §2.14 / §2.17）。
+
+接线方式
+--------
+
+1. 每个阶段是一个 `atlas.contracts.AtlasTask`，用 `atlas.runner.TaskGraph` 声明依赖边，
+   由 `atlas.runner.TaskRunner` 按拓扑序执行（幂等跳过 / 有界重试 / 失败可见都由 T-110 负责）。
+2. 阶段的**输入快照**由 `NodeInputs` 从**上游节点的执行记录**里取（内容寻址的 `identity`
+   部分），因此换解析器 / 换窗口会重算、内容不变则幂等跳过；跳过时上游产物仍可被下游读到。
+3. 所有外部依赖（fetcher / robots / 限速 / 时钟）都是**构造注入**的；默认装配是真实实现
+   （`UrllibFetcher` + `RobotsCache` + `DomainThrottle`），测试注入假 fetcher，一条网络都不打。
+4. 失败一律向上传播：采集阶段任何渠道失败就抛 `CollectionFailedError`，
+   由 `TaskRunner` 包装成 `TaskFailedError` 并附上 `partial_report`（失败节点 + 被阻塞的下游）。
+   **没有任何路径会吞掉异常后报告成功。**
+
+最小用法::
+
+    from atlas.compose import build_pipeline
+
+    with build_pipeline(store_root="data/store", actor="me") as pipeline:
+        report = pipeline.run()          # 真实采集：走 robots + 限速
+        report.result("feed").output.artifacts["identity"]["items"]
+
+真实抓取默认关闭（CLI 要求 `ATLAS_LIVE=1`，见 `atlas.compose.cli`）。
+
+T-207 追加：调度（哪些渠道到期了）
+---------------------------------
+
+`Pipeline.due_decision()` 用 `atlas.schedule` 按 `channel.interval_seconds` 判定本轮
+该试哪些渠道；`Pipeline.run(due_only=True)` 只注册到期的渠道（**默认关闭**，
+`False` 时行为与 T-120 完全一致）。"一个可采集渠道都没有"（配置问题，响亮失败）与
+"有渠道但都还没到期"（正常，`DueDecision.is_idle`）被**显式分开** —— 后者不是错误，
+CLI 以退出码 0 结束并打印说明。理由与 cron 示例见 `atlas.schedule` 的模块文档。
+"""
+
+from __future__ import annotations
+
+from .cli import main
+from .pipeline import (
+    NODE_ARCHIVE,
+    NODE_CLASSIFY,
+    NODE_COLLECT,
+    NODE_EVIDENCE,
+    NODE_FEED,
+    NODE_LABEL,
+    NODE_NORMALIZE,
+    ComposeDependencies,
+    FileExecutionRecordStore,
+    LabelAssignment,
+    NodeInputs,
+    NothingDueError,
+    Pipeline,
+    PipelineConfig,
+    build_pipeline,
+    default_cognition_port,
+)
+from .tasks import (
+    COMPOSE_CODE_VERSION,
+    DISPATCH_CONTENT_TYPE,
+    ArchiveStage,
+    ClassifyStage,
+    ClassifyStageError,
+    CollectStage,
+    CollectionFailedError,
+    EvidenceStage,
+    EvidenceStageError,
+    FeedStage,
+    LabelStage,
+    NormalizeStage,
+    NormalizeStageError,
+    PipelineError,
+    StageInputError,
+    StageLabelError,
+    claim_verification_requests,
+    classify_archived_document,
+    classify_plan_for_content,
+    classify_plan_projection,
+    content_type_conflict,
+    label_space_from_snapshot,
+    parse_raw_ids,
+    parse_window,
+    policy_from_snapshot,
+    proposed_claim_from_snapshot,
+    utc_hour_window,
+)
+
+__all__ = [
+    "COMPOSE_CODE_VERSION",
+    "DISPATCH_CONTENT_TYPE",
+    "NODE_ARCHIVE",
+    "NODE_CLASSIFY",
+    "NODE_COLLECT",
+    "NODE_EVIDENCE",
+    "NODE_FEED",
+    "NODE_LABEL",
+    "NODE_NORMALIZE",
+    # pipeline
+    "ComposeDependencies",
+    "FileExecutionRecordStore",
+    "LabelAssignment",
+    "NodeInputs",
+    "NothingDueError",
+    "Pipeline",
+    "PipelineConfig",
+    "build_pipeline",
+    "default_cognition_port",
+    # tasks
+    "ArchiveStage",
+    "ClassifyStage",
+    "ClassifyStageError",
+    "CollectStage",
+    "CollectionFailedError",
+    "EvidenceStage",
+    "EvidenceStageError",
+    "FeedStage",
+    "LabelStage",
+    "NormalizeStage",
+    "NormalizeStageError",
+    "PipelineError",
+    "StageInputError",
+    "StageLabelError",
+    "claim_verification_requests",
+    "classify_archived_document",
+    "classify_plan_for_content",
+    "classify_plan_projection",
+    "content_type_conflict",
+    "label_space_from_snapshot",
+    "parse_raw_ids",
+    "parse_window",
+    "policy_from_snapshot",
+    "proposed_claim_from_snapshot",
+    "utc_hour_window",
+    # cli
+    "main",
+]
