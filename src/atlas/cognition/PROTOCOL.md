@@ -109,7 +109,7 @@ Node 的 fd 3 **不可写**——`writeSync(3, …)` 与 `createWriteStream(null
 | `route_name` | `deepseek` | `openai-compatible` | `opencode-go` |
 | provider | `deepseek` | `atlas-openai-compatible` | `opencode-go` |
 | base_url | `https://api.deepseek.com` | `ATLAS_LLM_BASE_URL` | `OPENCODE_GO_BASE_URL`，默认 `https://opencode.ai/inference/go/openai/v1` |
-| model | `deepseek-flash` | `ATLAS_LLM_MODEL` | `OPENCODE_GO_MODEL`，默认 `glm-5.3-flash` |
+| model | `deepseek-flash` | `ATLAS_LLM_MODEL` | `OPENCODE_GO_MODEL`，默认 `deepseek-v4.1-flash` |
 | 凭据变量 | `DEEPSEEK_API_KEY` | `ATLAS_OPENAI_API_KEY` | `OPENCODE_GO_API_KEY` |
 
 Go 请求使用 `User-Agent: Atlas/0.1`，并以 `sessionId` 填入 `x-opencode-session`。

@@ -651,21 +651,28 @@ def test_default_path_matches_spec_layout() -> None:
     assert resolve_db_path("x/y.db") == Path("x/y.db")
 
 
-def _fingerprint(path: Path) -> tuple[bool, int, int] | None:
-    if not path.exists():
-        return None
-    stat = path.stat()
-    return (True, stat.st_size, stat.st_mtime_ns)
+def test_repo_data_is_never_written(tmp_path: Path, monkeypatch) -> None:
+    """拦截本测试进程访问正式库；不把后台合法入库误判为测试写入。"""
+    repo_db = (Path(__file__).resolve().parents[1] / "data" / "store" / "atlas.db").resolve()
+    connect = sqlite3.connect
+    opened = []
 
+    def guarded_connect(database, *args, **kwargs):
+        target = Path(database).resolve()
+        opened.append(target)
+        if target == repo_db:
+            raise AssertionError("测试禁止连接正式库")
+        return connect(database, *args, **kwargs)
 
-def test_repo_data_is_never_written(tmp_path: Path) -> None:
-    """本用例是"测试绝不写仓库 `data/`"的守门人。"""
-    repo_db = Path(__file__).resolve().parents[1] / "data" / "store" / "atlas.db"
-    before = _fingerprint(repo_db)
+    monkeypatch.setattr(sqlite3, "connect", guarded_connect)
     store = SqliteConfirmedStore(db_path=tmp_path / "guard.db")
     try:
         store.add(make_label())
         assert store.count() == 1
     finally:
         store.close()
-    assert _fingerprint(repo_db) == before
+    assert opened == [(tmp_path / "guard.db").resolve()]
+    # 活对照：错误地传正式路径时，守门人在实际打开前明确拦截。
+    with pytest.raises(AssertionError, match="测试禁止连接正式库"):
+        sqlite3.connect(repo_db)
+    assert opened[-1] == repo_db

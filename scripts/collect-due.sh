@@ -11,6 +11,11 @@ if ! flock -n 9; then
     exit 0
 fi
 
-# 定时更新原文不调用付费模型；需要分类时由操作者单独显式执行。
+# 采集不触发行业分类；已启用的译题/简介任务独立处理新增文章。
 export ATLAS_COGNITION=0
-exec .venv-new/bin/python -u -m atlas.compose run --due-only --allow-partial "$@"
+.venv-new/bin/python -u -m atlas.compose run --due-only --allow-partial "$@"
+if command -v systemctl >/dev/null 2>&1 && systemctl is-enabled --quiet atlas-briefs.timer; then
+    if ! systemctl --no-ask-password --no-block start atlas-briefs.service; then
+        printf '采集已完成，但增量译题/简介任务未能立即启动；定时器会继续补齐。\n' >&2
+    fi
+fi

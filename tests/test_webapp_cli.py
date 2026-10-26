@@ -191,6 +191,7 @@ def test_module_has_a_main_guard_and_argparse_only() -> None:
         "argparse",
         "atlas",
         "dataclasses",
+        "json",
         "os",
         "pathlib",
         "sys",

@@ -1,32 +1,12 @@
-"""T-109 补完的**真实数据流证据**（硬规则 1）：真实 `data/store` 上的条目数与容器口径。
+"""浏览投影的冻结真实数据回归（只读，缺少快照时自跳过）。
 
-只读，**一个字节都不写**（整树 sha256 前后比对钉死）。`data/` 不进 git，
-因此干净 worktree 里没有它 —— 用例**自跳过**（照 `tests/test_search_realdata.py` 的先例），
-真实数字由主工作区那次运行给出。
+2026-10-26 增加 Algolia/HN 浏览适配后，同一份 75 条 Raw 的冻结快照：
+9 份容器 = 8 份 XML + 1 份 HN JSON；850 派生条目 = 830 XML + 20 HN；
+65 份整篇导入文章；1 份订阅端点的 HTML 首页响应归入来源异常；共 915 个可浏览单元。
+旧版 897 单元中的 HN API 整篇卡片被 20 条新闻替换，原始归档没有变化。
 
-实测数字（SPEC §6.3 的容器/条目口径，本文件逐项钉死）
-----------------------------------------------------
-
-| 项 | 实测 | 说明 |
-|---|---|---|
-| 归档记录 | **75** | `data/store/raw` 下的目录数与 `raw_records` 行数 |
-| **容器**（feed-Raw） | **8** | `endpoint` 是 feed 且内容真能解析出条目 |
-| 属于容器的**派生条目** | **830** | 4×arXiv(331/199/191/54) + google-ai-blog(25) + synced-review/marktechpost/kdnuggets(各 10) |
-| **本身即条目**的 Raw（article-Raw） | **65** | T-131 导入的按篇文章 + 1 条 JSON 响应 + 1 条 HTML 页面 |
-| **可浏览条目总数** | **895** | 830 派生 + 65 直接（= §6.3 的结论） |
-
-> ⚠️ 与 §6.3 表格的一处**如实修正**：§6.3 说"8 条 feed-Raw"与"65 条 article-Raw"，
-> 合计 73，而归档实际是 **75** 条。差的两条是 `hacker-news-frontpage`（JSON API 响应）
-> 与 `ai-news-blog`（HTML 页面）—— 它们既不是容器、也没有可解析内容，
-> 在条目列表里**仍然作为整篇条目出现**（不静默消失）。
-> 因此"本身即条目"的实测是 **67** 条（65 篇导入文章 + 那两条），
-> 条目总数 = 830 + 67 = **897**，而**不是** 895。
-> 这个差异是**真实测量**的结果，不是笔误：本文件把实测值钉死，
-> 并把"哪两条是多的、为什么"写清楚，避免沿用陈旧结论。
-
-真实前端的一次完整闭环（`GET /feed` → `POST /label` → 独立 sqlite 复核）在
-`tools/t109_entries_e2e.py` 里（会**真的写一条标签**，因此不入 pytest：
-pytest 不得往真实库里写人工标签）。本文件只做**只读**测量。
+本文件验证浏览、分页、锚点与原始归档不变；XML 解析及机器分类的历史
+测量仍由对应测试文件独立验证。本文件不向真实库写入标签。
 """
 
 from __future__ import annotations
@@ -56,22 +36,22 @@ EXPECTED_CONTAINER_FEEDS: Dict[str, int] = {
     "https://syncedreview.com/feed": 10,
     "https://www.marktechpost.com/feed": 10,
     "https://www.kdnuggets.com/feed": 10,
+    "https://hn.algolia.com/api/v1/search_by_date?tags=story": 20,
 }
 
-#: §6.3 的合计预期。
-EXPECTED_DERIVED_ENTRIES = 830
+#: XML 830 条 + Algolia/HN 20 条。
+EXPECTED_DERIVED_ENTRIES = 850
 
-#: 两份**不是 feed** 的真实输入（既不是容器、也没有可解析内容）。
-#: 它们在条目列表里作为"整篇条目"出现 —— 必须被算进去，否则总数会少 2。
-EXPECTED_NON_FEED_ENDPOINTS = (
-    "https://hn.algolia.com/api/v1/search_by_date?tags=story",
+#: RSS 端点返回首页，原始响应保留，但不再伪装成整篇文章。
+EXPECTED_UNAVAILABLE_ENDPOINTS = (
     "https://artificialintelligence-news.com/feed/",
 )
 
 MEASURED_TOTAL_RECORDS = 75
-MEASURED_CONTAINERS = 8
-MEASURED_DIRECT_ENTRIES = 67  # 65 篇导入文章 + 上面那两条非 feed
-MEASURED_TOTAL_ENTRIES = 897  # 830 + 67（**不是** §6.3 写的 895，见模块 docstring）
+MEASURED_CONTAINERS = 9
+MEASURED_DIRECT_ENTRIES = 65
+MEASURED_UNAVAILABLE = 1
+MEASURED_TOTAL_ENTRIES = 915  # 850 + 65
 
 
 def _has_real_store() -> bool:
@@ -103,24 +83,27 @@ def archive():
         instance.close()
 
 
-def _measure() -> Tuple[Dict[str, int], List[str], int, int]:
+def _measure() -> Tuple[Dict[str, int], List[str], int, int, List[str]]:
     """只读测量：`endpoint -> 派生条目数`、非 feed endpoint 列表、容器数、总数。"""
     archive = open_archive(STORE_ROOT)
     try:
         access = ArchiveEntriesAccess(archive)
         per_endpoint: Dict[str, int] = {}
         non_feed: List[str] = []
+        unavailable: List[str] = []
         derived = 0
         for raw_id in archive.all_raw_ids():
             record = archive.get(raw_id)
             view = access.entries_of(record)
-            if view.entries:
+            if view.unavailable_reason:
+                unavailable.append(record.endpoint)
+            elif view.entries:
                 per_endpoint[record.endpoint] = len(view.entries)
                 derived += len(view.entries)
             else:
                 non_feed.append(record.endpoint)
         records = len(archive.all_raw_ids())
-        return per_endpoint, non_feed, derived, records
+        return per_endpoint, non_feed, derived, records, unavailable
     finally:
         archive.close()
 
@@ -132,15 +115,15 @@ def test_real_containers_and_entry_counts() -> None:
     raw_root = STORE_ROOT / "raw"
     before = _tree_digest(raw_root)
 
-    per_endpoint, non_feed, derived, records = _measure()
+    per_endpoint, non_feed, derived, records, unavailable = _measure()
 
     print(f"\n[T-109 真实] 归档记录 {records} 条")
     print(f"[T-109 真实] 容器（能拆出条目的 feed）{len(per_endpoint)} 份")
     for endpoint, count in sorted(per_endpoint.items(), key=lambda kv: -kv[1]):
         print(f"[T-109 真实]   {count:>4} 条  {endpoint}")
     print(f"[T-109 真实] 派生条目合计 {derived}")
-    print(f"[T-109 真实] 本身即条目（整篇）{records - len(per_endpoint)} 条")
-    print(f"[T-109 真实] 可浏览条目总数 {derived + (records - len(per_endpoint))}")
+    print(f"[T-109 真实] 本身即条目（整篇）{records - len(per_endpoint) - len(unavailable)} 条")
+    print(f"[T-109 真实] 可浏览条目总数 {derived + (records - len(per_endpoint) - len(unavailable))}")
 
     assert records == MEASURED_TOTAL_RECORDS, (
         f"归档记录数变了：实测 {records}，记录值 {MEASURED_TOTAL_RECORDS}；"
@@ -149,14 +132,14 @@ def test_real_containers_and_entry_counts() -> None:
     assert per_endpoint == EXPECTED_CONTAINER_FEEDS, (
         f"容器的派生条目数变了：实测 {per_endpoint}"
     )
-    assert derived == EXPECTED_DERIVED_ENTRIES == 830
-    assert len(per_endpoint) == MEASURED_CONTAINERS == 8
-    assert records - len(per_endpoint) == MEASURED_DIRECT_ENTRIES == 67
-    assert derived + (records - len(per_endpoint)) == MEASURED_TOTAL_ENTRIES == 897
+    assert derived == EXPECTED_DERIVED_ENTRIES == 850
+    assert len(per_endpoint) == MEASURED_CONTAINERS == 9
+    assert records - len(per_endpoint) - len(unavailable) == MEASURED_DIRECT_ENTRIES == 65
+    assert derived + (records - len(per_endpoint) - len(unavailable)) == MEASURED_TOTAL_ENTRIES == 915
 
-    # 两份"不是 feed"的真实输入必须被算进"整篇条目"，而不是消失
-    for endpoint in EXPECTED_NON_FEED_ENDPOINTS:
-        assert endpoint in non_feed, f"{endpoint} 不在整篇条目里（条目消失=静默丢失）"
+    assert len(unavailable) == MEASURED_UNAVAILABLE
+    for endpoint in EXPECTED_UNAVAILABLE_ENDPOINTS:
+        assert endpoint in unavailable and endpoint not in non_feed
     assert len(non_feed) == MEASURED_DIRECT_ENTRIES
 
     # 只读纪律：一个字节都没动

@@ -78,9 +78,19 @@ SPEC §6.3 裁决 B 的落地：`raw_id` 既可以标识**一份 feed**（容器
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, Iterable, Mapping, Optional, Protocol, Sequence, Tuple
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    Mapping,
+    Optional,
+    Protocol,
+    Sequence,
+    Tuple,
+)
 
 from atlas.contracts import RawRecord
 
@@ -440,8 +450,9 @@ class RawEntriesView(Protocol):
     |---|---|
     | `entries` | 这份原文的派生条目；**不是容器**时为空序列 |
     | `text_length` | 解码后原文的字符数（整篇条目的区间靠它定；见 `EntryView`） |
-    | `is_feed`（可选） | 已识别为 RSS/Atom；空序列表示本次无可展示文章，不回落为文章 |
+    | `is_feed`（可选） | 已识别为受支持的 XML/JSON 订阅；空序列表示本次无文章，不回落为文章 |
     | `problems`（可选） | 无文章时保留条目层的诊断，供浏览提示展示 |
+    | `unavailable_reason`（可选） | 明确的无文章响应（例如验证码页），作为提示而非文章展示 |
 
     为什么必须单独带 `text_length` 而不是从 `entries` 里取：**非容器本来就没有条目**，
     而整篇条目的区间仍然需要"这份原文有多长"。缺了它只能用字节数顶替，
@@ -504,6 +515,18 @@ class FeedEntry:
     #: 条目化过程中的**非致命**问题（例如"声明是 feed 但解析失败，已回落成整篇条目"）。
     #: 绝不静默：调用方（前端）必须能把它显出来。
     problems: Tuple[str, ...] = ()
+    industry_values: Tuple[str, ...] = ()
+    industry_source: str = ""
+    classification_status: str = ""
+    classification_model: str = ""
+    confirmed_values: Optional[Tuple[Tuple[str, str], ...]] = None
+    summary: str = ""
+    summary_origin: str = ""
+    title_zh: str = ""
+    body_note: str = ""
+    body_text: str = ""
+    admission_status: str = ""
+    admission_reason: str = ""
 
     @property
     def timestamp(self) -> datetime:
@@ -555,6 +578,7 @@ def run_query(
     *,
     label_lookup: LabelLookup | None = None,
     entries_of: EntriesLookup | None = None,
+    entry_projection: Callable[[Sequence[FeedEntry]], Sequence[FeedEntry]] | None = None,
 ) -> FeedResult:
     """执行一次只读查询。
 
@@ -582,10 +606,11 @@ def run_query(
     scanned = _scan_source(source)
     industries: Dict[str, str | None] = {}
     filtered: list[RawRecord] = []
+    scan_query = replace(query, industries=(), labels=(), labeled=None) if query.is_entry_mode and entry_projection else query
     for record in scanned:
         industry = _industry_of(source, record.channel_id)
         industries[record.raw_id] = industry
-        if not _matches(record, query, industry, label_lookup, wants_labels):
+        if not _matches(record, scan_query, industry, label_lookup, wants_labels and scan_query is query):
             continue
         filtered.append(record)
 
@@ -596,6 +621,7 @@ def run_query(
             query,
             label_lookup=label_lookup,
             entries_of=entries_of,
+            entry_projection=entry_projection,
         )
 
     ordered = _stable_order(filtered, query.order)
@@ -651,6 +677,7 @@ def _run_entry_query(
     *,
     label_lookup: LabelLookup | None,
     entries_of: EntriesLookup | None,
+    entry_projection: Callable[[Sequence[FeedEntry]], Sequence[FeedEntry]] | None = None,
 ) -> FeedResult:
     """条目粒度：把筛选后的 Raw 展开成可浏览单元，再排序 / 分页。"""
     assert entries_of is not None  # 由 run_query 保证
@@ -660,6 +687,12 @@ def _run_entry_query(
         labels = () if label_lookup is None else tuple(label_lookup(record.raw_id))
         view = entries_of(record)
         text_length = _require_text_length(record, view)
+        unavailable_reason = getattr(view, "unavailable_reason", "")
+        if unavailable_reason:
+            notices.append(f"{record.channel_id}：{unavailable_reason}")
+            continue
+        if view.entries:
+            notices.extend(f"{record.channel_id}：{problem}" for problem in getattr(view, "problems", ()))
         if record.entry_kind == "feed" and getattr(view, "is_feed", False) and not view.entries:
             reason = "；".join(getattr(view, "problems", ()))
             notices.append(
@@ -677,6 +710,20 @@ def _run_entry_query(
             )
         )
 
+    if entry_projection is not None:
+        projected = list(entry_projection(tuple(units)))
+        if [(u.raw_id, u.raw_sha256, u.entry_id, u.char_start, u.char_end) for u in projected] != [(u.raw_id, u.raw_sha256, u.entry_id, u.char_start, u.char_end) for u in units]:
+            raise SourceContractError("条目投影不得更改原文身份、区间、顺序或数量")
+        units = [u for u in projected if (
+            (not query.industries or bool(set(query.industries) & set(u.industry_values or ((u.industry,) if u.industry else ()))))
+            and (not query.labels or bool(set(query.labels) & set(u.labels)))
+            and (query.labeled is None or bool(u.labels) == query.labeled)
+        )]
+    isolated = [u for u in units if u.admission_status in ("pending", "rejected")]
+    if isolated:
+        counts = {status: sum(u.admission_status == status for u in isolated) for status in ("pending", "rejected")}
+        notices.append(f"入站审核：{counts['pending']} 条待审或内容不可读取，{counts['rejected']} 条已拦截；均未进入文章队列。")
+        units = [u for u in units if u.admission_status not in ("pending", "rejected")]
     ordered = _stable_entry_order(units, query.order)
     total = len(ordered)
     page = ordered[query.offset : query.offset + query.limit]
@@ -690,7 +737,7 @@ def _run_entry_query(
         offset=query.offset,
         has_more=has_more,
         next_offset=(query.offset + returned) if has_more else None,
-        notices=tuple(notices),
+        notices=tuple(dict.fromkeys(notices)),
     )
 
 

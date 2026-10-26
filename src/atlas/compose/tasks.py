@@ -1454,7 +1454,9 @@ class ClassifyStage(AtlasTask):
         space = label_space_from_snapshot(payload.get("label_space"))
         policy = policy_from_snapshot(payload.get("policy"))
         scoped, declared, by_raw = self._classify_scope(inputs)
-        port = self._resolve_port()
+        admission = payload.get("admission")
+        port = None if admission else self._resolve_port()
+        admission_blocked = 0
 
         classified: List[Dict[str, Any]] = []
         unclassified_rows = 0
@@ -1515,9 +1517,21 @@ class ClassifyStage(AtlasTask):
                 raw_plans.append(projection)
                 continue
 
+            units = plan.units
+            if admission:
+                approved = admission["allowed_units"].get(raw_id, [])
+                if set(approved) - {u.unit_id for u in units}:
+                    raise ClassifyStageError("审核快照含未知分类单元")
+                units = tuple(u for u in units if u.unit_id in approved)
+                admission_blocked += len(plan.units) - len(units)
+                if not units:
+                    raw_plans.append(projection)
+                    continue
+            if port is None:
+                port = self._resolve_port()
             outcome = propose_units(
                 raw_id,
-                plan.units,
+                units,
                 label_space=space,
                 port=port,
                 store=self._proposed,
@@ -1610,6 +1624,9 @@ class ClassifyStage(AtlasTask):
             "proposed_db": str(self._proposed.db_path),
             "classified_at": _utcnow().isoformat(),
         }
+        if admission:
+            observed["admission_blocked_units"] = admission_blocked
+            identity["admission"] = admission
         return make_artifacts(identity, observed)
 
     # ------------------------------------------------------------------

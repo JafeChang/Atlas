@@ -33,6 +33,7 @@ from .opml import (
     registry_to_opml,
 )
 from .persistence import DEFAULT_DB_PATH, SCHEMA_VERSION, SqliteConfigStore, open_store
+from .readview import read_subscription_sources
 from .schema import (
     BROWSER_MASQUERADE_USER_AGENTS,
     ID_PATTERN,
@@ -104,6 +105,7 @@ __all__ = [
     "open_store",
     "parse_opml",
     "registry_to_opml",
+    "read_subscription_sources",
     "require_adapter_plugin",
     "validate_endpoint",
     "validate_id",

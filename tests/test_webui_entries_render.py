@@ -22,6 +22,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -292,6 +293,164 @@ def test_unrecognized_xml_remains_visible_for_inspection(tmp_path: Path) -> None
         status, page, _ = _get(world.app, "/feed?limit=200")
         assert status == 200
         assert f'id="item-{record.raw_id}"' in page
+
+
+def test_json_news_are_articles_and_challenges_are_not(tmp_path: Path) -> None:
+    from atlas.webapp import store_summary
+
+    with running_frontend(tmp_path) as world:
+        hits = [
+            {"title": "中文 Hacker News article", "url": "https://example.test/news", "objectID": "123", "created_at": "2026-10-26T01:00:00Z"},
+            {"title": "Another discussion", "url": None, "objectID": "124", "created_at": "2026-10-26T02:00:00Z"},
+        ]
+        payload = json.dumps({"hits": hits, "nbHits": 2, "hitsPerPage": 20}, ensure_ascii=False).encode()
+        challenge = b'<html><head><meta http-equiv="refresh" content="0;/.well-known/sgcaptcha/"></head></html>'
+        with open_archive(world.root) as archive:
+            news = RawRecord.create(channel_id="hn", endpoint="https://example.test/api", content=payload, http_status=200)
+            blocked = RawRecord.create(channel_id="blocked", endpoint="https://example.test/feed/", content=challenge, http_status=202)
+            archive.put(news, payload)
+            archive.put(blocked, challenge)
+        before = hashlib.sha256(world.db_path.read_bytes()).hexdigest()
+        status, page, _ = _get(world.app, "/feed?limit=200")
+        assert status == 200 and 'class="count">共 6 条' in page
+        assert hits[0]["title"] in page and hits[1]["title"] in page
+        assert 'href="https://example.test/news"' in page
+        assert 'href="https://news.ycombinator.com/item?id=124"' in page
+        assert "验证码验证页" in page
+        assert f'id="item-{blocked.raw_id}"' not in page
+        status, documents, _ = _get(world.app, "/feed?granularity=document&limit=200")
+        assert status == 200 and f'id="item-{blocked.raw_id}"' in documents
+        assert f'id="item-{news.raw_id}"' in documents
+        summary = store_summary(world.root)
+        assert summary.records == 5 and summary.entries == 6 and summary.unavailable_records == 1
+        assert hashlib.sha256(world.db_path.read_bytes()).hexdigest() == before
+
+        # 浏览 / 高亮 / 单条打标实际通过 HTTP，锚点必须落在 JSON 中的原始对象上。
+        fields = _span_of(world.app, news.raw_id)
+        start, end = int(fields["char_start"]), int(fields["char_end"])
+        selected = json.loads(payload.decode()[start:end])
+        status, archive_page, _ = _get(world.app, "/entry?" + urllib.parse.urlencode({k: fields[k] for k in ("raw_id", "char_start", "char_end")}))
+        assert status == 200 and "<mark>" in archive_page
+        assert selected["title"] in archive_page
+        fields["actor"] = "tester"
+        status, _, _ = _post(world.app, fields)
+        assert status == 303
+        with open_store(world.db_path) as store:
+            label, = store.all_for(news.raw_id)
+            assert label.anchor.char_start == start and label.anchor.char_end == end
+            assert label.anchor.raw_sha256 == hashlib.sha256(payload).hexdigest()
+
+
+def test_ai_industries_are_per_entry_live_filtered_and_overridden_only_by_own_manual_label(tmp_path):
+    from bs4 import BeautifulSoup
+
+    from atlas.cognition import classify_document
+    from tests.test_classification_readview import add_classification
+
+    with running_frontend(tmp_path) as world:
+        first, second = classify_document(FEED_TEXT.encode(), raw_id="raw-feed-render").units
+        add_classification(world.db_path, first, values=("web",), plan="ai-first")
+        add_classification(world.db_path, second, values=("ai", "web"), plan="ai-second")
+        before = hashlib.sha256(world.db_path.read_bytes()).digest()
+        status, page, _ = _get(world.app, "/feed?industry=web&limit=1")
+        assert status == 200 and 'class="count">共 3 条' in page
+        assert "AI 建议" in page and "Gamma Report" in page
+        # 筛选 / total 先使用逐篇分类，再分页；渠道原来只有 ai。
+        status, page, _ = _get(world.app, "/feed?industry=web&limit=200")
+        soup = BeautifulSoup(page, "html.parser")
+        assert len(soup.select('.item')) == 3
+        assert "Gamma Report" in page and first.title.replace("&", "&amp;")[:10] in page
+        assert hashlib.sha256(world.db_path.read_bytes()).digest() == before
+        status, page, _ = _get(world.app, "/feed?labeled=true")
+        assert status == 200 and 'class="count">共 0 条' in page  # AI 不算人工打标。
+
+        fields = _span_of(world.app, "raw-feed-render")
+        fields.update(label_key="industry", label_value="ai", actor="tester")
+        status, _, _ = _post(world.app, fields)
+        assert status == 303
+        status, page, _ = _get(world.app, "/feed?labeled=true")
+        assert status == 200 and 'class="count">共 1 条' in page
+        assert "人工确认" in page
+        # 更换另一个条目的模型结果，不重启也能读到；失败不得继续显示旧分类。
+        selected_start = int(fields['char_start'])
+        other = first if first.char_start != selected_start else second
+        add_classification(world.db_path, other, status="unclassified", plan="ai-failed")
+        status, page, _ = _get(world.app, "/feed?limit=200")
+        assert status == 200 and "AI 未分类" in page and "人工确认" in page
+        status, page, _ = _get(world.app, "/feed?industry=web&limit=200")
+        assert status == 200 and 'class="count">共 1 条' in page  # 只剩渠道为 web 的整篇文章。
+
+
+def test_industry_projection_cannot_change_an_articles_anchor(tmp_path):
+    from dataclasses import replace
+
+    with running_frontend(tmp_path) as world:
+        assert _get(world.app, "/feed")[0] == 200  # 同一 HTTP / 投影路径的活对照。
+        original = world.app._httpd.entry_projection
+
+        def wrong(entries, session):
+            rows = list(original(entries, session))
+            rows[0] = replace(rows[0], char_end=rows[0].char_end + 1)
+            return rows
+
+        world.app._httpd.entry_projection = wrong
+        status, page, _ = _get(world.app, "/feed")
+        assert status == 500 and "投影不得更改" in page
+
+
+def test_feed_reads_title_and_summary_columns_and_places_translation_below_original(tmp_path):
+    from dataclasses import replace
+
+    from bs4 import BeautifulSoup
+
+    from atlas.cognition import ArticleBrief, BriefStore
+    from atlas.webapp import ArchiveEntriesAccess
+
+    with running_frontend(tmp_path) as world:
+        with open_archive(world.root) as archive:
+            source = next(iter(ArchiveEntriesAccess(archive).brief_sources('raw-feed-render').values()))
+        enriched = replace(source, body='The article explains an algorithm and its evaluation. ' * 10)
+        store = BriefStore(world.db_path)
+        store.record([enriched], {source.key:ArticleBrief('阿尔法与贝塔', '这是该文章的中文简介，介绍研究方法及其主要发现。' * 30)}, model='test-model')
+        store.close()
+        before = hashlib.sha256(world.db_path.read_bytes()).digest()
+        status, page, _ = _get(world.app, '/feed?limit=200')
+        soup = BeautifulSoup(page, 'html.parser')
+        assert status == 200
+        translated = soup.select_one('.title-zh')
+        assert translated.get_text() == '阿尔法与贝塔'
+        assert translated.find_previous_sibling('a')['class'] == ['title']
+        assert 'Alpha' in translated.find_previous_sibling('a').get_text()
+        card = translated.find_parent('article')
+        assert '这是该文章的中文简介' in card.select_one('.summary').get_text()
+        assert len(card.select_one('.summary').get_text()) <= 300
+        assert 'AI 中文简介' in page
+        assert '标题译述' not in page
+        assert hashlib.sha256(world.db_path.read_bytes()).digest() == before
+
+
+def test_feed_chinese_original_title_is_not_repeated_but_has_summary(tmp_path):
+    from bs4 import BeautifulSoup
+
+    from atlas.cognition import ArticleBrief, BriefStore
+    from atlas.webapp import ArchiveEntriesAccess
+
+    with running_frontend(tmp_path) as world:
+        payload = ('<rss><channel><item><title>中文原始标题</title><link>https://example.test/zh</link>'
+                   '<description>' + '这是中文正文，介绍图像识别研究的核心方法及其评估。' * 10 + '</description></item></channel></rss>').encode()
+        record = RawRecord.create(channel_id='chan-feed', endpoint='https://example.test/zh.xml', content=payload, http_status=200)
+        with open_archive(world.root) as archive:
+            archive.put(record, payload)
+            source = next(iter(ArchiveEntriesAccess(archive).brief_sources(record.raw_id).values()))
+        store = BriefStore(world.db_path)
+        store.record([source], {source.key:ArticleBrief('不应显示的重复译题', '文章介绍图像识别研究的方法及评估。')}, model='test-model')
+        store.close()
+        status, page, _ = _get(world.app, '/feed?limit=200')
+        soup = BeautifulSoup(page, 'html.parser')
+        card = next(c for c in soup.select('article') if c.select_one('.title').get_text() == '中文原始标题')
+        assert status == 200
+        assert not card.select('.title-zh')
+        assert card.select_one('.summary').get_text() == '文章介绍图像识别研究的方法及评估。'
 
 
 # ===================================================================== #
@@ -653,3 +812,46 @@ def test_browsing_does_not_touch_the_archive_or_create_a_label_store(
         assert snapshot() == before, "浏览不得改动归档"
     finally:
         app.close()
+
+
+def test_cleaned_body_and_failure_category_are_visible_without_network_or_writes(tmp_path):
+    from bs4 import BeautifulSoup
+
+    from atlas.archive import ArticleContentStore
+    with running_frontend(tmp_path) as world:
+        store=ArticleContentStore(world.db_path)
+        store.record(source_url='https://example.test/alpha?a=1&b=2',status='ready',content_kind='article',cleaned_text='已经清洗留存的正文第一段。\n\n第二段包含代码 <script>unsafe()</script>。',cleaner_version='test')
+        store.record(source_url='https://example.test/gamma',status='unavailable',cleaner_version='test',failure_code='http_forbidden',failure_category='access',failure_label='访问受限',failure_detail='原文 HTTP 403',http_status=403)
+        store.close()
+        digest=hashlib.sha256(world.db_path.read_bytes()).digest()
+        status,page,_=_get(world.app,'/feed?limit=200')
+        soup=BeautifulSoup(page,'html.parser')
+        assert status==200
+        assert '本次正文获取失败：访问受限' in page and '清洗后' in page
+        card=next(c for c in soup.select('article.entry') if 'Alpha' in c.select_one('.title').get_text())
+        link=next(a['href'] for a in card.select('a') if a.get_text()=='查看归档')
+        status,detail,_=_get(world.app,link)
+        soup=BeautifulSoup(detail,'html.parser')
+        assert status==200 and '清洗后留存的正文' in detail
+        assert '<script>unsafe()</script>' in soup.select_one('.cleaned-body').get_text()
+        assert not soup.select('.cleaned-body script')
+        assert hashlib.sha256(world.db_path.read_bytes()).digest()==digest
+
+
+def test_recovered_body_does_not_keep_showing_old_unreadable_message(tmp_path):
+    from atlas.archive import ArticleContentStore
+    from atlas.cognition import BriefStore
+    from atlas.webapp import ArchiveEntriesAccess
+    with running_frontend(tmp_path) as world:
+        with open_archive(world.root) as archive:
+            source=next(iter(ArchiveEntriesAccess(archive).brief_sources('raw-feed-render').values()))
+        briefs=BriefStore(world.db_path)
+        briefs.ensure_sources([source])
+        briefs.record_body(source,body='',error='原文 HTTP 403')
+        briefs.close()
+        bodies=ArticleContentStore(world.db_path)
+        bodies.record(source_url=source.url,status='ready',content_kind='article',cleaned_text='已经恢复获取并留存的正文。'*20,cleaner_version='test')
+        bodies.close()
+        status,page,_=_get(world.app,'/feed?limit=200')
+        assert status==200 and '简介待生成：正文已留存' in page
+        assert '原文暂时无法读取' not in page

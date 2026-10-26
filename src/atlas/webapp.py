@@ -30,12 +30,12 @@ SPEC §6.5 的结论是"把 T-130 的条目接进 feed 与前端"。接线需要
 |---|---|
 | **容器**（内容能解析成 feed，实测 8 条） | **本身不出现**；它的派生条目出现 |
 | **本身就是条目**（按篇归档的文章，实测 65 条） | 整篇作为一条出现 |
-| 既不是 feed 也没有可解析内容（实测 2 条） | 仍是整篇一条，**不消失** |
+| Algolia/Hacker News JSON 搜索响应 | 展开为新闻条目，使用原始 JSON 对象的字符区间 |
+| 明确的验证码跳转响应 | 显示来源提示；原始响应仍可从文档视图查看 |
+| 其余未知内容 | 仍按整篇保留，便于检查 |
 
-判据是**内容**（`parse_entries` 是否识别为 RSS/Atom，包括零条目的响应），不是 endpoint 猜的，
-也不是 endpoint 后缀匹配——`hacker-news-frontpage` 的 endpoint 以 `/search_by_date`
-结尾却返回 JSON，`ai-news-blog` 的 endpoint 以 `/feed/` 结尾却返回 HTML；
-按内容判定对这两条给出了正确结果（都是"整篇即条目"）。
+判据是**内容**：RSS/Atom、Algolia 的 hits 数组、验证码页的实际 meta 重定向目标。
+不根据 endpoint 后缀猜格式，空订阅不回落成文章。JSON 浏览适配与机器分类分流独立。
 
 > ⚠️ 分类是**派生量**，没有落库：`raw_records` 没有 `entry_kind` 列，加列会牵动
 > T-103 的物理表（超出本任务范围）。因此它在浏览时按内容计算并缓存（确定性、可重建）。
@@ -70,16 +70,35 @@ PYTHONPATH=src ./.venv-new/bin/python -m atlas.webapp
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Sequence, Tuple
 
-from atlas.archive import ArchiveStore, open_archive
+from atlas.archive import (
+    ArchiveStore,
+    enable_wal,
+    open_archive,
+    read_article_body,
+    read_article_contents,
+)
+from atlas.cognition import (
+    BriefSource,
+    brief_source,
+    display_brief,
+    read_articles,
+    read_classifications,
+)
 from atlas.contracts import RawRecord
-from atlas.entries import EntryParseError, parse_entries
+from atlas.entries import (
+    EntryParseError,
+    is_challenge_page,
+    parse_algolia_entries,
+    parse_entries,
+)
 from atlas.feed import (
     ArchiveFeedSource,
     FeedEntry,
@@ -87,7 +106,8 @@ from atlas.feed import (
     title_from_endpoint,
 )
 from atlas.normalize.text import decode_bytes
-from atlas.registry import RegistryService
+from atlas.cognition.admission import read_admissions
+from atlas.registry import RegistryService, read_subscription_sources
 from atlas.registry import open_store as open_registry_store
 from atlas.webui import (
     DEFAULT_ACTOR,
@@ -133,6 +153,7 @@ class _Analysis:
     text_length: int
     is_feed: bool = False
     problems: Tuple[str, ...] = ()
+    unavailable_reason: str = ""
 
 
 class LocatedEntry:
@@ -160,6 +181,8 @@ class ArchiveEntriesAccess:
         self._archive = archive
         self._cache_size = cache_size
         self._cache: Dict[str, _Analysis] = {}
+        self._brief_sources: Dict[str, Dict[tuple[int, int], BriefSource]] = {}
+        self._subscription_sources = read_subscription_sources(archive.db_path)
 
     # -- 基础 -----------------------------------------------------------------
     def content(self, raw_id: str) -> bytes:
@@ -171,13 +194,45 @@ class ArchiveEntriesAccess:
             return cached
 
         raw_bytes = self.content(record.raw_id)
+        text = decode_bytes(raw_bytes)[0]
+        algolia = parse_algolia_entries(raw_bytes, raw_id=record.raw_id)
+        if algolia is not None:
+            analysis = _Analysis(
+                entries=algolia.entries, text=algolia.feed_text, text_length=len(algolia.feed_text),
+                is_feed=True, problems=algolia.problems,
+            )
+        elif is_challenge_page(text):
+            analysis = _Analysis(
+                entries=(), text=text, text_length=len(text),
+                unavailable_reason="来源返回验证码验证页，本次没有可展示的文章；原始响应保留在归档中。",
+            )
+        else:
+            analysis = self._analyse_xml(record, raw_bytes)
+
+        if len(self._cache) >= self._cache_size:
+            self._cache.clear()
+            self._brief_sources.clear()
+        self._cache[record.raw_id] = analysis
+        return analysis
+
+    def _analyse_xml(self, record: RawRecord, raw_bytes: bytes) -> _Analysis:
         try:
             entrieset = parse_entries(raw_bytes, "", raw_id=record.raw_id)
-        except EntryParseError:
-            # 不是 feed（HTML 文章页 / JSON API 响应）⇒ 整篇即条目。
+        except EntryParseError as error:
+            if (record.channel_id, record.endpoint) in self._subscription_sources:
+                return _Analysis(
+                    entries=(), text=decode_bytes(raw_bytes)[0], text_length=_text_length(raw_bytes),
+                    unavailable_reason=f'订阅端点返回了非订阅内容，本次未展示为文章：{error}',
+                )
+            # Algolia 与验证码响应已经处理；其他非 XML 内容按整篇保留。
             # **不吞掉**这个事实：它正是 §6.3 的"非容器"那一类。
             analysis = _Analysis(entries=(), text="", text_length=_text_length(raw_bytes))
         else:
+            if (record.channel_id, record.endpoint) in self._subscription_sources and entrieset.kind not in ('rss', 'atom'):
+                return _Analysis(
+                    entries=(), text=entrieset.feed_text, text_length=len(entrieset.feed_text),
+                    unavailable_reason='订阅端点响应未包含可识别的订阅条目，原始响应仍保留在归档中。',
+                )
             analysis = _Analysis(
                 entries=tuple(entrieset.entries),
                 text=entrieset.feed_text,
@@ -186,9 +241,6 @@ class ArchiveEntriesAccess:
                 problems=entrieset.problems,
             )
 
-        if len(self._cache) >= self._cache_size:
-            self._cache.clear()
-        self._cache[record.raw_id] = analysis
         return analysis
 
     # -- atlas.feed.EntriesLookup -------------------------------------------
@@ -202,17 +254,43 @@ class ArchiveEntriesAccess:
         return _RawEntriesView(
             entries=analysis.entries, text_length=analysis.text_length,
             is_feed=analysis.is_feed, problems=analysis.problems,
+            unavailable_reason=analysis.unavailable_reason,
         )
 
     def is_container(self, raw_id: str) -> bool:
-        """合法 RSS/Atom 即容器，包括本次没有文章的订阅响应。"""
+        """RSS/Atom 或受支持的 JSON 订阅即容器，包括本次没有文章的响应。"""
         return self._analyse(self._archive.get(raw_id)).is_feed
+
+    def brief_sources(self, raw_id: str) -> Dict[tuple[int, int], BriefSource]:
+        """简介的标题 / 正文来源；和文章区间对应，绝不把 JSON 元数据当成正文。"""
+        if raw_id in self._brief_sources:
+            return self._brief_sources[raw_id]
+        record = self._archive.get(raw_id)
+        analysis = self._analyse(record)
+        sources = {}
+        if not analysis.unavailable_reason:
+            if analysis.is_feed:
+                for entry in analysis.entries:
+                    body = getattr(entry, "entry_text", "")
+                    if getattr(entry, "kind", "") == "algolia-hn":
+                        hit = json.loads(entry.content_slice(analysis.text))
+                        body = hit.get("story_text") or hit.get("text") or ""
+                        if not isinstance(body, str):
+                            body = ""
+                    sources[(entry.char_start, entry.char_end)] = brief_source(entry.title, body, url=entry.link or record.endpoint)
+            else:
+                text = analysis.text or decode_bytes(self.content(raw_id))[0]
+                sources[(0, max(1, analysis.text_length))] = brief_source(
+                    title_from_endpoint(record.endpoint), text, kind="excerpt", url=record.endpoint,
+                )
+        self._brief_sources[raw_id] = sources
+        return sources
 
     # -- 容器分类 -----------------------------------------------------------
     def container_ids(self) -> Tuple[str, ...]:
         """哪些 raw 是**容器**（`entry_kind == "feed"`）。
 
-        判据是内容被识别为合法 RSS/Atom，与本次文章数量无关。
+        判据是内容被识别为 RSS/Atom 或受支持的 JSON，与本次文章数量无关。
         解析失败和未知 XML 仍按整篇原文保留，不伪装成空订阅。
         """
         containers: list[str] = []
@@ -282,6 +360,7 @@ class _RawEntriesView:
     text_length: int
     is_feed: bool = False
     problems: Tuple[str, ...] = ()
+    unavailable_reason: str = ""
 
 
 # ---------------------------------------------------------------------- #
@@ -346,6 +425,62 @@ def build_webapp(
     if initialize_labels:
         labels.initialize()
 
+    def project_entries(entries: Sequence[FeedEntry], session: Any) -> Sequence[FeedEntry]:
+        views = read_classifications(db_path)
+        briefs = read_articles(db_path)
+        admission = read_admissions(db_path)
+        bodies = read_article_contents(db_path)
+        articles = {v.raw_id: v for v in views.values() if v.unit_kind == "article"}
+        allowed = set(industry_provider())
+        projected = []
+        for entry in entries:
+            summary_source = access.brief_sources(entry.raw_id).get((entry.char_start, entry.char_end))
+            summary, summary_origin = display_brief(summary_source, briefs) if summary_source else ("", "")
+            article = briefs.get(summary_source.key) if summary_source else None
+            title_zh = article.title_zh if article and article.status == 'ready' and not summary_source.native_chinese else ''
+            body = bodies.get(summary_source.url) if summary_source else None
+            review = admission.reviews.get(summary_source.key) if summary_source and admission.enabled else None
+            admission_status = (review.decision if review else "pending") if admission.enabled else ""
+            admission_reason = review.reason if review else "尚未完成入站审核"
+            body_note = ''
+            saved_body = read_article_body(db_path,summary_source.url) if summary_source and len(entries)==1 else None
+            if body:
+                if body.status == 'ready':
+                    body_note = f'{"论文全文" if body.content_kind == "paper" else "正文"}已留存，清洗后 {body.body_chars} 字'
+                    if body.truncated:
+                        body_note += '（内容受限，已标记截断）'
+                    if not article or article.status != 'ready':
+                        summary_origin = '简介待生成：正文已留存'
+                elif body.status == 'partial':
+                    body_note = '目前留存摘要或片段，完整正文待补抓'
+                else:
+                    body_note = '本次正文获取失败：' + body.failure_label
+                    if not article or article.status != 'ready':
+                        summary_origin = '简介暂缺：' + body.failure_label
+            values = session.values_for_entry(entry)
+            view = views.get(entry.entry_id) if entry.from_feed else articles.get(entry.raw_id)
+            source, status, model = "channel", "pending", ""
+            industries = (entry.industry,) if entry.industry else ()
+            if view is not None:
+                status, model = view.status, view.model
+                source = view.origin
+                industries = tuple(value for value in view.labels if value in allowed)
+                if status == "classified" and not industries:
+                    status = "outdated"
+            if "industry" in values:
+                source, industries = "manual", (values["industry"],)
+            projected.append(replace(
+                entry, industry=industries[0] if industries else None,
+                industry_values=industries, industry_source=source,
+                classification_status=status, classification_model=model,
+                confirmed_values=tuple(sorted(values.items())), labels=tuple(sorted(values)),
+                summary=summary, summary_origin=summary_origin, title_zh=title_zh,
+                admission_status=admission_status, admission_reason=admission_reason,
+                body_note=("入站审核：" + admission_reason + "；" if admission_status in ("pending", "rejected") else "") + body_note,
+                body_text=saved_body.cleaned_text if saved_body else '',
+            ))
+        return tuple(projected)
+
     return WebUIApplication(
         source,
         labels=labels,
@@ -355,6 +490,7 @@ def build_webapp(
         entries_lookup=entries_of,
         locate_entry=locate_entry,
         text_length=text_length,
+        entry_projection=project_entries,
         on_close=archive.close,
         host=host,
         port=port,
@@ -428,11 +564,12 @@ class StoreSummary:
     records: int
     containers: int
     derived_entries: int
+    unavailable_records: int = 0
 
     @property
     def direct_entries(self) -> int:
         """本身就是条目的 Raw 数（整篇即一条）。"""
-        return self.records - self.containers
+        return self.records - self.containers - self.unavailable_records
 
     @property
     def entries(self) -> int:
@@ -458,6 +595,10 @@ def store_summary(root: Any) -> StoreSummary:
             records=len(archive.all_raw_ids()),
             containers=len(containers),
             derived_entries=derived,
+            unavailable_records=sum(
+                bool(access.entries_of(archive.get(raw_id)).unavailable_reason)
+                for raw_id in archive.all_raw_ids()
+            ),
         )
     finally:
         archive.close()
@@ -564,6 +705,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
 
     db_path = root / "atlas.db"
+    enable_wal(db_path)
     # 行业取值集合来自**配置**（SPEC §2.5 的 C8 闭环），不硬编码任何行业名。
     registry = RegistryService(open_registry_store(db_path, author=str(args.actor)))
     industry_of = {

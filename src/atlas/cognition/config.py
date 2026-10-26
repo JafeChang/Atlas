@@ -79,7 +79,7 @@ OA_API_KEY_ENV = "ATLAS_OPENAI_API_KEY"
 #: OpenCode Go：独立凭据与配置，避免覆盖 OpenRouter 兼容路由。
 GO_ROUTE = "opencode-go"
 GO_PROVIDER = "opencode-go"
-GO_MODEL = "glm-5.3-flash"
+GO_MODEL = "deepseek-v4.1-flash"
 GO_BASE_URL = "https://opencode.ai/inference/go/openai/v1"
 GO_API_KEY_ENV = "OPENCODE_GO_API_KEY"
 ROUTES = (DS_ROUTE, OA_ROUTE, GO_ROUTE)

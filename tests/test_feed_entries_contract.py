@@ -541,14 +541,14 @@ def test_criterion_7_contract_version_bumped_with_backward_compatible_documents(
 # ===================================================================== #
 # 判据 8：零新增 Python 依赖
 # ===================================================================== #
-def test_criterion_8_no_new_python_dependencies() -> None:
-    """零新增依赖：`pyproject.toml` 声明的第三方包**一个都没变**（照 T-001 的 12 项基线）。
+def test_criterion_8_only_registered_python_dependencies() -> None:
+    """依赖集合固定：T-001 基线加 SPEC §6.19 的 PDF 正文读取依赖。
 
     比"grep 一下没有 flask"强的地方：这里把**声明集合**钉死，任何新增/删除都会失败。
     """
     declared = _declared_dependencies()
     assert declared == BASELINE_DEPENDENCIES, (
-        "本任务不得改动依赖声明（SPEC §2.11 / CLAUDE.md 的依赖最小化）；"
+        "依赖必须符合 SPEC §2.11 / §6.19 登记集合；"
         f"新增/删除：{sorted(declared ^ BASELINE_DEPENDENCIES)}"
     )
     # 本任务的全部 import 都来自 stdlib 与仓库内包：用 AST 检查被改动的文件
@@ -592,6 +592,7 @@ BASELINE_DEPENDENCIES = frozenset(
         "httpx>=0.25.0",
         "beautifulsoup4>=4.12.0",
         "lxml>=4.9.0",
+        "pypdf>=6.0.0",
         "feedparser>=6.0.0",
         "pydantic>=2.5.0",
         "pydantic-settings>=2.12.0",
@@ -677,7 +678,7 @@ def test_criterion_9_protected_modules_are_not_imported_by_the_changed_packages(
 
 
 def test_criterion_9a_composition_root_only_imports_the_c8_wiring() -> None:
-    """组合根（`atlas/webapp.py`）只允许 import 受保护模块里的 `atlas.registry`。
+    """组合根接注册表与只读分类；查询 / 渲染包仍不依赖这些实现。
 
     理由：SPEC §2.5 规定"行业配置 = AI 分类的标签空间 = feed 的筛选维度 = 打标时的
     修正对象"四者引用同一份配置，而 feed 刻意不 import registry ⇒ **必须**由组合根
@@ -686,7 +687,9 @@ def test_criterion_9a_composition_root_only_imports_the_c8_wiring() -> None:
     modules = _imported_modules(REPO_ROOT / "src" / "atlas" / "webapp.py")
     imported = {name for name in modules if name.startswith("atlas")}
     for forbidden in FORBIDDEN_MODULES:
-        assert forbidden not in imported, forbidden
+        if forbidden != "atlas.cognition":
+            assert forbidden not in imported, forbidden
+    assert "atlas.cognition" in imported  # 组合根只读注入机器分类；feed/webui 继续隔离。
     assert "atlas.registry" in imported, "C8 闭环必须由组合根接上（SPEC §2.5）"
     # 组件的实现细节不许穿透：只用包的公开入口
     assert "atlas.archive.blobstore" not in imported

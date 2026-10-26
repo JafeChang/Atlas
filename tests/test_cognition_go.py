@@ -26,7 +26,7 @@ def test_go_route_uses_its_own_key_model_and_endpoint() -> None:
     }
     config = CognitionConfig.from_env(env=env, route=GO_ROUTE)
     assert config.provider == GO_PROVIDER
-    assert config.model == GO_MODEL
+    assert config.model == GO_MODEL == "deepseek-v4.1-flash"
     assert config.base_url == GO_BASE_URL
     assert config.api_key_env == GO_API_KEY_ENV
     assert config.api_key == 'go-test-key'

@@ -30,6 +30,17 @@
 from __future__ import annotations
 
 from .adapter import FRAME_PREFIX, PROTOCOL, PiSidecarCognitionPort
+from .briefs import (
+    ArticleBrief,
+    ArticleRow,
+    BriefClient,
+    BriefSource,
+    BriefStore,
+    brief_source,
+    display_brief,
+    read_articles,
+    read_briefs,
+)
 from .classify import (
     ARTICLE_ID_PREFIX,
     BATCH_MAX_CHARS,
@@ -127,6 +138,7 @@ from .propose import (
     propose_units,
     run_batch,
 )
+from .readview import ClassificationView, read_classifications
 from .store import (
     CLAIM_KEY_PREFIX,
     CLAIM_STATUS_CLASSIFIED,
@@ -149,6 +161,17 @@ from .store import (
 )
 
 __all__ = [
+    "ArticleBrief",
+    "ArticleRow",
+    "BriefClient",
+    "BriefSource",
+    "BriefStore",
+    "brief_source",
+    "display_brief",
+    "read_briefs",
+    "read_articles",
+    "ClassificationView",
+    "read_classifications",
     "ARTICLE_ID_PREFIX",
     "ATTRIBUTION_STATUS_ATTRIBUTED",
     "ATTRIBUTION_STATUS_MULTIPLE",

@@ -13,7 +13,14 @@
 
 from __future__ import annotations
 
+from .article_store import (
+    ArticleContentRow,
+    ArticleContentStore,
+    read_article_body,
+    read_article_contents,
+)
 from .blobstore import DEFAULT_RAW_DIR, BlobStore
+from .concurrency import enable_wal
 from .sqlite_store import DEFAULT_DB_PATH, SCHEMA_VERSION, SqliteRawStore
 from .store import (
     DEFAULT_STORE_ROOT,
@@ -24,6 +31,11 @@ from .store import (
 )
 
 __all__ = [
+    "ArticleContentRow",
+    "ArticleContentStore",
+    "read_article_contents",
+    "read_article_body",
+    "enable_wal",
     "DEFAULT_DB_PATH",
     "DEFAULT_RAW_DIR",
     "DEFAULT_STORE_ROOT",

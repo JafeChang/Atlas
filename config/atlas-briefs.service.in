@@ -1,0 +1,25 @@
+[Unit]
+Description=Atlas incremental Chinese article titles and summaries
+After=network-online.target
+Wants=network-online.target
+RequiresMountsFor=@ATLAS_ROOT@
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+WorkingDirectory=@ATLAS_ROOT@
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=-@ATLAS_ROOT@/data/store/article-content.env
+ExecStartPre=@ATLAS_ROOT@/.venv-new/bin/python -m atlas.admission_cli --enable --limit 100 --workers 2 --report-dir @ATLAS_ROOT@/data/store/admission-job
+ExecStart=@ATLAS_ROOT@/.venv-new/bin/python -m atlas.briefs_cli --limit 50 --workers 2 --fetch-workers 2 --failure-cooldown 900 --report-dir @ATLAS_ROOT@/data/store/briefs-job
+TimeoutStartSec=600
+TimeoutStopSec=20
+Restart=on-failure
+RestartSec=120
+Nice=10
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=@ATLAS_ROOT@/data @ATLAS_ROOT@/logs

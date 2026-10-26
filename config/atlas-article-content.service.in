@@ -1,0 +1,27 @@
+[Unit]
+Description=Atlas cleaned article and paper full text backfill
+After=network-online.target
+Wants=network-online.target
+RequiresMountsFor=@ATLAS_ROOT@
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=@ATLAS_ROOT@
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=-@ATLAS_ROOT@/data/store/article-content.env
+ExecStart=@ATLAS_ROOT@/.venv-new/bin/python -m atlas.article_content_cli --scope all --retry-transient --workers 4 --report-dir @ATLAS_ROOT@/data/store/article-content-job
+Restart=on-failure
+RestartSec=900
+KillSignal=SIGINT
+TimeoutStopSec=90
+Nice=10
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=@ATLAS_ROOT@/data @ATLAS_ROOT@/logs
+
+[Install]
+WantedBy=multi-user.target

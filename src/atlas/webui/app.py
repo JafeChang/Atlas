@@ -272,6 +272,9 @@ class _ReadOnlySession:
                 values[key] = value
         return values
 
+    def values_for_entry(self, entry: FeedEntry) -> Dict[str, str]:
+        return self.values_for(entry.raw_id)
+
     def __enter__(self) -> "_ReadOnlySession":
         return self
 
@@ -324,6 +327,21 @@ class _StoreSession(_ReadOnlySession):
         只拿键名分不出"这条标签标在哪一段"。
         """
         return [(label, _anchor_key(label)) for label in self._labels_for(raw_id)]
+
+    def values_for_entry(self, entry: FeedEntry) -> Dict[str, str]:
+        document, specific = {}, {}
+        for label in self._labels_for(entry.raw_id):
+            anchor = label.anchor
+            if anchor is None:
+                target = document
+            elif (anchor.raw_sha256, anchor.char_start, anchor.char_end) == (entry.raw_sha256, entry.char_start, entry.char_end):
+                target = specific
+            else:
+                continue
+            previous = target.get(label.label_key)
+            if previous is None or label.created_at > previous.created_at:
+                target[label.label_key] = label
+        return {key: label.label_value for key, label in {**document, **specific}.items()}
 
     def __exit__(self, *exc_info: object) -> None:
         self._store.close()
@@ -581,6 +599,7 @@ class WebUIRequestHandler(BaseHTTPRequestHandler):
                     query,
                     label_lookup=_memoized_lookup(session),
                     entries_of=server.entries_lookup,
+                    entry_projection=(lambda entries: server.entry_projection(entries, session)) if server.entry_projection else None,
                 )
                 values = {
                     item.raw_id: session.values_for(item.raw_id) for item in result.items
@@ -689,7 +708,11 @@ class WebUIRequestHandler(BaseHTTPRequestHandler):
 
         try:
             with server.labels.read_session() as session:
-                labels = session.values_for(raw_id)
+                if server.entry_projection:
+                    located.entry = server.entry_projection((located.entry,), session)[0]
+                    labels = dict(located.entry.confirmed_values or ())
+                else:
+                    labels = session.values_for(raw_id)
         except Exception as exc:  # noqa: BLE001
             _log.exception("读取标签失败")
             self._send_error(
@@ -1270,6 +1293,7 @@ class WebUIHTTPServer(ThreadingHTTPServer):
         entries_lookup: Any = None,
         locate_entry: Any = None,
         text_length: Any = None,
+        entry_projection: Any = None,
     ) -> None:
         self._source = source
         self.labels = labels
@@ -1281,6 +1305,7 @@ class WebUIHTTPServer(ThreadingHTTPServer):
         self.entries_lookup = entries_lookup or _derive_entries_lookup(source)
         self.locate_entry = locate_entry or _whole_document_entry
         self.text_length = text_length or _default_text_length
+        self.entry_projection = entry_projection
         super().__init__(server_address, WebUIRequestHandler)
 
     def resolve_source(self) -> Any:
@@ -1355,6 +1380,7 @@ class WebUIApplication:
         entries_lookup: Any = None,
         locate_entry: Any = None,
         text_length: Any = None,
+        entry_projection: Any = None,
         on_close: Optional[Callable[[], None]] = None,
         host: str = "127.0.0.1",
         port: int = 0,
@@ -1371,6 +1397,7 @@ class WebUIApplication:
             entries_lookup=entries_lookup,
             locate_entry=locate_entry,
             text_length=text_length,
+            entry_projection=entry_projection,
         )
         self._thread = threading.Thread(
             target=self._serve, name="atlas-webui-http", daemon=True

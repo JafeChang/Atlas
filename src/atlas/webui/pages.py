@@ -182,6 +182,8 @@ code, .raw-id { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; fon
 .item .head { min-width: 0; }
 .item .title { color: var(--text); font-weight: 650; font-size: 1.08rem;
               text-decoration: none; overflow-wrap: anywhere; }
+.item .title-zh { color: var(--text); font-size: 1rem; line-height: 1.55;
+                  margin: 0.35rem 0 0; overflow-wrap: anywhere; }
 .item .meta { display: flex; flex-wrap: wrap; gap: 0.25rem 0.75rem; color: var(--muted);
               font-size: 0.875rem; margin: 0.45rem 0; overflow-wrap: anywhere; }
 .badge { display: inline-block; font-size: 0.8rem; border-radius: 6px;
@@ -191,6 +193,11 @@ code, .raw-id { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; fon
 .item .trace code { margin-right: 0.35rem; }
 .item .hint { font-size: 0.75rem; opacity: 0.7; }
 .item .labels { font-size: 0.875rem; color: var(--muted); margin: 0.6rem 0; }
+.item .summary { font-size: 0.95rem; line-height: 1.7; margin: 0.75rem 0 0.25rem;
+                 overflow-wrap: anywhere; }
+.item .summary-origin { color: var(--muted); font-size: 0.75rem; }
+.cleaned-body { white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.75;
+                font-family: inherit; max-width: 100%; }
 .item .problem { font-size: 0.8rem; border-left: 3px solid currentColor;
                  padding-left: 0.5rem; margin: 0.3rem 0; }
 .item .open { opacity: 1; font-size: 0.875rem; }
@@ -332,6 +339,8 @@ def render_feed_page(
     for item in result.items:
         labels = values.get(item.raw_id, {})
         if isinstance(item, FeedEntry):
+            if item.confirmed_values is not None:
+                labels = dict(item.confirmed_values)
             parts.append(
                 _render_entry(
                     item,
@@ -444,7 +453,6 @@ def _render_entry(
     刻意保留 `raw-id` / `item-{raw_id}` / `label-tag` 这些既有标识：
     它们是对外可断言的结构，换渲染粒度不该把它们弄丢（既有测试与页面锚点都在用）。
     """
-    industry = entry.industry if entry.industry is not None else "（未归行业）"
     status = "" if entry.http_status is None else f" · HTTP {entry.http_status}"
     time_hint = "" if entry.published_from_entry else "（条目无发布时间，显示抓取时间）"
     title_hint = (
@@ -461,12 +469,16 @@ def _render_entry(
         '<div class="head">'
         f'<a class="title" href="{_safe_href(link)}" rel="noreferrer noopener">'
         f"{escape(entry.title)}</a>"
-        "</div>"
+        + (f'<p class="title-zh" lang="zh-CN">{escape(entry.title_zh)}</p>' if entry.title_zh else '')
+        + "</div>"
         f'<div class="meta"><span>{escape(entry.channel_id)}</span>'
         f'<time datetime="{escape(entry.timestamp.isoformat())}">'
         f'{escape(entry.timestamp.strftime("%Y-%m-%d"))}'
         f'{" · 发布" if entry.published_from_entry else " · 采集"}</time></div>'
-        f'<span class="badge">{escape(industry)}</span>'
+        + _industry_badges(entry)
+        + (f'<p class="summary">{escape(entry.summary[:300])}</p>'
+           f'<span class="summary-origin">{escape(entry.summary_origin)}</span>' if entry.summary else
+           f'<p class="summary-origin summary-pending">{escape(entry.summary_origin)}</p>' if entry.summary_origin else '')
         + _label_line(labels)
         + '<p class="open">'
         f'<a href="{_safe_href(link)}" rel="noreferrer noopener">阅读原文</a>'
@@ -479,6 +491,9 @@ def _render_entry(
         + '</details></div>'
         + '<details class="record-details"><summary>归档详情</summary>'
         + title_hint
+        + (f'<p class="body-status">{escape(entry.body_note)}</p>' if entry.body_note else '')
+        + (f'<p class="meta">分类模型：{escape(entry.classification_model)}</p>' if entry.classification_model else '')
+        + ('<p class="meta">本次运行复用了历史提议；这里显示历史 AI 建议，仍待人工确认。</p>' if entry.industry_source == 'history' else '')
         + f'<div class="endpoint"><a href="{_safe_href(link)}" rel="noreferrer noopener">'
         f"{escape(link)}</a></div>"
         f'<div class="meta">{escape(entry.timestamp.isoformat())}{escape(time_hint)}'
@@ -496,6 +511,17 @@ def _render_entry(
         "打开原文并高亮该条目区间</a></p>"
         + "</details></article>"
     )
+
+
+def _industry_badges(entry: FeedEntry) -> str:
+    if entry.industry_source != "manual" and entry.classification_status in ("unclassified", "outdated"):
+        text = "AI 未分类" if entry.classification_status == "unclassified" else "AI 分类待更新"
+        return f'<span class="badge">{text}</span>'
+    prefix = {"manual": "人工确认", "ai": "AI 建议", "history": "历史 AI 建议", "channel": "渠道配置"}.get(entry.industry_source, "")
+    values = entry.industry_values or ((entry.industry,) if entry.industry else ())
+    if not values:
+        return '<span class="badge">待分类</span>'
+    return " ".join(f'<span class="badge">{escape(prefix + " · " if prefix else "")}{escape(value)}</span>' for value in values)
 
 
 def render_entry_page(
@@ -517,7 +543,6 @@ def render_entry_page(
     - `sliced=False` 表示"这段切片不等于条目自身的区间"（整篇即条目，或条目层
       换了版本），此时**如实说明并未高亮**，不假装高亮过。
     """
-    industry = entry.industry if entry.industry is not None else "（未归行业）"
     link = entry.link or entry.endpoint
     if sliced:
         highlight = (
@@ -537,7 +562,8 @@ def render_entry_page(
         '<div class="notice">'
         f'<p><strong>{escape(entry.title)}</strong></p>'
         f'<p><a href="{_safe_href(link)}" rel="noreferrer noopener">{escape(link)}</a></p>'
-        f'<p class="meta">时间 {escape(entry.timestamp.isoformat())} · 行业 {escape(industry)} · '
+        f'<p>{_industry_badges(entry)}</p>'
+        f'<p class="meta">时间 {escape(entry.timestamp.isoformat())} · '
         f"渠道 {escape(entry.channel_id)} · 区间 "
         f"[{escape(entry.char_start)}, {escape(entry.char_end)})</p>"
         f'<p class="trace"><code class="raw-id">{escape(entry.raw_id)}</code>'
@@ -548,6 +574,11 @@ def render_entry_page(
     ]
     if notice:
         parts.append(f'<div class="notice">{escape(notice)}</div>')
+    if entry.body_note:
+        parts.append(f'<p class="body-status">{escape(entry.body_note)}</p>')
+    if entry.body_text:
+        parts.append('<section class="saved-body"><h2>清洗后留存的正文</h2>'
+                     f'<pre class="cleaned-body">{escape(entry.body_text)}</pre></section>')
     parts.extend(
         [
             highlight,

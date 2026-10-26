@@ -44,6 +44,7 @@ T-130 在 DAG 里的上游是 T-103（不可变原文）/ T-104（归一化文�
 写在 `atlas.entries.parser` 的模块 docstring 里。
 """
 
+from .adapters import is_challenge_page, parse_algolia_entries
 from .errors import (
     EntryError,
     EntryNotAnchorError,
@@ -83,6 +84,8 @@ __all__ = [
     "EntryError",
     "EntryNotAnchorError",
     "EntryParseError",
+    "is_challenge_page",
+    "parse_algolia_entries",
     "EntryParser",
     "EntryParserError",
     "EntrySet",

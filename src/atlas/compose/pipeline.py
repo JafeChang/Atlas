@@ -112,6 +112,7 @@ from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Seque
 
 from atlas.archive import ArchiveStore, open_archive
 from atlas.cognition import ClassificationError, LabelSpace, ProposalPolicy
+from atlas.cognition.admission import read_admissions
 from atlas.cognition.store import CLAIM_STATUS_CLASSIFIED, open_proposed_store
 from atlas.contracts import ContractError, Snapshot, TaskVersions, content_sha256
 from atlas.evidence import open_evidence_store
@@ -1148,25 +1149,34 @@ class Pipeline:
         space = self.label_space()
         policy = self.config.policy
         plans: List[Dict[str, Any]] = []
+        admission = read_admissions(self.archive.db_path)
+        admitted_units = {}
+        if admission.enabled:
+            from atlas.webapp import ArchiveEntriesAccess
+            access = ArchiveEntriesAccess(self.archive)
         for raw_id in scoped:
             item = by_raw[raw_id]
-            plans.append(
-                classify_plan_projection(
-                    classify_plan_for_content(
-                        self.archive.get_content(raw_id),
-                        raw_id=raw_id,
-                        channel_id=str(item.get("channel_id") or ""),
-                        endpoint=str(item.get("endpoint") or ""),
-                    )
-                )
+            plan = classify_plan_for_content(
+                self.archive.get_content(raw_id), raw_id=raw_id,
+                channel_id=str(item.get("channel_id") or ""),
+                endpoint=str(item.get("endpoint") or ""),
             )
-        return {
+            plans.append(classify_plan_projection(plan))
+            if admission.enabled:
+                sources = access.brief_sources(raw_id)
+                admitted_units[raw_id] = [u.unit_id for u in plan.units
+                    if (source := sources.get((u.char_start, u.char_end)))
+                    and admission.allows(source.key)]
+        result = {
             "enabled": True,
             "label_space": space.as_dict(),
             "policy": policy.as_dict(),
             "raw_ids": scoped,
             "plans": plans,
         }
+        if admission.enabled:
+            result["admission"] = {"policy": admission.policy, "allowed_units": admitted_units}
+        return result
 
     def _evidence_claims(self, inputs: NodeInputs) -> Mapping[str, Any]:
         """把 T-105 `proposed_claims` 的**分类行**投影成 `evidence` 节点的输入。

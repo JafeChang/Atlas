@@ -73,7 +73,6 @@ import ast
 import dataclasses
 import io
 import xml.etree.ElementTree as ET
-from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -196,6 +195,7 @@ _ALLOWED_STDLIB = frozenset(
         "hashlib",
         "re",
         "html",
+        "html.parser",
         "dataclasses",
         "datetime",
         "email",
@@ -206,6 +206,9 @@ _ALLOWED_STDLIB = frozenset(
         "xml.etree.ElementTree",
         "__future__",
         "io",
+        "json",
+        "urllib",
+        "urllib.parse",
     }
 )
 
