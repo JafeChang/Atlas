@@ -569,8 +569,10 @@ requires_real_data = pytest.mark.skipif(
 
 
 @requires_real_data
-def test_read_only_snapshot_is_repeatable() -> None:
+def test_read_only_snapshot_is_repeatable(monkeypatch: pytest.MonkeyPatch) -> None:
     """**判据 Y6**：连续两次只读快照逐字段相同；raw 整树摘要不变。"""
+    monkeypatch.setattr(t105_yield_probe, "REAL_DB", REAL_DB)
+    monkeypatch.setattr(t105_yield_probe, "STORE_RAW", STORE_RAW)
     first = t105_yield_probe.read_only_snapshot()
     second = t105_yield_probe.read_only_snapshot()
     assert first == second
