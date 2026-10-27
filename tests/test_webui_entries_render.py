@@ -341,7 +341,7 @@ def test_json_news_are_articles_and_challenges_are_not(tmp_path: Path) -> None:
             assert label.anchor.raw_sha256 == hashlib.sha256(payload).hexdigest()
 
 
-def test_ai_industries_are_per_entry_live_filtered_and_overridden_only_by_own_manual_label(tmp_path):
+def test_legacy_industries_remain_per_entry_alongside_manual_tags(tmp_path):
     from bs4 import BeautifulSoup
 
     from atlas.cognition import classify_document
@@ -354,7 +354,7 @@ def test_ai_industries_are_per_entry_live_filtered_and_overridden_only_by_own_ma
         before = hashlib.sha256(world.db_path.read_bytes()).digest()
         status, page, _ = _get(world.app, "/feed?industry=web&limit=1")
         assert status == 200 and 'class="count">共 3 条' in page
-        assert "AI 建议" in page and "Gamma Report" in page
+        assert "Gamma Report" in page
         # 筛选 / total 先使用逐篇分类，再分页；渠道原来只有 ai。
         status, page, _ = _get(world.app, "/feed?industry=web&limit=200")
         soup = BeautifulSoup(page, "html.parser")
@@ -370,15 +370,16 @@ def test_ai_industries_are_per_entry_live_filtered_and_overridden_only_by_own_ma
         assert status == 303
         status, page, _ = _get(world.app, "/feed?labeled=true")
         assert status == 200 and 'class="count">共 1 条' in page
-        assert "人工确认" in page
+        assert BeautifulSoup(page, "html.parser").select_one('.tag-manual[data-label-value="ai"]')
         # 更换另一个条目的模型结果，不重启也能读到；失败不得继续显示旧分类。
         selected_start = int(fields['char_start'])
         other = first if first.char_start != selected_start else second
         add_classification(world.db_path, other, status="unclassified", plan="ai-failed")
         status, page, _ = _get(world.app, "/feed?limit=200")
-        assert status == 200 and "AI 未分类" in page and "人工确认" in page
+        assert status == 200
+        assert BeautifulSoup(page, "html.parser").select_one('.tag-manual[data-label-value="ai"]')
         status, page, _ = _get(world.app, "/feed?industry=web&limit=200")
-        assert status == 200 and 'class="count">共 1 条' in page  # 只剩渠道为 web 的整篇文章。
+        assert status == 200 and 'class="count">共 2 条' in page  # 人工行业与 AI 行业并存。
 
 
 def test_industry_projection_cannot_change_an_articles_anchor(tmp_path):
@@ -424,7 +425,7 @@ def test_feed_reads_title_and_summary_columns_and_places_translation_below_origi
         card = translated.find_parent('article')
         assert '这是该文章的中文简介' in card.select_one('.summary').get_text()
         assert len(card.select_one('.summary').get_text()) <= 300
-        assert 'AI 中文简介' in page
+        assert 'AI 中文简介 · 基于原文' not in page
         assert '标题译述' not in page
         assert hashlib.sha256(world.db_path.read_bytes()).digest() == before
 
@@ -621,7 +622,8 @@ def test_entry_level_label_lands_with_anchor(tmp_path: Path) -> None:
         # 状态回显
         status, again, _ = _get(world.app, "/feed?limit=50&order=asc")
         assert status == 200
-        assert '<span class="label-tag">industry=ai</span>' in again
+        from bs4 import BeautifulSoup
+        assert BeautifulSoup(again, "html.parser").select_one('.tag-manual[data-label-key="industry"][data-label-value="ai"]')
 
 
 def test_half_anchor_is_refused(tmp_path: Path) -> None:
@@ -829,7 +831,7 @@ def test_cleaned_body_and_failure_category_are_visible_without_network_or_writes
         assert status==200
         assert '本次正文获取失败：访问受限' in page and '清洗后' in page
         card=next(c for c in soup.select('article.entry') if 'Alpha' in c.select_one('.title').get_text())
-        link=next(a['href'] for a in card.select('a') if a.get_text()=='查看归档')
+        link=next(a['href'] for a in card.select('a') if a.get_text()=='打开原文并高亮该条目区间')
         status,detail,_=_get(world.app,link)
         soup=BeautifulSoup(detail,'html.parser')
         assert status==200 and '清洗后留存的正文' in detail

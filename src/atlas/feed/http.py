@@ -192,6 +192,7 @@ def entry_payload(entry: FeedEntry) -> Dict[str, Any]:
         # 文档上下文（与文档粒度同名同义，便于前端同一套渲染）
         "channel_id": entry.channel_id,
         "industry": entry.industry,
+        "tags": list(entry.tags),
         "endpoint": entry.endpoint,
         "content_sha256": entry.content_sha256,
         "byte_length": entry.byte_length,

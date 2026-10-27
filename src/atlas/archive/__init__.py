@@ -18,6 +18,7 @@ from .article_store import (
     ArticleContentStore,
     read_article_body,
     read_article_contents,
+    read_article_response,
 )
 from .blobstore import DEFAULT_RAW_DIR, BlobStore
 from .concurrency import enable_wal
@@ -35,6 +36,7 @@ __all__ = [
     "ArticleContentStore",
     "read_article_contents",
     "read_article_body",
+    "read_article_response",
     "enable_wal",
     "DEFAULT_DB_PATH",
     "DEFAULT_RAW_DIR",

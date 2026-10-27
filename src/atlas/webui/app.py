@@ -33,7 +33,11 @@ SPEC §2.11 的硬边界
 |---|---|---|
 | GET | `/` `/feed` | 可筛选、可排序、可翻页的 feed（**条目**粒度）；只读 |
 | GET | `/entry` | 原文 + 高亮该条目区间（`raw_id` / `char_start` / `char_end`）；只读 |
-| POST | `/label` | 提交**一个**判断（一条一次点击）；成功后 `303` 回到 feed |
+| GET | `/article` | 完整阅读详情：元信息、简介、正文、有效性操作与归档详情 |
+| GET | `/image` | 通过签名校验的图片，读取独立 Disk LRU 缓存或按需抓取 |
+| POST | `/translate` | 显式启动中文全文翻译，不由打开详情页触发 |
+| GET | `/translation` | 读取翻译进度或已缓存的完整译文 |
+| POST | `/label` | 提交一个判断；`Accept: application/json` 返回当前标签，普通表单 `303` 回到 feed |
 | GET | `/health` | 存活探测（不碰数据源、不碰标签库） |
 
 其它路径 → `404`；方法不匹配 → `405` + `Allow`。
@@ -92,10 +96,11 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Mapping, Optional, Protocol, Sequence
 from urllib.parse import parse_qs, urlsplit
 
-from atlas.contracts import ConfirmedLabel
+from atlas.contracts import ConfirmedLabel, content_sha256
 from atlas.contracts.anchors import EvidenceAnchor
 from atlas.feed import (
     ENTRY_GRANULARITY,
+    FeedEntry,
     FeedQuery,
     FeedQueryError,
     InvalidQueryError,
@@ -116,6 +121,7 @@ from .pages import (
     render_entry_page,
     render_error_page,
     render_feed_page,
+    render_article_page,
 )
 
 __all__ = [
@@ -145,7 +151,10 @@ __all__ = [
 #: - **2**（T-109 补完）：`/feed` 改为**条目粒度**、新增 `GET /entry`（高亮条目区间）、
 #:   `POST /label` 新增**可选**的锚点字段（`raw_sha256` / `char_start` / `char_end`）。
 #:   不带锚点的提交仍然等价于文档级打标 —— 既有调用方不受影响。
-WEBUI_CONTRACT_VERSION = 2
+#: - **3**：`POST /label` 可用 `Accept: application/json` 获取最新人工标签，
+#:   前端只更新当前卡片；普通表单继续返回 303。
+#: - **4**：阅读详情、图片缓存及按需全文翻译；打标允许回到当前详情页。
+WEBUI_CONTRACT_VERSION = 4
 
 #: 打标人的默认署名；也可由页面上的 `actor` 字段覆盖。
 DEFAULT_ACTOR = "me"
@@ -233,6 +242,10 @@ class LabelSession(Protocol):
 
     def values_for(self, raw_id: str) -> Dict[str, str]: ...
 
+    def values_for_anchor(
+        self, raw_id: str, anchor: Optional[EvidenceAnchor]
+    ) -> Dict[str, str]: ...
+
     def rates_for(self, raw_id: str) -> list[tuple[ConfirmedLabel, str]]: ...
 
 
@@ -273,7 +286,18 @@ class _ReadOnlySession:
         return values
 
     def values_for_entry(self, entry: FeedEntry) -> Dict[str, str]:
-        return self.values_for(entry.raw_id)
+        return self.values_for_anchor(
+            entry.raw_id,
+            EvidenceAnchor.create(
+                raw_id=entry.raw_id, raw_sha256=entry.raw_sha256,
+                char_start=entry.char_start, char_end=entry.char_end,
+            ),
+        )
+
+    def values_for_anchor(
+        self, raw_id: str, anchor: Optional[EvidenceAnchor]
+    ) -> Dict[str, str]:
+        return self.values_for(raw_id)
 
     def __enter__(self) -> "_ReadOnlySession":
         return self
@@ -328,13 +352,16 @@ class _StoreSession(_ReadOnlySession):
         """
         return [(label, _anchor_key(label)) for label in self._labels_for(raw_id)]
 
-    def values_for_entry(self, entry: FeedEntry) -> Dict[str, str]:
+    def values_for_anchor(
+        self, raw_id: str, anchor: Optional[EvidenceAnchor]
+    ) -> Dict[str, str]:
+        if anchor is None:
+            return self.values_for(raw_id)
         document, specific = {}, {}
-        for label in self._labels_for(entry.raw_id):
-            anchor = label.anchor
-            if anchor is None:
+        for label in self._labels_for(raw_id):
+            if label.anchor is None:
                 target = document
-            elif (anchor.raw_sha256, anchor.char_start, anchor.char_end) == (entry.raw_sha256, entry.char_start, entry.char_end):
+            elif label.anchor == anchor:
                 target = specific
             else:
                 continue
@@ -543,17 +570,42 @@ class WebUIRequestHandler(BaseHTTPRequestHandler):
         if path == "/entry":
             self._render_entry(target.query)
             return
+        if path == "/article":
+            self._render_entry(target.query, view="article")
+            return
+        if path == "/image":
+            self._render_image(target.query)
+            return
+        if path == "/translation":
+            self._translation_status(target.query)
+            return
+        if path == "/translate":
+            self._reject_method(allow="POST", detail="翻译由点击中文 tab 后显式触发")
+            return
         if path == "/label":
             self._reject_method(allow="POST", detail="打标是写操作，只接受 POST")
             return
         self._not_found(path)
 
     def do_POST(self) -> None:  # noqa: N802
-        path = _normalize_path(urlsplit(self.path).path)
+        target = urlsplit(self.path)
+        path = _normalize_path(target.path)
         if path == "/label":
             self._submit_label()
             return
-        if path in ("/", "/feed", "/entry"):
+        if path == "/translate":
+            origin = self.headers.get("Origin")
+            if self.headers.get("Sec-Fetch-Site") == "cross-site" or (
+                origin and urlsplit(origin).netloc != self.headers.get("Host")
+            ):
+                self._send_error(HTTPStatus.FORBIDDEN, "翻译请求被拒绝", "请从当前文章详情页发起翻译")
+                return
+            if self.headers.get("Content-Length", "0") != "0" or self.headers.get("Transfer-Encoding"):
+                self._send_error(HTTPStatus.BAD_REQUEST, "翻译请求非法", "翻译参数只放在查询串，请勿附带请求体", close=True)
+                return
+            self._render_entry(target.query, view="translate")
+            return
+        if path in ("/", "/feed", "/entry", "/article", "/image", "/translation"):
             self._reject_method(allow="GET", detail="feed / 条目页是只读投影，只接受 GET")
             return
         self._not_found(path)
@@ -567,7 +619,7 @@ class WebUIRequestHandler(BaseHTTPRequestHandler):
         self._send_error(
             HTTPStatus.NOT_FOUND,
             "路径不存在",
-            f"未知路径：{path}；可用：/feed（GET）、/entry（GET）、/label（POST）、/health（GET）",
+            f"未知路径：{path}；可用：/feed、/article、/entry、/image、/translation（GET），/label、/translate（POST），/health（GET）",
         )
 
     def _reject_method(self, *, allow: str, detail: str) -> None:
@@ -639,12 +691,14 @@ class WebUIRequestHandler(BaseHTTPRequestHandler):
         调用方显式传了 `granularity` 就尊重它（否则传 `document` 会被静默改写，
         那种"看着接受了其实没用"正是要避免的）；缺省时用条目粒度。
         """
+        if "tag" in params and not any(value.strip() for value in params["tag"]):
+            params = {key: value for key, value in params.items() if key != "tag"}
         if "granularity" not in params:
             params = {**params, "granularity": [ENTRY_GRANULARITY]}
         return FeedQuery.from_params(params)
 
     # -- GET /entry ---------------------------------------------------------
-    def _render_entry(self, query_string: str) -> None:
+    def _render_entry(self, query_string: str, *, view: str = "archive") -> None:
         """打开原文并高亮该条目区间。
 
         区间是**整数**参数，直接用来切片（`text[char_start:char_end]`）；
@@ -654,7 +708,8 @@ class WebUIRequestHandler(BaseHTTPRequestHandler):
         """
         server = self.server
         params = parse_qs(query_string, keep_blank_values=True)
-        unknown = sorted(set(params) - ENTRY_PARAMS)
+        allowed = ENTRY_PARAMS | ({"back_to"} if view != "archive" else set())
+        unknown = sorted(set(params) - allowed)
         if unknown:
             self._send_error(
                 HTTPStatus.BAD_REQUEST,
@@ -673,6 +728,10 @@ class WebUIRequestHandler(BaseHTTPRequestHandler):
                     f"char_end({char_end}) 必须大于 char_start({char_start})",
                 )
             requested_entry_id = _optional_query_text(params, "entry_id")
+            back_to = _optional_query_text(params, "back_to") or "/feed"
+            if not (back_to == "/feed" or back_to.startswith("/feed?")):
+                raise _FormRejected(HTTPStatus.BAD_REQUEST, "返回地址非法", "只允许返回站内 Feed")
+            _validate_return_to(back_to)
         except _FormRejected as exc:
             self._send_error(exc.status, exc.title, exc.message)
             return
@@ -681,6 +740,8 @@ class WebUIRequestHandler(BaseHTTPRequestHandler):
         try:
             source = server.resolve_source()
             record = _record_of(source, raw_id)
+            if record is None:
+                raise _FormRejected(HTTPStatus.NOT_FOUND, "文档不存在", "归档中没有这篇文章")
             located = server.locate_entry(record, char_start=char_start, char_end=char_end)
         except _FormRejected as exc:
             self._send_error(exc.status, exc.title, exc.message)
@@ -722,6 +783,33 @@ class WebUIRequestHandler(BaseHTTPRequestHandler):
             )
             return
 
+        if view != "archive":
+            if server.reader is None:
+                self._send_error(HTTPStatus.SERVICE_UNAVAILABLE, "阅读服务不可用", "尚未配置正文阅读服务")
+                return
+            try:
+                if view == "translate":
+                    if located.entry.admission_status in ("pending", "rejected"):
+                        self._send_error(HTTPStatus.CONFLICT, "文章尚未通过入站审核", "当前文章尚未通过入站审核，暂不进入全文翻译队列。")
+                        return
+                    result = server.reader.translate(located.entry)
+                    result["poll_url"] = "/translation?key=" + result.get("key", "")
+                    self._send_json(HTTPStatus.ACCEPTED if result["status"] == "running" else HTTPStatus.OK, result)
+                    return
+                body = server.reader.document(located.entry)
+                document = render_article_page(
+                    located.entry, labels=labels, actor=server.actor,
+                    industries=tuple(server.industry_provider()), back_to=back_to,
+                    body_html=server.reader.render(body), native_chinese=body.native_chinese,
+                    body_note=body.note,
+                )
+            except Exception as exc:
+                _log.exception("阅读服务失败")
+                self._send_error(HTTPStatus.INTERNAL_SERVER_ERROR, "阅读服务失败", str(exc))
+                return
+            self._send_html(HTTPStatus.OK, document)
+            return
+
         document = render_entry_page(
             located.entry,
             content=located.content,
@@ -730,6 +818,33 @@ class WebUIRequestHandler(BaseHTTPRequestHandler):
             notice=located.notice,
         )
         self._send_html(HTTPStatus.OK, document)
+
+    def _render_image(self, query_string: str) -> None:
+        if self.server.reader is None:
+            self._send_error(HTTPStatus.SERVICE_UNAVAILABLE, "图片缓存不可用", "尚未配置阅读服务")
+            return
+        try:
+            data, mime = self.server.reader.images.get_signed(query_string)
+        except Exception as exc:
+            _log.info("图片不可用：%s", exc)
+            self._send_bytes(HTTPStatus.BAD_GATEWAY, b"", content_type="application/octet-stream")
+            return
+        self._send_bytes(HTTPStatus.OK, data, content_type=mime, extra_headers={
+            "Cache-Control": "private, max-age=86400", "X-Content-Type-Options": "nosniff",
+            "Content-Security-Policy": "default-src 'none'; sandbox",
+        })
+
+    def _translation_status(self, query_string: str) -> None:
+        try:
+            params = parse_qs(query_string, keep_blank_values=True)
+            if set(params) != {"key"}:
+                raise ValueError("翻译查询参数非法")
+            key = _require_query_text(params, "key", max_length=64)
+            if self.server.reader is None:
+                raise ValueError("尚未配置阅读服务")
+            self._send_json(HTTPStatus.OK, self.server.reader.translation_status(key))
+        except (_FormRejected, ValueError) as exc:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"status": "error", "message": str(exc)})
 
     # -- POST /label --------------------------------------------------------
     def _submit_label(self) -> None:
@@ -772,6 +887,9 @@ class WebUIRequestHandler(BaseHTTPRequestHandler):
             self._send_error(exc.status, exc.title, exc.message)
             return
 
+        if label_key == "tag":
+            identity = f"{anchor.raw_sha256}:{anchor.char_start}:{anchor.char_end}" if anchor else "document"
+            label_key = "tag:" + content_sha256((identity + "\0" + label_value).encode("utf-8"))
         try:
             label = server.labels.record(
                 raw_id=raw_id,
@@ -806,7 +924,31 @@ class WebUIRequestHandler(BaseHTTPRequestHandler):
             _anchor_key(label),
             label.label_id,
         )
+        if self._label_json_requested():
+            try:
+                with server.labels.read_session() as session:
+                    values = session.values_for_anchor(raw_id, anchor)
+            except Exception:  # noqa: BLE001 - 写入成功不等于回读成功
+                _log.exception("标签已保存，但读取最新状态失败")
+                self._send_error(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    "读取标签失败",
+                    "标签已保存，但读取最新状态失败，请刷新后确认。",
+                )
+                return
+            self._send_json(HTTPStatus.OK, {"raw_id": raw_id, "values": values})
+            return
         self._redirect(HTTPStatus.SEE_OTHER, return_to)
+
+    def _label_json_requested(self) -> bool:
+        return (
+            self.command == "POST"
+            and urlsplit(self.path).path == "/label"
+            and any(
+                part.split(";", 1)[0].strip().lower() == "application/json"
+                for part in self.headers.get("Accept", "").split(",")
+            )
+        )
 
     def _anchor_from_fields(
         self,
@@ -958,11 +1100,17 @@ class WebUIRequestHandler(BaseHTTPRequestHandler):
             close=close,
         )
 
-    def _send_json(self, status: HTTPStatus, payload: Mapping[str, Any]) -> None:
+    def _send_json(
+        self, status: HTTPStatus, payload: Mapping[str, Any], *,
+        extra_headers: Mapping[str, str] | None = None,
+        close: bool = False,
+    ) -> None:
         self._send_bytes(
             status,
             json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8"),
             content_type="application/json; charset=utf-8",
+            extra_headers=extra_headers,
+            close=close,
         )
 
     def _send_error(
@@ -981,6 +1129,12 @@ class WebUIRequestHandler(BaseHTTPRequestHandler):
                 content_type="text/html; charset=utf-8",
                 extra_headers=extra_headers,
                 close=close,
+            )
+            return
+        if self._label_json_requested() or urlsplit(self.path).path in ("/translate", "/translation"):
+            self._send_json(
+                status, {"error": title, "message": message},
+                extra_headers=extra_headers, close=close,
             )
             return
         self._send_html(
@@ -1010,12 +1164,13 @@ class WebUIRequestHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
+        self.send_header("Cache-Control", (extra_headers or {}).get("Cache-Control", "no-store"))
         if close:
             self.send_header("Connection", "close")
             self.close_connection = True
         for key, value in (extra_headers or {}).items():
-            self.send_header(key, value)
+            if key.lower() != "cache-control":
+                self.send_header(key, value)
         self.end_headers()
         if body and self.command != "HEAD":
             self.wfile.write(body)
@@ -1222,6 +1377,10 @@ def _default_text_length(record: Any) -> int:
 
 def _validate_label(label_key: str, label_value: str, industries: Sequence[str]) -> None:
     """标签值校验。行业取值集合**只来自配置**，代码里没有行业名。"""
+    if label_key == "tag":
+        if len(label_value) > 80:
+            raise _FormRejected(HTTPStatus.BAD_REQUEST, "标签值非法", "标签最多 80 字符")
+        return
     if label_key == LABEL_KEY_VALID:
         allowed = (LABEL_VALUE_VALID, LABEL_VALUE_INVALID)
         if label_value not in allowed:
@@ -1254,7 +1413,23 @@ def _validate_label(label_key: str, label_value: str, industries: Sequence[str])
 
 
 def _validate_return_to(return_to: str) -> None:
-    """只允许回到 feed（防开放重定向），且查询参数必须是合法的 feed 查询。"""
+    """只允许回到 Feed 或有效的站内文章详情（防开放重定向）。"""
+    if return_to.startswith("/article?"):
+        parsed = urlsplit(return_to)
+        params = parse_qs(parsed.query, keep_blank_values=True)
+        if parsed.fragment or set(params) - (ENTRY_PARAMS | {"back_to"}):
+            raise _FormRejected(HTTPStatus.BAD_REQUEST, "返回地址非法", "文章返回地址参数非法")
+        _require_query_text(params, "raw_id", max_length=MAX_RAW_ID_LENGTH)
+        start = _require_query_int(params, "char_start", maximum=MAX_ANCHOR_CHAR)
+        end = _require_query_int(params, "char_end", maximum=MAX_ANCHOR_CHAR)
+        if end <= start:
+            raise _FormRejected(HTTPStatus.BAD_REQUEST, "返回地址非法", "文章区间非法")
+        _optional_query_text(params, "entry_id")
+        back = _optional_query_text(params, "back_to") or "/feed"
+        if not (back == "/feed" or back.startswith("/feed?")):
+            raise _FormRejected(HTTPStatus.BAD_REQUEST, "返回地址非法", "只允许返回 Feed")
+        _validate_return_to(back)
+        return
     if not (return_to == _RETURN_TO_PREFIX or return_to.startswith(_RETURN_TO_PREFIX + "?")):
         raise _FormRejected(
             HTTPStatus.BAD_REQUEST,
@@ -1294,6 +1469,7 @@ class WebUIHTTPServer(ThreadingHTTPServer):
         locate_entry: Any = None,
         text_length: Any = None,
         entry_projection: Any = None,
+        reader: Any = None,
     ) -> None:
         self._source = source
         self.labels = labels
@@ -1306,6 +1482,7 @@ class WebUIHTTPServer(ThreadingHTTPServer):
         self.locate_entry = locate_entry or _whole_document_entry
         self.text_length = text_length or _default_text_length
         self.entry_projection = entry_projection
+        self.reader = reader
         super().__init__(server_address, WebUIRequestHandler)
 
     def resolve_source(self) -> Any:
@@ -1381,6 +1558,7 @@ class WebUIApplication:
         locate_entry: Any = None,
         text_length: Any = None,
         entry_projection: Any = None,
+        reader: Any = None,
         on_close: Optional[Callable[[], None]] = None,
         host: str = "127.0.0.1",
         port: int = 0,
@@ -1398,6 +1576,7 @@ class WebUIApplication:
             locate_entry=locate_entry,
             text_length=text_length,
             entry_projection=entry_projection,
+            reader=reader,
         )
         self._thread = threading.Thread(
             target=self._serve, name="atlas-webui-http", daemon=True

@@ -542,13 +542,13 @@ def test_criterion_7_contract_version_bumped_with_backward_compatible_documents(
 # 判据 8：零新增 Python 依赖
 # ===================================================================== #
 def test_criterion_8_only_registered_python_dependencies() -> None:
-    """依赖集合固定：T-001 基线加 SPEC §6.19 的 PDF 正文读取依赖。
+    """依赖集合固定：T-001 基线、§6.19 PDF、§6.27 Markdown 阅读渲染。
 
     比"grep 一下没有 flask"强的地方：这里把**声明集合**钉死，任何新增/删除都会失败。
     """
     declared = _declared_dependencies()
     assert declared == BASELINE_DEPENDENCIES, (
-        "依赖必须符合 SPEC §2.11 / §6.19 登记集合；"
+        "依赖必须符合 SPEC §2.11 / §6.19 / §6.27 登记集合；"
         f"新增/删除：{sorted(declared ^ BASELINE_DEPENDENCIES)}"
     )
     # 本任务的全部 import 都来自 stdlib 与仓库内包：用 AST 检查被改动的文件
@@ -593,6 +593,7 @@ BASELINE_DEPENDENCIES = frozenset(
         "beautifulsoup4>=4.12.0",
         "lxml>=4.9.0",
         "pypdf>=6.0.0",
+        "markdown-it-py>=3.0.0",
         "feedparser>=6.0.0",
         "pydantic>=2.5.0",
         "pydantic-settings>=2.12.0",

@@ -26,6 +26,8 @@ dependencies = [
     # 解析（HTML / XML / RSS）
     "beautifulsoup4>=4.12.0",
     "lxml>=4.9.0",
+    # 阅读详情页的 CommonMark / 表格渲染；输出统一经过 HTML 清洗。
+    "markdown-it-py>=3.0.0",
     # 原文链接为 PDF 时提取正文，供中文简介生成
     "pypdf>=6.0.0",
     "feedparser>=6.0.0",

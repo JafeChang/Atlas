@@ -266,7 +266,11 @@ def test_real_frontend_serves_entry_html_from_the_real_store(tmp_path: Path) -> 
         )
         assert titles, "条目必须有标题链接（不是只有 raw_id）"
         links = [link for link, _ in titles]
-        assert all(link.startswith("http") or link == "#" for link in links)
+        assert all(link.startswith("/article?") for link in links)
+        from html import unescape
+        with urllib.request.urlopen(app.base_url + unescape(links[0]), timeout=120) as detail:
+            assert detail.status == 200
+            assert 'class="article-title"' in detail.read().decode("utf-8")
         # 标题是**真实标题**，不是 raw_id
         for _link, title in titles:
             assert title.strip()

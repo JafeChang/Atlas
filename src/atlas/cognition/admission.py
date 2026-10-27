@@ -6,7 +6,7 @@ import hashlib
 import json
 import sqlite3
 from contextlib import closing
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -49,6 +49,7 @@ class Review:
     evidence: str = ""
     input_hash: str = ""
     reviewed_at: str = ""
+    tags: tuple[str, ...] = ()
 
     def __post_init__(self):
         if (
@@ -56,6 +57,9 @@ class Review:
             or self.reason_code not in REASONS[self.decision]
         ):
             raise ValueError("审核状态或理由码无效")
+        if not isinstance(self.tags, tuple) or any(not isinstance(t, str) or not t.strip() or len(t) > 80 for t in self.tags):
+            raise ValueError("标签无效")
+        object.__setattr__(self, "tags", tuple(dict.fromkeys(t.strip() for t in self.tags)))
         if not self.reason or len(self.reason) > 300 or len(self.evidence) > 300:
             raise ValueError("审核理由或证据无效")
 
@@ -101,6 +105,11 @@ def read_admissions(path: str | Path) -> AdmissionState:
                 (policy,),
             )
         }
+        if db.execute("SELECT 1 FROM sqlite_master WHERE name='admission_review_tags'").fetchone():
+            for key, tags_json in db.execute("""SELECT r.source_key, t.tags_json FROM admission_reviews r
+                JOIN (SELECT source_key, MAX(id) id FROM admission_reviews WHERE policy=? GROUP BY source_key) latest ON r.id=latest.id
+                JOIN admission_review_tags t ON t.review_id=r.id""", (policy,)):
+                reviews[key] = replace(reviews[key], tags=tuple(json.loads(tags_json)))
         return AdmissionState(enabled, policy, scope, reviews)
 
 
@@ -136,6 +145,12 @@ class AdmissionStore:
                 decision TEXT NOT NULL CHECK(decision IN ('accepted','rejected','pending')),
                 reason_code TEXT NOT NULL,reason TEXT NOT NULL,evidence TEXT NOT NULL,
                 model TEXT NOT NULL,reviewed_at TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS admission_review_tags (
+                review_id INTEGER PRIMARY KEY REFERENCES admission_reviews(id), tags_json TEXT NOT NULL);
+            CREATE TRIGGER IF NOT EXISTS admission_tags_no_update BEFORE UPDATE ON admission_review_tags
+                BEGIN SELECT RAISE(ABORT,'admission tag history is append-only'); END;
+            CREATE TRIGGER IF NOT EXISTS admission_tags_no_delete BEFORE DELETE ON admission_review_tags
+                BEGIN SELECT RAISE(ABORT,'admission tag history is append-only'); END;
             CREATE INDEX IF NOT EXISTS admission_review_latest ON admission_reviews(policy,source_key,id);
             CREATE TRIGGER IF NOT EXISTS admission_no_update BEFORE UPDATE ON admission_reviews
                 BEGIN SELECT RAISE(ABORT,'admission history is append-only'); END;
@@ -153,7 +168,7 @@ class AdmissionStore:
         if review.decision == "rejected" and not review.evidence:
             raise ValueError("AI 拦截必须提供原文证据")
         with self.db:
-            self.db.execute(
+            cursor = self.db.execute(
                 """INSERT INTO admission_reviews(source_key,source_url,policy,input_hash,
                 decision,reason_code,reason,evidence,model,reviewed_at) VALUES(?,?,?,?,?,?,?,?,?,?)""",
                 (
@@ -169,6 +184,8 @@ class AdmissionStore:
                     datetime.now(UTC).isoformat(),
                 ),
             )
+            self.db.execute("INSERT INTO admission_review_tags VALUES (?, ?)",
+                            (cursor.lastrowid, json.dumps(review.tags, ensure_ascii=False)))
 
     def close(self):
         self.db.close()
@@ -199,11 +216,12 @@ class AdmissionClient:
             "正文与标题明显不对应用 rejected/content_mismatch。"
             "不确定、片段太少用 pending/insufficient_content，不猜测放行或编造。"
             "有足够实质信息用 accepted/substantive。支持领域来自配置，other表示可容纳其他主题，不得只因不属于AI/论文而拒绝。"
+            "对accepted文章生成多个简洁中文普通标签，涵盖主题或行业及内容性质（例如严肃内容、轻松内容），可自由创造，不限配置；标签去重，每个不超过80字。"
             "reason用300字符以内中文说明，evidence用300字符以内正文连续原句；rejected必须有确切原文证据。"
             "字段枚举：decision=accepted时reason_code只能为substantive；decision=rejected时reason_code只能为advertisement、error_page、unsupported或content_mismatch；decision=pending时reason_code只能为insufficient_content。禁止将decision/前缀写入reason_code。"
-            '例如{"id":"1","decision":"accepted","reason_code":"substantive","reason":"技术文章","evidence":""}。'
+            '例如{"id":"1","decision":"accepted","reason_code":"substantive","reason":"技术文章","evidence":"","tags":["科技","严肃内容"]}。'
             '只返回JSON {"reviews":[{"id":"输入id","decision":"accepted|rejected|pending",'
-            '"reason_code":"上述对应码","reason":"中文理由","evidence":"原文连续片段或空串"}]}，每个输入恰好一项。'
+            '"reason_code":"上述对应码","reason":"中文理由","evidence":"原文连续片段或空串","tags":["标签"]}]}，每个输入恰好一项。'
         )
         response = requests.post(
             config.base_url.rstrip("/") + "/chat/completions",
@@ -257,9 +275,14 @@ class AdmissionClient:
                 for k in ("decision", "reason_code", "reason", "evidence")
             ):
                 raise ValueError("审核响应字段类型无效")
+            tags = item.get("tags", [])
+            if not isinstance(tags, list):
+                raise ValueError("标签必须是数组")
             review = Review(
-                item["decision"], item["reason_code"], item["reason"], item["evidence"]
+                item["decision"], item["reason_code"], item["reason"], item["evidence"], tags=tuple(tags)
             )
+            if review.decision == "accepted" and not review.tags:
+                raise ValueError("收录文章必须包含标签数组")
             if (
                 review.evidence
                 and review.evidence not in review_input(numbered[key])["body"]

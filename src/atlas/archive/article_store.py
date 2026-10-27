@@ -84,6 +84,17 @@ def read_article_body(path: str | Path, source_url: str) -> ArticleContentRow | 
         return ArticleContentRow(*row) if row else None
 
 
+def read_article_response(path: str | Path, row_id: int) -> tuple[bytes, str]:
+    """只读取得正文快照的原始响应，供阅读页保留 HTML / Markdown 排版。"""
+    with closing(sqlite3.connect(f"{Path(path).resolve().as_uri()}?mode=ro", uri=True, timeout=30)) as db:
+        row = db.execute(
+            "SELECT raw_gzip,content_type FROM article_contents WHERE id=?", (row_id,)
+        ).fetchone()
+        if row is None:
+            raise KeyError(row_id)
+        return gzip.decompress(row[0]) if row[0] is not None else b"", row[1]
+
+
 class ArticleContentStore:
     def __init__(self, path: str | Path):
         self._batch = False

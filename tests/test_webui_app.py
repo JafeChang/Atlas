@@ -36,6 +36,7 @@ from types import SimpleNamespace
 from typing import Any, Callable, Dict, Iterator, Optional, Sequence, Tuple
 
 import pytest
+from bs4 import BeautifulSoup
 
 from atlas.archive import open_archive
 from atlas.contracts import ConfirmedLabel, RawRecord
@@ -269,7 +270,12 @@ def raw_post(
 
 
 def page_shows_label(page: str, label_key: str, label_value: str) -> bool:
-    return f'<span class="label-tag">{label_key}={label_value}</span>' in page
+    soup = BeautifulSoup(page, "html.parser")
+    if label_key == LABEL_KEY_VALID:
+        return soup.select_one(f'.act-{label_value} .vote-button[aria-pressed="true"]') is not None
+    return soup.find(
+        attrs={"data-label-key": label_key, "data-label-value": label_value}
+    ) is not None
 
 
 # ---------------------------------------------------------------------- #
@@ -283,7 +289,7 @@ def test_document_level_label_round_trip_end_to_end(tmp_path: Path) -> None:
         status, page, _ = get(app, "/feed?order=asc")
         assert status == 200
         assert '<code class="raw-id">arch-0</code>' in page
-        assert page.count('<p class="labels">未打标</p>') == len(DEMO_RECORDS)
+        assert not BeautifulSoup(page, "html.parser").select(".labels .tag-neutral")
 
         # -- 2) POST 打标（判据要求的第一个判断：有效） ------------------
         status, _, headers = submit(app, judgment("arch-0", LABEL_VALUE_VALID))
@@ -599,7 +605,7 @@ def test_industry_options_and_validation_follow_the_injected_provider(tmp_path: 
     with running_webui(tmp_path, industries=first, industry_map={}) as world:
         status, page, _ = get(world.app, "/feed")
         assert status == 200
-        assert f'<option value="{first[0]}">{first[0]}</option>' in page
+        assert 'name="tag"' in page
         for other in second:
             assert other not in page, "行业选项只能来自注入的配置"
 
@@ -620,7 +626,7 @@ def test_industry_options_and_validation_follow_the_injected_provider(tmp_path: 
         status, page, _ = get(world.app, "/feed")
         assert status == 200
         for other in second:
-            assert f'<option value="{other}">{other}</option>' in page
+            assert f'<option value="{other}">{other}</option>' not in page
         assert first[0] not in page, "换一份配置后，旧行业不得再出现"
 
 
@@ -681,7 +687,7 @@ def test_c8_loop_runs_against_the_real_registry_configuration(tmp_path: Path) ->
         ) as world:
             status, page, _ = get(world.app, "/feed?order=asc")
             assert status == 200
-            assert f'<option value="{REGISTRY_INDUSTRIES[0]}">{REGISTRY_INDUSTRIES[0]}</option>' in page
+            assert 'name="tag"' in page
             assert REGISTRY_INDUSTRIES[2] not in page, "停用的行业不在标签空间里"
 
             # 筛选维度就是配置里的行业（渠道 chan-0 挂在 REGISTRY_INDUSTRIES[0] 下）

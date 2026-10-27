@@ -143,6 +143,7 @@ _FALSY = ("false", "0")
 KNOWN_PARAMS = frozenset(
     {
         "industry",
+        "tag",
         "channel",
         "since",
         "until",
@@ -252,6 +253,7 @@ class FeedQuery:
     offset: int = 0
     #: 粒度。默认 `"document"`（原契约）；`"entry"` 见模块 docstring。
     granularity: str = DOCUMENT_GRANULARITY
+    tags: Tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if self.granularity not in GRANULARITIES:
@@ -312,6 +314,7 @@ class FeedQuery:
 
         query = cls(
             industries=multi("industry"),
+            tags=_clean_ids(values.get("tag", []), "tag"),
             channels=multi("channel"),
             since=_parse_moment(values["since"][0], "since") if "since" in values else None,
             until=_parse_moment(values["until"][0], "until") if "until" in values else None,
@@ -351,6 +354,8 @@ class FeedQuery:
             "labels": list(self.labels),
             "labeled": self.labeled,
         }
+        if self.tags:
+            data["tags"] = list(self.tags)
         if self.is_entry_mode:
             # 只在条目模式出现：文档模式的 filters 逐字段不变（对外契约向后兼容）。
             data["granularity"] = self.granularity
@@ -527,6 +532,7 @@ class FeedEntry:
     body_text: str = ""
     admission_status: str = ""
     admission_reason: str = ""
+    tags: Tuple[str, ...] = ()
 
     @property
     def timestamp(self) -> datetime:
@@ -602,6 +608,9 @@ def run_query(
             "granularity=entry 需要条目派生层，但未注入 entries_of；"
             "拒绝返回把容器本身当成条目的结果（SPEC §6.3 裁决 B）"
         )
+
+    if query.tags and (not query.is_entry_mode or entry_projection is None):
+        raise FeedQueryError("标签筛选需要文章级标签投影")
 
     scanned = _scan_source(source)
     industries: Dict[str, str | None] = {}
@@ -716,6 +725,7 @@ def _run_entry_query(
             raise SourceContractError("条目投影不得更改原文身份、区间、顺序或数量")
         units = [u for u in projected if (
             (not query.industries or bool(set(query.industries) & set(u.industry_values or ((u.industry,) if u.industry else ()))))
+            and (not query.tags or bool(set(query.tags) & set(u.tags)))
             and (not query.labels or bool(set(query.labels) & set(u.labels)))
             and (query.labeled is None or bool(u.labels) == query.labeled)
         )]

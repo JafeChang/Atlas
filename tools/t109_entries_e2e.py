@@ -275,7 +275,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         # 状态回显
         status, page2 = get(url + "/feed?limit=5")
         assert status == 200
-        tag = f'<span class="label-tag">{args.label_key}={label_value}</span>'
+        tag = f'data-label-key="{args.label_key}" data-label-value="{label_value}"'
+        if args.label_key == "valid":
+            caption = "标记有效" if label_value == "valid" else "标记无效"
+            tag = f'aria-label="{caption}" title="{caption}" aria-pressed="true"'
         assert tag in page2, "打标后页面必须回显该标签"
         print(f"✅ 再次 GET /feed 回显：{tag}")
 

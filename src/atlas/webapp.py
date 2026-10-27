@@ -58,7 +58,8 @@ PYTHONPATH=src ./.venv-new/bin/python -m atlas.webapp
 风格照 `atlas.compose.cli`：argparse、`--store-root` 默认 `data/store`
 （可用 `ATLAS_STORE_ROOT` 覆盖）、失败打印到 stderr 并非零退出。
 
-**它只负责把界面摆出来**：不采集、不抓网、不改配置。三条硬要求：
+**它负责界面与按需阅读服务**：Feed / 原文详情不采集、不调用模型、不改配置；
+图片按浏览需要进入独立缓存，中文全文仅由用户切换 tab 后显式生成。三条硬要求：
 
 1. 启动时打印**真实 URL**（`--port 0` 时是内核分配的那个端口）与退出方式；
 2. **store 不存在 / 没有归档时响亮失败**，并写清下一步（先跑采集）——
@@ -84,6 +85,7 @@ from atlas.archive import (
     open_archive,
     read_article_body,
     read_article_contents,
+    read_article_response,
 )
 from atlas.cognition import (
     BriefSource,
@@ -109,6 +111,8 @@ from atlas.normalize.text import decode_bytes
 from atlas.cognition.admission import read_admissions
 from atlas.registry import RegistryService, read_subscription_sources
 from atlas.registry import open_store as open_registry_store
+from atlas.reader import ReaderService, make_document
+from atlas.reader.content import feed_excerpt
 from atlas.webui import (
     DEFAULT_ACTOR,
     StoreLabelAccess,
@@ -376,6 +380,9 @@ def build_webapp(
     host: str = "127.0.0.1",
     port: int = 0,
     initialize_labels: bool = True,
+    cache_root: Any = None,
+    image_cache: Any = None,
+    translation_client_factory: Any = None,
 ) -> WebUIApplication:
     """装配一个**按条目渲染**的真实前端（已启动）。
 
@@ -431,7 +438,6 @@ def build_webapp(
         admission = read_admissions(db_path)
         bodies = read_article_contents(db_path)
         articles = {v.raw_id: v for v in views.values() if v.unit_kind == "article"}
-        allowed = set(industry_provider())
         projected = []
         for entry in entries:
             summary_source = access.brief_sources(entry.raw_id).get((entry.char_start, entry.char_end))
@@ -459,19 +465,23 @@ def build_webapp(
                         summary_origin = '简介暂缺：' + body.failure_label
             values = session.values_for_entry(entry)
             view = views.get(entry.entry_id) if entry.from_feed else articles.get(entry.raw_id)
-            source, status, model = "channel", "pending", ""
-            industries = (entry.industry,) if entry.industry else ()
+            industry_source, status, model = "channel", "pending", ""
+            channel_industry = entry.industry or source.industry_of(entry.channel_id)
+            industries = (channel_industry,) if channel_industry else ()
             if view is not None:
                 status, model = view.status, view.model
-                source = view.origin
-                industries = tuple(value for value in view.labels if value in allowed)
+                industry_source = view.origin
+                industries = tuple(view.labels)
                 if status == "classified" and not industries:
                     status = "outdated"
-            if "industry" in values:
-                source, industries = "manual", (values["industry"],)
+            manual_tags = tuple(value for key, value in values.items() if key.startswith("tag:"))
+            ai_tags = review.tags if review and review.decision == "accepted" else ()
+            # 渠道行业只是来源配置，不能推断每篇文章的主题。
+            legacy_tags = (industries if view is not None else ()) + ((values["industry"],) if "industry" in values else ())
+            tags = tuple(dict.fromkeys((*ai_tags, *legacy_tags, *manual_tags)))
             projected.append(replace(
-                entry, industry=industries[0] if industries else None,
-                industry_values=industries, industry_source=source,
+                entry, tags=tags, industry=industries[0] if industries else None,
+                industry_values=industries, industry_source=industry_source,
                 classification_status=status, classification_model=model,
                 confirmed_values=tuple(sorted(values.items())), labels=tuple(sorted(values)),
                 summary=summary, summary_origin=summary_origin, title_zh=title_zh,
@@ -480,6 +490,34 @@ def build_webapp(
                 body_text=saved_body.cleaned_text if saved_body else '',
             ))
         return tuple(projected)
+
+    def load_document(entry):
+        url = entry.link or entry.endpoint
+        saved = read_article_body(db_path, url)
+        if saved:
+            raw, content_type = read_article_response(db_path, saved.id)
+            return make_document(
+                raw, content_type, saved.resolved_url or url,
+                fallback_text=saved.cleaned_text,
+                note="正文获取时受到长度限制，当前展示已留存部分。" if saved.truncated else "",
+            )
+        if not entry.from_feed:
+            return make_document(access.content(entry.raw_id), "", url)
+        source = access.brief_sources(entry.raw_id).get((entry.char_start, entry.char_end))
+        # 订阅摘要作为回落，不把它标成已经取得完整正文。
+        analysis = access._analyse(archive.get(entry.raw_id))
+        fragment = analysis.text[entry.char_start:entry.char_end]
+        excerpt = feed_excerpt(fragment, source.body if source else "")
+        return make_document(excerpt, "", url, note="正文尚未留存，以下为来源提供的摘要。")
+
+    reader = ReaderService(
+        load_document, Path(cache_root) if cache_root is not None else Path(root).parent / "cache",
+        image_cache=image_cache, client_factory=translation_client_factory,
+    )
+
+    def close_resources():
+        reader.close()
+        archive.close()
 
     return WebUIApplication(
         source,
@@ -491,7 +529,8 @@ def build_webapp(
         locate_entry=locate_entry,
         text_length=text_length,
         entry_projection=project_entries,
-        on_close=archive.close,
+        reader=reader,
+        on_close=close_resources,
         host=host,
         port=port,
     )
