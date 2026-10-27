@@ -146,7 +146,7 @@ def test_entries_expose_defaults_for_the_frontend(catalog: PrebuiltCatalog) -> N
     entry = next(e for e in catalog.entries() if e.id == "openai-blog")
     assert entry.defaults["interval_seconds"] == 3600
     assert entry.defaults["enabled"] is True
-    assert entry.defaults["endpoint"] == "https://openai.com/blog/rss/"
+    assert entry.defaults["endpoint"] == "https://openai.com/news/rss.xml"
     assert entry.template.name == "OpenAI 官方博客"
 
 

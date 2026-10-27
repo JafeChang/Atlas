@@ -286,6 +286,18 @@ class Collector:
                 detail=type(exc).__name__,
             )
 
+        # robots 请求本身也必须遵守该渠道已配置的同域间隔。
+        if hasattr(self._throttle, "policy"):
+            try:
+                self._throttle.policy.set_rate(
+                    endpoint, channel.id, self._throttle.min_interval_for(channel)
+                )
+            except ThrottleTimeout as exc:
+                return self._failed(
+                    channel, kind=FailureKind.RATE_LIMIT_WAIT_TIMEOUT,
+                    reason=str(exc), attempts=0, detail=type(exc).__name__,
+                )
+
         # 2) robots：抓取之前检查，拒绝即跳过（绝不"先抓再说"）。
         decision = self._robots.check(endpoint, user_agent=user_agent)
         if not decision.allowed:
@@ -309,7 +321,7 @@ class Collector:
                 attempts=0,
                 detail=type(exc).__name__,
             )
-        min_interval = self._throttle.min_interval_for(channel)
+        min_interval = max(self._throttle.min_interval_for(channel), decision.crawl_delay)
 
         return self._attempt_loop(
             channel,
@@ -341,7 +353,20 @@ class Collector:
 
         for attempt in range(1, self.retry.max_attempts + 1):
             try:
-                throttle_decision = self._throttle.reserve(domain, min_interval)
+                request = FetchRequest(
+                    url=channel.endpoint,
+                    user_agent=user_agent,
+                    timeout_seconds=self.timeout_seconds,
+                    min_interval_seconds=self._throttle.min_interval_for(channel),
+                    channel_id=channel.id,
+                )
+                if getattr(self._fetcher, "manages_policy", False):
+                    outcome = fetch_once(self._fetcher, request)
+                    waited += self._fetcher.waited_seconds
+                else:
+                    with self._throttle.slot(domain, min_interval) as throttle_decision:
+                        outcome = fetch_once(self._fetcher, request)
+                    waited += throttle_decision.waited_seconds
             except ThrottleTimeout as exc:
                 return self._failed(
                     channel,
@@ -354,17 +379,6 @@ class Collector:
                     waited_seconds=waited,
                     detail=type(exc).__name__,
                 )
-            waited += throttle_decision.waited_seconds
-
-            outcome = fetch_once(
-                self._fetcher,
-                FetchRequest(
-                    url=channel.endpoint,
-                    user_agent=user_agent,
-                    timeout_seconds=self.timeout_seconds,
-                ),
-            )
-
             if outcome.ok:
                 return self._collected(channel, outcome, attempts=attempt, waited=waited)
 

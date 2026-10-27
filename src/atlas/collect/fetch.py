@@ -106,6 +106,8 @@ class FetchRequest:
     user_agent: str
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS
     method: str = "GET"
+    min_interval_seconds: float = 0
+    channel_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -392,8 +394,18 @@ class UrllibFetcher:
         *,
         opener: Optional[object] = None,
         clock: Callable[[], float] = time.monotonic,
+        follow_redirects: bool = True,
     ) -> None:
-        self._opener = opener if opener is not None else urllib.request.build_opener()
+        self._follow_redirects = follow_redirects
+        if opener is not None:
+            self._opener = opener
+        elif follow_redirects:
+            self._opener = urllib.request.build_opener()
+        else:
+            class NoRedirect(urllib.request.HTTPRedirectHandler):
+                def redirect_request(self, req, fp, code, msg, headers, newurl):
+                    return None
+            self._opener = urllib.request.build_opener(NoRedirect())
         self._clock = clock
 
     def __call__(self, request: FetchRequest) -> FetchResult:
@@ -417,6 +429,15 @@ class UrllibFetcher:
             finally:
                 response.close()
         except urllib.error.HTTPError as exc:
+            if not self._follow_redirects and exc.code in (301, 302, 303, 307, 308):
+                try:
+                    return FetchResult(
+                        url=exc.geturl(), status_code=exc.code,
+                        content=exc.read(), headers={k.lower(): v for k, v in dict(exc.headers).items()},
+                        elapsed_seconds=self._clock() - started,
+                    )
+                finally:
+                    exc.close()
             raise FetchHTTPError(
                 f"HTTP {exc.code} {exc.reason}", url=request.url, status_code=exc.code
             ) from exc

@@ -36,7 +36,9 @@ class ArticleFailure:
 def classify_article_failure(message: str, url: str = "") -> ArticleFailure:
     status_match = re.search(r"HTTP (\d{3})", message)
     status = int(status_match.group(1)) if status_match else None
-    if "disallowed_by_rules" in message:
+    if "等待站点限速" in message:
+        code, category, retry = "site_deferred", "network", True
+    elif "disallowed_by_rules" in message:
         code, category, retry = "robots_disallowed", "access", False
     elif "disallowed_robots_forbidden" in message:
         code, category, retry = "robots_forbidden", "access", False

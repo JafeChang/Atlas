@@ -565,7 +565,7 @@ class Pipeline:
         cognition_factory: Optional[Callable[[], Any]] = None,
     ) -> None:
         self.config = config
-        self.dependencies = dependencies or ComposeDependencies.real()
+        self.dependencies = dependencies or ComposeDependencies.real(config.root)
         self._closed = False
         self._owned: List[Any] = []
 
@@ -916,6 +916,16 @@ class Pipeline:
                 "window": {"id": window_id, "started_at": window_start.isoformat()},
             }
         }
+        # 部分成功的采集会被幂等缓存；等待期届满必须改变输入，才能补采被限速的渠道。
+        throttle = self.dependencies.throttle
+        if hasattr(throttle, "policy"):
+            retries = {
+                channel.id: snapshot
+                for channel in channels
+                if (snapshot := throttle.policy.retry_snapshot(channel.endpoint)) is not None
+            }
+            if retries:
+                roots[NODE_COLLECT]["network_retries"] = retries
 
         inputs = NodeInputs(
             graph,

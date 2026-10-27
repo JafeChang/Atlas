@@ -32,6 +32,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
+from urllib.parse import urljoin, urlsplit
 
 from atlas.archive import ArchiveStore
 from atlas.cognition import (
@@ -54,6 +55,10 @@ from atlas.collect import (
     collect_channels,
 )
 from atlas.collect.fetch import DEFAULT_TIMEOUT_SECONDS
+from atlas.collect.fetch import FetchError, FetchHTTPError, FetchRequest
+from atlas.collect.network_policy import PolicyFetcher, SharedNetworkPolicy
+from atlas.collect.robots import RobotsFetchResult
+from atlas.collect.throttle import SharedDomainThrottle, domain_of
 from atlas.contracts import (
     AtlasTask,
     ConfirmedLabel,
@@ -204,13 +209,39 @@ class ComposeDependencies:
     user_agent_options: Optional[Mapping[str, str]] = None
 
     @classmethod
-    def real(cls) -> "ComposeDependencies":
+    def real(cls, store_root="data/store") -> "ComposeDependencies":
         """真实装配：`urllib` fetcher + 真 robots 检查 + 真同域限速（SPEC §2.12）。"""
-        fetcher = UrllibFetcher()
+        fetcher = UrllibFetcher(follow_redirects=False)
+        policy = SharedNetworkPolicy(store_root)
+
+        def fetch_robots(url, *, user_agent):
+            def guarded(target, *, user_agent):
+                original_domain = domain_of(target)
+                for _ in range(6):
+                    parsed = urlsplit(target)
+                    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+                        return RobotsFetchResult(url=target, status_code=None, body=b"", error="robots 重定向目标无效")
+                    try:
+                        with policy.slot(target, robots_request=domain_of(target) == original_domain):
+                            result = fetcher(FetchRequest(url=target, user_agent=user_agent))
+                    except FetchHTTPError as error:
+                        return RobotsFetchResult(url=target, status_code=error.status_code, body=b"")
+                    except FetchError as error:
+                        return RobotsFetchResult(url=target, status_code=None, body=b"", error=str(error))
+                    if result.status_code not in (301, 302, 303, 307, 308):
+                        return RobotsFetchResult(url=target, status_code=result.status_code, body=result.content)
+                    location = result.headers.get("location", "")
+                    if not location:
+                        return RobotsFetchResult(url=target, status_code=None, body=b"", error="robots 重定向缺少目标")
+                    target = urljoin(target, location)
+                return RobotsFetchResult(url=target, status_code=None, body=b"", error="robots 重定向次数过多")
+            return policy.robots(url, user_agent, guarded)
+
+        robots = RobotsCache(fetch_robots, cache_ttl_seconds=86400)
         return cls(
-            fetcher=fetcher,
-            robots=RobotsCache.from_fetcher(fetcher),
-            throttle=DomainThrottle(),
+            fetcher=PolicyFetcher(fetcher, robots, policy),
+            robots=robots,
+            throttle=SharedDomainThrottle(policy),
         )
 
 

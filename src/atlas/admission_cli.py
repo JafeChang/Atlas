@@ -35,6 +35,7 @@ from atlas.collect.article import (
     ArticleReadError,
     read_source,
 )
+from atlas.collect.network_policy import SharedNetworkPolicy
 from atlas.webapp import ArchiveEntriesAccess
 
 
@@ -44,6 +45,7 @@ def main(argv=None):
     parser.add_argument("--report-dir", default="data/store/admission-job")
     parser.add_argument("--limit", type=int)
     parser.add_argument("--workers", type=int, default=2)
+    parser.add_argument("--max-fetches", type=int, default=4, help="每轮最多补读的原文数")
     parser.add_argument("--enable", action="store_true", help="开启正式队列的审核门禁")
     parser.add_argument("--refresh", action="store_true")
     parser.add_argument(
@@ -58,9 +60,10 @@ def main(argv=None):
     if (
         not db_path.is_file()
         or not 1 <= args.workers <= 4
+        or args.max_fetches < 1
         or (args.limit is not None and args.limit < 1)
     ):
-        parser.error("正式库必须存在；并发 1–4，limit 为正")
+        parser.error("正式库必须存在；并发 1–4，limit 和 max-fetches 为正")
     with (root / ".admission.lock").open("a") as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -101,6 +104,7 @@ def run(args, root, db_path, parser):
             parser.error("指定的来源键不存在")
         briefs = read_articles(db_path)
         bodies = read_article_contents(db_path)
+        network_policy = SharedNetworkPolicy(root)
         pending = []
         skipped = 0
         for source in sources.values():
@@ -137,13 +141,25 @@ def run(args, root, db_path, parser):
                     and (age >= 900 or args.retry_errors)
                 ) or (
                     previous.reason_code == "source_unavailable"
-                    and age >= 3600
+                    and (age >= 3600 or (
+                        source.url in bodies
+                        and bodies[source.url].failure_code == "site_deferred"
+                        and time.time() >= network_policy.ready_at(source.url)
+                    ))
                     and (source.url not in bodies or bodies[source.url].retryable)
                 )
                 if not retry:
                     skipped += 1
                     continue
             pending.append(source)
+        # 已到期的站点限速重试优先，避免被新订阅的大量历史文章长期挤出批次。
+        pending.sort(
+            key=lambda source: not (
+                source.url in bodies
+                and bodies[source.url].failure_code == "site_deferred"
+                and time.time() >= network_policy.ready_at(source.url)
+            )
+        )
         if args.limit:
             pending = pending[: args.limit]
         counts = Counter(
@@ -155,6 +171,7 @@ def run(args, root, db_path, parser):
             pending=0,
             failed=0,
             requests=0,
+            fetch_deferred=0,
         )
         started = time.monotonic()
 
@@ -175,8 +192,9 @@ def run(args, root, db_path, parser):
             return 0
         progress("preparing")
         candidates = []
-        reader = ArticleReader()
+        reader = ArticleReader(shared=network_policy)
         body_store = None
+        fetched = 0
         try:
             for source in pending:
                 previous = state.reviews.get(source.key)
@@ -190,11 +208,11 @@ def run(args, root, db_path, parser):
                         previous
                         and known
                         and known.retryable
-                        and (
+                        and (known.failure_code == "site_deferred" and time.time() >= network_policy.ready_at(source.url) or (
                             datetime.now(UTC)
                             - datetime.fromisoformat(previous.reviewed_at)
                         ).total_seconds()
-                        >= 3600
+                        >= 3600)
                     )
                     if (
                         known
@@ -213,6 +231,10 @@ def run(args, root, db_path, parser):
                         )
                         counts["pending"] += 1
                         continue
+                    if fetched >= args.max_fetches:
+                        counts["fetch_deferred"] += 1
+                        continue
+                    fetched += 1
                     if body_store is None:
                         body_store = ArticleContentStore(db_path)
                     try:

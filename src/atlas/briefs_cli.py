@@ -29,6 +29,7 @@ from atlas.collect.article import (
     ArticleReadError,
     read_source,
 )
+from atlas.collect.network_policy import SharedNetworkPolicy
 from atlas.webapp import ArchiveEntriesAccess
 
 
@@ -87,6 +88,7 @@ def main(argv=None):
 
 
 def _run(args, root, db_path, parser):
+    network_policy = SharedNetworkPolicy(root)
     with open_archive(root) as archive:
         access = ArchiveEntriesAccess(archive)
         records = sorted(
@@ -114,6 +116,11 @@ def _run(args, root, db_path, parser):
             and (
                 existing[s.key].status != "unavailable"
                 or args.retry_unavailable
+                or (
+                    s.url in retained_bodies
+                    and retained_bodies[s.url].failure_code == "site_deferred"
+                    and time.time() >= network_policy.ready_at(s.url)
+                )
                 or (
                     s.url in retained_bodies
                     and retained_bodies[s.url].status == "ready"
@@ -208,6 +215,7 @@ def _run(args, root, db_path, parser):
                 and saved_state.status == "unavailable"
                 and not args.retry_unavailable
                 and not args.refresh_originals
+                and not (saved_state.failure_code == "site_deferred" and time.time() >= network_policy.ready_at(source.url))
             ):
                 store.record_body(source, body="", error=saved_state.failure_detail)
                 counts["unavailable"] += 1
@@ -220,7 +228,7 @@ def _run(args, root, db_path, parser):
 
         def read(url):
             if not hasattr(local, "reader"):
-                local.reader = ArticleReader()
+                local.reader = ArticleReader(shared=network_policy)
             try:
                 return read_source(local.reader, url), ""
             except ArticleReadError as error:

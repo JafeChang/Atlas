@@ -5,7 +5,7 @@ sources:
   # === OpenAI 官方博客（AI 研究与进展） ===
   - name: "openai-blog"
     type: "rss"
-    url: "https://openai.com/blog/rss/"
+    url: "https://openai.com/news/rss.xml"
     interval: 3600  # 1小时
     enabled: true
     tags: ["ai", "research", "openai", "llm"]
@@ -51,7 +51,7 @@ sources:
   # === Google AI Blog ===
   - name: "google-ai-blog"
     type: "rss"
-    url: "https://googleaiblog.blogspot.com/atom.xml"
+    url: "https://blog.google/innovation-and-ai/technology/ai/rss/"
     interval: 3600  # 1小时
     enabled: true
     tags: ["ai", "research", "google", "deepmind"]

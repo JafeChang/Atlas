@@ -18,6 +18,7 @@ from bs4 import BeautifulSoup
 
 from atlas.collect.article_failure import classify_article_failure
 from atlas.collect.robots import RobotsCache, RobotsFetchResult
+from atlas.collect.throttle import ThrottleTimeout
 
 USER_AGENT = "Atlas/0.1 (Article summaries)"
 MAX_BYTES = 32 * 1024 * 1024
@@ -42,8 +43,10 @@ class ArticleReadError(RuntimeError):
 class OriginThrottle:
     """所有工作线程共享；同源串行，遵守默认间隔和 robots Crawl-delay。"""
 
-    def __init__(self, interval=1.0):
+    def __init__(self, interval=1.0, max_wait=30.0, shared=None):
         self.interval = interval
+        self.max_wait = max_wait
+        self.shared = shared
         self._guard = threading.Lock()
         self._locks = {}
         self._last = {}
@@ -55,7 +58,15 @@ class OriginThrottle:
             self._delays[host] = max(seconds, self._delays.get(host, 0))
 
     @contextmanager
-    def slot(self, url):
+    def slot(self, url, *, robots_request=False):
+        if self.shared is not None:
+            delay = max(self.interval, 15.0 if (urlsplit(url).hostname or "") in ("arxiv.org", "export.arxiv.org") else 0)
+            try:
+                with self.shared.slot(url, delay, robots_request=robots_request):
+                    yield
+            except ThrottleTimeout as error:
+                raise ArticleReadError("原文等待站点限速：" + str(error), url=url) from error
+            return
         host = urlsplit(url).hostname or ""
         with self._guard:
             lock = self._locks.setdefault(host, threading.Lock())
@@ -65,7 +76,14 @@ class OriginThrottle:
                 self._delays.get(host, 0),
                 15.0 if host in ("arxiv.org", "export.arxiv.org") else 0,
             )
-            wait = self._last.get(host, 0) + delay - time.monotonic()
+            last = self._last.get(host)
+            wait = last + delay - time.monotonic() if last is not None else 0
+            if wait > self.max_wait:
+                # 不缩短站点要求的间隔；让调用方暂缓此来源，避免阻塞整个批次。
+                raise ArticleReadError(
+                    f"原文请求等待超时：站点要求间隔 {delay:g} 秒，"
+                    f"尚需等待 {wait:.1f} 秒", url=url
+                )
             if wait > 0:
                 time.sleep(wait)
             self._last[host] = time.monotonic()
@@ -236,9 +254,14 @@ def extract_article(content: bytes, content_type: str = "") -> str:
 class ArticleReader:
     """每个工作线程一实例；robots 按 origin 复用，重定向逐跳检查。"""
 
-    def __init__(self, *, throttle: OriginThrottle | None = None):
-        self.throttle = throttle or OriginThrottle()
-        self.robots = RobotsCache(self._robots, user_agent=USER_AGENT)
+    def __init__(self, *, throttle: OriginThrottle | None = None, shared=None):
+        self.throttle = throttle or OriginThrottle(shared=shared)
+        self.shared = shared or self.throttle.shared
+        fetch = self._robots
+        if self.shared is not None:
+            def fetch(url, *, user_agent):
+                return self.shared.robots(url, user_agent, self._robots)
+        self.robots = RobotsCache(fetch, user_agent=USER_AGENT, cache_ttl_seconds=86400 if self.shared else None)
 
     def _get(self, url: str, *, check_robots: bool):
         for _ in range(6):
@@ -246,12 +269,14 @@ class ArticleReader:
             if check_robots:
                 decision = self.robots.check(url)
                 if not decision.allowed:
+                    if self.shared is not None and ("ThrottleTimeout" in decision.reason or "等待站点限速" in decision.reason):
+                        raise ArticleReadError("原文等待站点限速：" + decision.reason, url=url)
                     raise ArticleReadError(
                         "robots 拒绝或无法确认允许：" + decision.outcome.value
                     )
             try:
                 with (
-                    self.throttle.slot(url),
+                    self.throttle.slot(url, robots_request=not check_robots),
                     requests.get(
                         url,
                         headers={
@@ -308,6 +333,11 @@ class ArticleReader:
         try:
             status, content, content_type, final = self._get(url, check_robots=True)
         except ArticleReadError as error:
+            if self.shared is not None and error.failure.code == "site_deferred" and error.url:
+                self.shared.defer_origin(
+                    url, error.url,
+                    max(self.shared.ready_at(error.url), self.shared.clock() + 1),
+                )
             if not error.url:
                 error.url = url
                 error.failure = classify_article_failure(str(error), url)

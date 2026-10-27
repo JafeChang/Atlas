@@ -1,0 +1,11 @@
+[Unit]
+Description=Fill newly collected Atlas article and paper full text
+
+[Timer]
+OnBootSec=90
+OnUnitInactiveSec=60
+AccuracySec=5
+Unit=atlas-article-content.service
+
+[Install]
+WantedBy=timers.target

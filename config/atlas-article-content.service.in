@@ -10,9 +10,9 @@ Type=simple
 WorkingDirectory=@ATLAS_ROOT@
 Environment=PYTHONUNBUFFERED=1
 EnvironmentFile=-@ATLAS_ROOT@/data/store/article-content.env
-ExecStart=@ATLAS_ROOT@/.venv-new/bin/python -m atlas.article_content_cli --scope all --retry-transient --workers 4 --report-dir @ATLAS_ROOT@/data/store/article-content-job
-Restart=on-failure
-RestartSec=900
+ExecStart=@ATLAS_ROOT@/.venv-new/bin/python -m atlas.article_content_cli --scope all --retry-transient --workers 1 --limit 20 --report-dir @ATLAS_ROOT@/data/store/article-content-job
+SuccessExitStatus=75
+Restart=no
 KillSignal=SIGINT
 TimeoutStopSec=90
 Nice=10

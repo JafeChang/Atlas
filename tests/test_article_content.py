@@ -8,6 +8,30 @@ from atlas.collect.article import ArticleContent, clean_document
 from atlas.collect.article_failure import classify_article_failure
 
 
+def test_long_robots_delay_defers_one_host_without_sleeping_or_shortening_delay(monkeypatch):
+    from atlas.collect.article import ArticleReadError, OriginThrottle
+
+    now = [1000.0]
+    sleeps = []
+    monkeypatch.setattr("atlas.collect.article.time.monotonic", lambda: now[0])
+    monkeypatch.setattr("atlas.collect.article.time.sleep", lambda seconds: sleeps.append(seconds))
+    throttle = OriginThrottle(max_wait=30)
+    url = "https://slow.example/article"
+    with throttle.slot(url):
+        pass  # robots.txt request
+    throttle.set_delay(url, 600)
+    with pytest.raises(ArticleReadError) as error:
+        with throttle.slot(url):
+            pytest.fail("不得提前访问")
+    assert error.value.failure.code == "timeout" and error.value.failure.retryable
+    assert sleeps == []
+    with throttle.slot("https://other.example/article"):
+        pass
+    now[0] += 600
+    with throttle.slot(url):
+        pass
+
+
 def test_clean_body_preserves_paragraphs_code_and_removes_non_article_sections():
     raw = b'<html><nav>Menu</nav><article><h1>Heading</h1><p>First <b>important</b> paragraph.</p><p>Second paragraph.</p><div class="cookie-banner">Cookie prompt</div><div class="social-share">Share now</div><pre>if ready:\n    run()</pre><div class="related-posts">Other story</div></article><footer>Footer</footer></html>'
     body = clean_document(raw, "text/html").text
@@ -138,6 +162,49 @@ def test_body_cli_stores_fetched_full_body_without_invoking_models(
         assert db.execute("SELECT summary_zh FROM feed_articles").fetchone()[0] == ""
     with open_archive(root) as archive:
         assert archive.get_content(record.raw_id) == payload
+
+
+def test_incremental_batch_prioritizes_new_papers_without_starving_news(tmp_path, monkeypatch):
+    from atlas.archive import open_archive
+    from atlas.article_content_cli import main
+    from atlas.contracts import RawRecord
+
+    root = tmp_path / "store"
+    payload = b"""<rss><channel>
+      <item><title>Old paper</title><link>https://arxiv.org/abs/2601.00001</link><pubDate>Mon, 26 Oct 2026 04:00:00 GMT</pubDate></item>
+      <item><title>New paper</title><link>https://arxiv.org/abs/2601.00002</link><pubDate>Tue, 27 Oct 2026 04:00:00 GMT</pubDate></item>
+      <item><title>Old news</title><link>https://news.test/old</link><pubDate>Mon, 26 Oct 2026 04:00:00 GMT</pubDate></item>
+      <item><title>New news</title><link>https://news.test/new</link><pubDate>Tue, 27 Oct 2026 04:00:00 GMT</pubDate></item>
+      </channel></rss>"""
+    record = RawRecord.create(channel_id="test", endpoint="https://example.test/feed", content=payload, http_status=200)
+    with open_archive(root) as archive:
+        archive.put(record, payload)
+    calls = []
+    body = "Detailed article content with sufficient substance. " * 10
+
+    def read(self, url):
+        calls.append(url)
+        return ArticleContent(body, url, b'<article class="ltx_document">paper</article>', "text/html")
+
+    monkeypatch.setattr("atlas.article_content_cli.ArticleReader.read", read)
+    args = ["--store-root", str(root), "--report-dir", str(tmp_path / "report"), "--workers", "1", "--limit", "2"]
+    assert main(args) == 0
+    assert calls == ["https://news.test/new", "https://arxiv.org/html/2601.00002"]
+    assert main(args) == 0
+    assert calls[2:] == ["https://news.test/old", "https://arxiv.org/html/2601.00001"]
+
+
+def test_incremental_order_round_robins_arxiv_subscriptions():
+    from atlas.article_content_cli import _round_robin_urls
+
+    urls = [
+        "https://news.test/new",
+        "https://arxiv.org/abs/2601.00001",
+        "https://arxiv.org/abs/2601.00002",
+        "https://arxiv.org/abs/2601.00003",
+    ]
+    channels = {urls[1]: "arxiv-cv", urls[2]: "arxiv-cv", urls[3]: "arxiv-nlp"}
+    assert _round_robin_urls(urls, channels) == [urls[0], urls[1], urls[3], urls[2]]
 
 
 def test_arxiv_html_then_pdf_and_never_uses_abs_page_as_full_text():

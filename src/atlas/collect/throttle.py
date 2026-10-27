@@ -26,6 +26,7 @@
 from __future__ import annotations
 
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Dict, Optional
 from urllib.parse import urlsplit
@@ -172,6 +173,11 @@ class DomainThrottle:
         self._waited_totals[domain] = self._waited_totals.get(domain, 0.0) + waited
         return ThrottleDecision(domain=domain, min_interval=enforced, waited_seconds=waited)
 
+    @contextmanager
+    def slot(self, domain: str, min_interval: float):
+        yield self.reserve(domain, min_interval)
+
+
     # --- 观测 -------------------------------------------------------------
 
     def stats(self) -> Dict[str, Dict[str, float]]:
@@ -185,3 +191,16 @@ class DomainThrottle:
             }
             for domain in sorted(self._enforced_interval)
         }
+
+
+class SharedDomainThrottle(DomainThrottle):
+    """采集与正文任务共享站点请求状态。"""
+
+    def __init__(self, policy):
+        super().__init__()
+        self.policy = policy
+
+    @contextmanager
+    def slot(self, domain: str, min_interval: float):
+        with self.policy.slot("http://" + domain, min_interval, domain=domain) as decision:
+            yield decision

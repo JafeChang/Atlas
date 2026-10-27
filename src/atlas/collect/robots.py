@@ -8,7 +8,7 @@
 |---|---|---|
 | 规则明确禁止该 UA 抓该路径 | 禁止 | 合规底线 |
 | robots.txt 返回 401 / 403 | 禁止 | 站方明确拒绝（RFC 9309 §2.3.2.3） |
-| robots.txt 返回 5xx | **禁止（保守）** | 服务端错误无法证明允许；宁可漏抓不可违规 |
+| robots.txt 返回 429 / 5xx | **禁止（保守）** | 请求受限或服务端错误无法证明允许 |
 | 网络异常 / 超时 / 连接失败 | **禁止（保守）** | 同上：拿不到规则 ≠ 没有规则 |
 | robots.txt 解析异常 | **禁止（保守）** | 解析失败同样无法证明允许 |
 | robots.txt 返回其它 4xx（含 404） | 允许 | 文件不存在 = 没有限制（RFC 9309），且这不算"抓取失败" |
@@ -97,6 +97,7 @@ class RobotsDecision:
     reason: str
     status_code: Optional[int] = None
     from_cache: bool = False
+    crawl_delay: float = 0
 
 
 @dataclass
@@ -227,6 +228,7 @@ class RobotsCache:
                 reason=reason,
                 status_code=entry.status_code,
                 from_cache=from_cache,
+                crawl_delay=float(parser.crawl_delay(agent) or parser.crawl_delay("*") or 0),
             )
 
         return RobotsDecision(
@@ -330,10 +332,10 @@ class RobotsCache:
                 f"robots.txt 返回 {status}（站方明确拒绝访问），视为不允许"
             )
             return entry
-        if 500 <= status < 600:
+        if status == 429 or 500 <= status < 600:
             entry.blocked_outcome = RobotsOutcome.DISALLOWED_ROBOTS_UNAVAILABLE
             entry.blocked_reason = (
-                f"robots.txt 返回 {status}（服务端错误，无法证明允许），按保守策略视为不允许"
+                f"robots.txt 返回 {status}（请求受限或服务端错误，无法证明允许），按保守策略视为不允许"
             )
             return entry
         if 400 <= status < 500:

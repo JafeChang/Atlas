@@ -375,6 +375,38 @@ def test_admission_fetch_retains_cleaned_body_without_queuing_unreviewed_summary
     db.close()
 
 
+def test_fetch_budget_preserves_review_progress_and_resumes_deferred_sources(tmp_path, monkeypatch):
+    from atlas.collect.article import ArticleContent
+    from atlas.contracts import RawRecord
+    from tests.test_feed_refresh import BODY
+
+    root = tmp_path / "store"
+    payload = b"<rss><channel>" + b"".join(
+        f"<item><title>Article {i}</title><link>https://example.test/{i}</link></item>".encode()
+        for i in range(3)
+    ) + b"</channel></rss>"
+    record = RawRecord.create(channel_id="feed", endpoint="https://example.test/feed", content=payload, http_status=200)
+    with open_archive(root) as archive:
+        archive.put(record, payload)
+    fetched = []
+
+    def read(self, url):
+        fetched.append(url)
+        return ArticleContent(BODY, url, b"<article>body</article>", "text/html")
+
+    monkeypatch.setattr("atlas.admission_cli.ArticleReader.read", read)
+    calls = []
+    fake_reviews(monkeypatch, calls)
+    args = ["--store-root", str(root), "--enable", "--max-fetches", "1", "--report-dir", str(tmp_path / "review")]
+    assert main(args) == 0
+    state = read_admissions(root / "atlas.db")
+    assert len(state.reviews) == 1 and len(fetched) == 1 and len(calls) == 1
+    report = json.loads((tmp_path / "review/progress.json").read_text())
+    assert report["fetch_deferred"] == 2 and report["accepted"] == 1
+    assert main(args) == 0 and main(args) == 0
+    assert len(fetched) == 3 and len(read_admissions(root / "atlas.db").reviews) == 3
+
+
 def test_classification_gate_and_approval_change_invalidates_node_cache(tmp_path):
     from atlas.compose import NODE_CLASSIFY
     from atlas.runner import InMemoryExecutionRecordStore

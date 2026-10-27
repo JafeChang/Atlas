@@ -10,7 +10,8 @@ import sqlite3
 import threading
 import time
 from collections import Counter, defaultdict, deque
-from datetime import datetime
+from datetime import UTC, datetime
+from itertools import zip_longest
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -33,6 +34,7 @@ from atlas.collect.article import (
     read_source,
 )
 from atlas.collect.article_failure import classify_article_failure
+from atlas.collect.network_policy import SharedNetworkPolicy
 from atlas.webapp import ArchiveEntriesAccess
 
 
@@ -88,6 +90,38 @@ def seed_existing(store, db_path):
             )
 
 
+def _source_recency(record, entry):
+    published = getattr(entry, "published_at", None)
+    if published:
+        try:
+            value = datetime.fromisoformat(published)
+            return value.replace(tzinfo=UTC).timestamp() if value.tzinfo is None else value.timestamp()
+        except ValueError:
+            pass
+    return record.fetched_at.timestamp()
+
+
+def _round_robin_urls(urls, paper_channels=None):
+    """按输入优先级轮换站点；新闻和论文各自都能进入有上限的批次。"""
+    paper_channels = paper_channels or {}
+    groups = []
+    for paper in (False, True):
+        buckets = defaultdict(deque)
+        for url in urls:
+            if is_paper(url) == paper:
+                host = urlsplit(url).hostname
+                key = (host, paper_channels.get(url, "")) if paper else host
+                buckets[key].append(url)
+        ordered = []
+        while buckets:
+            for host in list(buckets):
+                ordered.append(buckets[host].popleft())
+                if not buckets[host]:
+                    del buckets[host]
+        groups.append(ordered)
+    return [url for pair in zip_longest(*groups) for url in pair if url is not None]
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         description="清洗留存正文（含论文全文）并归类失败；零模型调用"
@@ -106,6 +140,7 @@ def main(argv=None):
     if not 1 <= args.workers <= 8 or (args.limit is not None and args.limit < 1):
         parser.error("并发为 1–8，limit 必须为正")
     root = Path(args.store_root)
+    network_policy = SharedNetworkPolicy(root)
     db_path = root / "atlas.db"
     if not db_path.is_file():
         parser.error("正式库不存在")
@@ -126,11 +161,16 @@ def main(argv=None):
     enable_wal(db_path)
     with open_archive(root) as archive:
         access = ArchiveEntriesAccess(archive)
-        sources = {
-            s.key: s
-            for rid in archive.all_raw_ids()
-            for s in access.brief_sources(rid).values()
-        }
+        sources, recency, paper_channels = {}, {}, {}
+        for rid in archive.all_raw_ids():
+            record = archive.get(rid)
+            entries = {(e.char_start, e.char_end): e for e in access.entries_of(record).entries}
+            for position, source in access.brief_sources(rid).items():
+                sources[source.key] = source
+                timestamp = _source_recency(record, entries.get(position))
+                recency[source.url] = max(recency.get(source.url, 0), timestamp)
+                if is_paper(source.url) and record.channel_id.startswith("arxiv-"):
+                    paper_channels.setdefault(source.url, record.channel_id)
     admission = read_admissions(db_path)
     sources = {k: s for k, s in sources.items() if admission.allows(k)}
     brief_store = BriefStore(db_path)
@@ -183,7 +223,7 @@ def main(argv=None):
                     continue
                 if row.status == "unavailable":
                     age = now - datetime.fromisoformat(row.fetched_at).timestamp()
-                    if not args.retry_unavailable and not (
+                    if not args.retry_unavailable and not (row.failure_code == "site_deferred" and now >= network_policy.ready_at(url)) and not (
                         args.retry_transient and row.retryable and age >= 3600
                     ):
                         continue
@@ -192,22 +232,8 @@ def main(argv=None):
                 deferred += 1
             else:
                 pending.append(url)
-        # 先新闻再论文；新闻同域轮换，避免工作线程全部等一个站点。
-        buckets = defaultdict(deque)
-        for url in pending:
-            buckets[urlsplit(url).hostname].append(url)
-        ordered = []
-        for paper in (False, True):
-            selected = {
-                host: values
-                for host, values in buckets.items()
-                if values and is_paper(values[0]) == paper
-            }
-            while selected:
-                for host in list(selected):
-                    ordered.append(selected[host].popleft())
-                    if not selected[host]:
-                        del selected[host]
+        pending.sort(key=lambda url: recency.get(url, 0), reverse=True)
+        ordered = _round_robin_urls(pending, paper_channels)
         pending = ordered[: args.limit] if args.limit else ordered
         counts = Counter(
             total_urls=len(urls),
@@ -234,7 +260,7 @@ def main(argv=None):
             stage.replace(report_dir / "progress.json")
             print(json.dumps(data, ensure_ascii=False), flush=True)
 
-        throttle = OriginThrottle()
+        throttle = OriginThrottle(shared=network_policy)
         local = threading.local()
         network_failures = Counter()
 
@@ -359,7 +385,10 @@ def main(argv=None):
                         result, error = future.result()
                         save(url, result, error)
                         host = urlsplit(url).hostname or ""
-                        if error and error.failure.retryable:
+                        if error and error.failure.code == "site_deferred":
+                            host_blocks[host] = max(time.time() + 1, network_policy.ready_at(url))
+                            host_blocks_path.write_text(json.dumps(host_blocks))
+                        elif error and error.failure.retryable:
                             network_failures[host] += 1
                             if network_failures[host] >= 5:
                                 host_blocks[host] = time.time() + 3600
