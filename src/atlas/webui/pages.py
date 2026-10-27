@@ -51,6 +51,7 @@ from string import Template
 from typing import Any, Mapping, Optional, Sequence
 from urllib.parse import urlencode
 
+from atlas.analytics.tracking import TRACKING_SCRIPT
 from atlas.feed import FeedEntry, FeedItem, FeedQuery, FeedResult
 
 __all__ = [
@@ -509,8 +510,6 @@ if (tabs) {
   });
 }
 </script>"""
-
-from atlas.analytics.tracking import TRACKING_SCRIPT
 
 _SHELL = Template(
     """<!DOCTYPE html>

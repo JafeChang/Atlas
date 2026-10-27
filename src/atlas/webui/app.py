@@ -155,7 +155,8 @@ __all__ = [
 #: - **3**：`POST /label` 可用 `Accept: application/json` 获取最新人工标签，
 #:   前端只更新当前卡片；普通表单继续返回 303。
 #: - **4**：阅读详情、图片缓存及按需全文翻译；打标允许回到当前详情页。
-WEBUI_CONTRACT_VERSION = 4
+#: - **5**：新增行为事件上报接口。
+WEBUI_CONTRACT_VERSION = 5
 
 #: 打标人的默认署名；也可由页面上的 `actor` 字段覆盖。
 DEFAULT_ACTOR = "me"
