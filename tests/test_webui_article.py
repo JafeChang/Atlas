@@ -56,6 +56,7 @@ def article_world(tmp_path, *, chinese=False):
     cache = DiskImageCache(cache_root / "images", downloader=download)
     app = build_webapp(
         root,
+        require_login=False,
         db_path=db_path,
         industry_provider=lambda: ("ai", "web", "news"),
         industry_of={"chan-feed": "ai", "chan-article": "web"},

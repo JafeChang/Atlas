@@ -122,7 +122,7 @@ def _moment(minutes: int):
 
 
 @contextmanager
-def running_frontend(tmp_path: Path, *, actor: str = "tester") -> Iterator[SimpleNamespace]:
+def running_frontend(tmp_path: Path, *, actor: str = "tester", require_login: bool = False) -> Iterator[SimpleNamespace]:
     """把 fixture 写进临时归档根，再用**真实组合根**装一个前端（`127.0.0.1:0`）。"""
     root = tmp_path / "store"
     archive = open_archive(root)
@@ -136,6 +136,7 @@ def running_frontend(tmp_path: Path, *, actor: str = "tester") -> Iterator[Simpl
     db_path = root / "atlas.db"
     app = build_webapp(
         root,
+        require_login=require_login,
         db_path=db_path,
         industry_provider=lambda: ("ai", "web"),
         industry_of={"chan-feed": "ai", "chan-article": "web"},
@@ -863,6 +864,7 @@ def test_browsing_does_not_touch_the_archive_or_create_a_label_store(
     db_path = tmp_path / "labels" / "atlas.db"
     app = build_webapp(
         root,
+        require_login=False,
         db_path=db_path,
         industry_provider=lambda: ("ai", "web"),
         actor="tester",

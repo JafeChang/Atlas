@@ -179,6 +179,18 @@ button:disabled, select:disabled { opacity: 0.6; cursor: wait; }
 :focus-visible { outline: 3px solid var(--accent); outline-offset: 3px; }
 summary { cursor: pointer; min-height: 44px; padding-block: 0.55rem; }
 code, .raw-id { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.85em; }
+.login-card { max-width: 28rem; margin: 3rem auto; padding: 1.5rem; background: var(--surface); border: 1px solid var(--border); border-radius: 14px; }
+.login-card label { display: block; font-weight: 600; margin-bottom: 0.4rem; }
+.login-card input, .login-card button { width: 100%; }
+.login-card button { margin-top: 1rem; }
+.login-spinner { display: inline-block; width: 1.2rem; height: 1.2rem; vertical-align: middle;
+                 border: 2px solid rgba(255, 255, 255, 0.4); border-top-color: #fff;
+                 border-radius: 50%; animation: login-spin 0.7s linear infinite; }
+@keyframes login-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .login-spinner { animation: none; } }
+.login-card p, .account { color: var(--muted); }
+.account { display: flex; align-items: center; gap: 1rem; flex-wrap: wrap; margin-bottom: 1rem; }
+.account button { background: transparent; color: var(--accent); border-color: var(--border); }
 .filter-panel { border: 1px solid var(--border); border-radius: 12px; padding: 0.2rem 0.9rem;
                 background: var(--surface); }
 .filters { display: flex; flex-wrap: wrap; gap: 0.8rem; align-items: flex-end; padding-bottom: 0.8rem; }
@@ -458,29 +470,98 @@ if (tabs) {
     const status = document.createElement('p');
     status.className = 'translation-status';
     status.setAttribute('role', 'status');
-    status.textContent = '正在生成中文全文…';
-    translated.append(status);
+    status.textContent = '正在翻译中文全文…';
+    const body = document.createElement('div');
+    body.className = 'article-body';
+    translated.append(status, body);
+    let initialized = false;
+    let lastRevision = -1;
+    const show = (result) => {
+      if (typeof result.revision === 'number') {
+        if (result.revision < lastRevision) return;
+        lastRevision = result.revision;
+      }
+      if (result.html) {
+        // HTML comes from the server's sanitized document and escaped text translations.
+        const template = document.createElement('template');
+        template.innerHTML = result.html;
+        const updates = template.content.querySelectorAll('[data-atlas-translation-node]');
+        const existing = body.querySelectorAll('[data-atlas-translation-node]');
+        if (initialized && updates.length && updates.length === existing.length) {
+          const byId = new Map(Array.from(existing, node => [node.dataset.atlasTranslationNode, node]));
+          if (Array.from(updates).every(node => byId.has(node.dataset.atlasTranslationNode))) {
+            updates.forEach(node => {
+              const target = byId.get(node.dataset.atlasTranslationNode);
+              if (target.textContent !== node.textContent) target.textContent = node.textContent;
+            });
+          } else body.replaceChildren(template.content);
+        } else body.replaceChildren(template.content);
+        initialized = true;
+      }
+      if (result.patches && initialized) {
+        const byId = new Map(Array.from(body.querySelectorAll('[data-atlas-translation-node]'),
+          node => [node.dataset.atlasTranslationNode, node]));
+        for (const [id, text] of Object.entries(result.patches)) {
+          const target = byId.get(id);
+          if (target && target.textContent !== text) target.textContent = text;
+        }
+      }
+      if (result.status === 'running') {
+        status.textContent = '正在翻译… ' + result.progress + '%（未完成部分显示原文）';
+      } else if (result.status === 'ready') {
+        status.textContent = 'AI 中文译文';
+      }
+    };
     try {
       let response = await fetch(tabs.dataset.translationUrl, {method: 'POST', headers: {Accept: 'application/json'}});
       let result = await response.json();
       if (!response.ok) throw new Error(result.message || '翻译请求失败');
+      show(result);
+      if (result.status === 'running' && window.EventSource && result.stream_url) {
+        const streamed = await new Promise(resolve => {
+          const source = new EventSource(result.stream_url);
+          let lastEventAt = Date.now(), polling = false, settled = false;
+          const finish = value => {
+            if (settled) return;
+            settled = true;
+            clearInterval(watchdog);
+            source.close();
+            resolve(value);
+          };
+          // Some proxies keep the connection open while buffering the event stream.
+          const watchdog = setInterval(async () => {
+            if (settled || polling || Date.now() - lastEventAt < 4000) return;
+            polling = true;
+            try {
+              const response = await fetch('/translation?key=' + encodeURIComponent(result.key), {headers: {Accept: 'application/json'}});
+              const next = await response.json();
+              if (settled) return;
+              if (!response.ok) { finish(null); return; }
+              show(next);
+              if (next.status !== 'running' && (typeof next.revision !== 'number' || next.revision >= lastRevision)) finish(next);
+            } catch (_) { /* keep waiting for SSE or the next retry */ }
+            finally { polling = false; }
+          }, 1200);
+          source.addEventListener('update', (event) => {
+            try {
+              const next = JSON.parse(event.data);
+              lastEventAt = Date.now();
+              show(next);
+              if (next.status !== 'running' && (typeof next.revision !== 'number' || next.revision >= lastRevision)) finish(next);
+            } catch (_) { finish(null); }
+          });
+          source.onerror = () => finish(null);
+        });
+        if (streamed) result = streamed;
+      }
       while (result.status === 'running') {
-        status.textContent = '正在生成中文全文… ' + result.progress + '%';
-        await new Promise((resolve) => setTimeout(resolve, 1200));
+        await new Promise(resolve => setTimeout(resolve, 1200));
         response = await fetch('/translation?key=' + encodeURIComponent(result.key), {headers: {Accept: 'application/json'}});
         result = await response.json();
         if (!response.ok) throw new Error(result.message || '读取翻译进度失败');
+        show(result);
       }
       if (result.status !== 'ready') throw new Error(result.message || '全文翻译尚未完成，请重试。');
-      const body = document.createElement('div');
-      body.className = 'article-body';
-      // 此字段仅由服务端的正文清洗器与逐文本节点翻译产生。
-      body.innerHTML = result.html;
-      translated.replaceChildren(body);
-      const origin = document.createElement('p');
-      origin.className = 'translation-status';
-      origin.textContent = 'AI 中文译文';
-      translated.prepend(origin);
       loaded = true;
     } catch (error) {
       status.textContent = error instanceof TypeError ? '网络暂不可用，翻译结果尚未确认。' : error.message;
@@ -572,6 +653,39 @@ def _shell(*, title: str, heading: str, body: str) -> str:
     )
 
 
+
+def render_login_page(return_to: str, error: str = "") -> str:
+    message = f'<p role="alert">{escape(error)}</p>' if error else ""
+    body = (f'<main class="login-card">{message}'
+            f'<form method="post" action="/login"><label for="name">名字</label>'
+            f'<input id="name" name="name" type="text" maxlength="{MAX_ACTOR_LENGTH}" autocomplete="username" required autofocus>'
+            f'<input type="hidden" name="return_to" value="{escape(return_to)}">'
+            '<button type="submit" aria-live="polite">登录</button></form></main>'
+            '''<script>
+(() => {
+  const form = document.querySelector('.login-card form');
+  const button = form.querySelector('button[type="submit"]');
+  let submitting = false;
+  form.addEventListener('submit', (event) => {
+    if (submitting) { event.preventDefault(); return; }
+    submitting = true;
+    button.disabled = true;
+    const spinner = document.createElement('span');
+    spinner.className = 'login-spinner';
+    spinner.setAttribute('aria-hidden', 'true');
+    button.setAttribute('aria-label', '登录中');
+    button.replaceChildren(spinner);
+  });
+  window.addEventListener('pageshow', () => {
+    submitting = false;
+    button.disabled = false;
+    button.textContent = '登录';
+    button.removeAttribute('aria-label');
+  });
+})();
+</script>''')
+    return _shell(title="登录", heading="登录", body=body)
+
 # ---------------------------------------------------------------------- #
 # feed 页面
 # ---------------------------------------------------------------------- #
@@ -583,6 +697,7 @@ def render_feed_page(
     actor: str,
     return_to: Optional[str] = None,
     notices: Sequence[str] = (),
+    show_account: bool = False,
 ) -> str:
     """渲染一页 feed：筛选器 + 排序 + 分页 + 每条一次点击打标。
 
@@ -597,7 +712,20 @@ def render_feed_page(
         notices: 需要显式告诉用户的事实（例如"若干条目由容器回落而来"）。
     """
     page_url = return_to or feed_query_string(result.query, offset=result.offset)
+    filter_mask = sum(bit for enabled, bit in (
+        (bool(result.query.channels), 1), (bool(result.query.industries), 2),
+        (bool(result.query.tags), 4), (bool(result.query.labels), 8),
+        (result.query.labeled is not None, 16), (result.query.since is not None, 32),
+        (result.query.until is not None, 64),
+    ) if enabled)
     parts: list[str] = [
+        f'<div hidden data-feed-context data-strategy="chronological-v1" '
+        f'data-order="{escape(result.query.order)}" data-offset="{result.offset}" '
+        f'data-limit="{result.limit}" data-total="{result.total}" data-filter-mask="{filter_mask}"></div>'
+    ]
+    if show_account:
+        parts.append(f'<div class="account"><span>当前用户：{escape(actor)}</span><form method="post" action="/logout"><button type="submit">退出登录</button></form></div>')
+    parts += [
         _render_source_tabs(result.query, result.channels),
         _render_filters(result.query, industries),
         _render_quick_switches(result.query),

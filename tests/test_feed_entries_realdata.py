@@ -247,8 +247,7 @@ def test_real_frontend_serves_entry_html_from_the_real_store(tmp_path: Path) -> 
     import re
     import urllib.request
 
-    app = build_webapp(
-        STORE_ROOT,
+    app = build_webapp(STORE_ROOT, require_login=False,
         db_path=tmp_path / "labels.db",
         industry_provider=lambda: (),
         industry_of={},

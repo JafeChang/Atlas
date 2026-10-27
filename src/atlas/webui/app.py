@@ -37,6 +37,7 @@ SPEC §2.11 的硬边界
 | GET | `/image` | 通过签名校验的图片，读取独立 Disk LRU 缓存或按需抓取 |
 | POST | `/translate` | 显式启动中文全文翻译，不由打开详情页触发 |
 | GET | `/translation` | 读取翻译进度或已缓存的完整译文 |
+| GET | `/translation-stream` | SSE 推送翻译进度及已完成的段落 |
 | POST | `/label` | 提交一个判断；`Accept: application/json` 返回当前标签，普通表单 `303` 回到 feed |
 | GET | `/health` | 存活探测（不碰数据源、不碰标签库） |
 
@@ -91,10 +92,11 @@ import json
 import logging
 import threading
 from http import HTTPStatus
+from http.cookies import CookieError, SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable, Dict, Mapping, Optional, Protocol, Sequence
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, urlencode, urlsplit
 
 from atlas.analytics import EventStore, validate_event
 from atlas.contracts import ConfirmedLabel, content_sha256
@@ -110,6 +112,7 @@ from atlas.feed import (
 )
 from atlas.feed.query import SOURCE_PAGE_SIZE
 from atlas.labels import LabelStore, open_store
+from atlas.users import SESSION_SECONDS, UserStore
 
 from .pages import (
     LABEL_KEY_INDUSTRY,
@@ -122,6 +125,7 @@ from .pages import (
     render_entry_page,
     render_error_page,
     render_feed_page,
+    render_login_page,
     render_article_page,
 )
 
@@ -156,7 +160,9 @@ __all__ = [
 #:   前端只更新当前卡片；普通表单继续返回 303。
 #: - **4**：阅读详情、图片缓存及按需全文翻译；打标允许回到当前详情页。
 #: - **5**：新增行为事件上报接口。
-WEBUI_CONTRACT_VERSION = 5
+#: - **6**：正式前端要求名字登录，标签按当前会话署名。
+#: - **7**：翻译支持 SSE 推送已完成的段落。
+WEBUI_CONTRACT_VERSION = 7
 
 #: 打标人的默认署名；也可由页面上的 `actor` 字段覆盖。
 DEFAULT_ACTOR = "me"
@@ -554,6 +560,7 @@ class WebUIRequestHandler(BaseHTTPRequestHandler):
 
     # -- 路由 ---------------------------------------------------------------
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler 的约定
+        self._session_cookie = None
         target = urlsplit(self.path)
         path = _normalize_path(target.path)
         if path == "/health":
@@ -566,6 +573,13 @@ class WebUIRequestHandler(BaseHTTPRequestHandler):
                 },
             )
             return
+        if self.server.users is not None:
+            if path == "/login":
+                params = parse_qs(target.query)
+                self._send_html(HTTPStatus.OK, render_login_page(_safe_login_return(params.get("return_to", ["/feed"])[0])))
+                return
+            if not self._require_login():
+                return
         if path in ("/", "/feed"):
             self._render_feed(target.query)
             return
@@ -581,6 +595,9 @@ class WebUIRequestHandler(BaseHTTPRequestHandler):
         if path == "/translation":
             self._translation_status(target.query)
             return
+        if path == "/translation-stream":
+            self._translation_stream(target.query)
+            return
         if path == "/translate":
             self._reject_method(allow="POST", detail="翻译由点击中文 tab 后显式触发")
             return
@@ -593,8 +610,18 @@ class WebUIRequestHandler(BaseHTTPRequestHandler):
         self._not_found(path)
 
     def do_POST(self) -> None:  # noqa: N802
+        self._session_cookie = None
         target = urlsplit(self.path)
         path = _normalize_path(target.path)
+        if self.server.users is not None:
+            if path in ("/login", "/logout"):
+                self._login_action(path)
+                return
+            if not self._require_login():
+                return
+            if not self._same_origin():
+                self._send_error(HTTPStatus.FORBIDDEN, "请求被拒绝", "请从 Atlas 页面发起请求", close=True)
+                return
         if path == "/events":
             self._submit_event()
             return
@@ -613,10 +640,92 @@ class WebUIRequestHandler(BaseHTTPRequestHandler):
                 return
             self._render_entry(target.query, view="translate")
             return
-        if path in ("/", "/feed", "/entry", "/article", "/image", "/translation"):
+        if path in ("/", "/feed", "/entry", "/article", "/image", "/translation", "/translation-stream"):
             self._reject_method(allow="GET", detail="feed / 条目页是只读投影，只接受 GET")
             return
         self._not_found(path)
+
+    def _same_origin(self) -> bool:
+        origin = self.headers.get("Origin")
+        try:
+            return self.headers.get("Sec-Fetch-Site") != "cross-site" and (
+                not origin or urlsplit(origin).netloc == self.headers.get("Host")
+            )
+        except ValueError:
+            return False
+
+    def _session_token(self) -> str:
+        try:
+            cookie = SimpleCookie()
+            cookie.load(self.headers.get("Cookie", ""))
+            morsel = cookie.get("atlas_session")
+            return morsel.value if morsel else ""
+        except CookieError:
+            return ""
+
+    def _require_login(self) -> bool:
+        try:
+            token = self._session_token()
+            session = self.server.users.authenticate(token)
+        except Exception:  # noqa: BLE001 - 存储失败必须向客户端可见
+            _log.exception("读取登录会话失败")
+            self._send_error(HTTPStatus.SERVICE_UNAVAILABLE, "登录服务不可用", "请稍后重试", close=self.command != "GET")
+            return False
+        if session:
+            self.current_actor, self.current_user_id, lifetime = session
+            self._session_cookie = self._cookie(token, lifetime)
+            return True
+        if self.command == "GET" and urlsplit(self.path).path in ("/", "/feed", "/entry", "/article"):
+            location = "/login?" + urlencode({"return_to": _safe_login_return(self.path)})
+            self._redirect(HTTPStatus.SEE_OTHER, location)
+        else:
+            self._send_json(HTTPStatus.UNAUTHORIZED, {"error": "请先登录", "login_url": "/login"}, close=self.command != "GET")
+        return False
+
+    def _request_labels(self) -> LabelAccess:
+        if self.server.users is not None:
+            return StoreLabelAccess(self.server.labels.db_path, actor=self.current_actor)
+        return self.server.labels
+
+    def _request_actor(self) -> str:
+        return self.current_actor if self.server.users is not None else self.server.actor
+
+    def _login_action(self, path: str) -> None:
+        if not self._same_origin():
+            self._send_error(HTTPStatus.FORBIDDEN, "请求被拒绝", "请从 Atlas 页面发起请求", close=True)
+            return
+        if path == "/logout":
+            if self.headers.get("Transfer-Encoding") or self.headers.get("Content-Length", "0") != "0":
+                self._send_error(HTTPStatus.BAD_REQUEST, "请求非法", "退出请求不能带请求体", close=True)
+                return
+            try:
+                self.server.users.logout(self._session_token())
+            except Exception:  # noqa: BLE001
+                _log.exception("退出登录失败")
+                self._send_error(HTTPStatus.SERVICE_UNAVAILABLE, "登录服务不可用", "退出失败，请稍后重试")
+                return
+            self._send_bytes(HTTPStatus.SEE_OTHER, b"", content_type="text/html; charset=utf-8", extra_headers={"Location": "/login", "Set-Cookie": self._cookie("", 0)})
+            return
+        try:
+            fields = self._parse_form(allowed_fields=frozenset({"name", "return_to"}))
+            name = _require_text(fields, "name", max_length=MAX_ACTOR_LENGTH)
+            if any(ord(c) < 32 or ord(c) == 127 for c in name):
+                raise _FormRejected(HTTPStatus.BAD_REQUEST, "名字非法", "名字不能包含控制字符")
+            return_to = _safe_login_return(fields.get("return_to", "/feed"))
+        except _FormRejected as exc:
+            self._send_html(exc.status, render_login_page("/feed", exc.message), close=True)
+            return
+        try:
+            token = self.server.users.login(name)
+        except Exception:  # noqa: BLE001
+            _log.exception("登录失败")
+            self._send_error(HTTPStatus.SERVICE_UNAVAILABLE, "登录服务不可用", "登录失败，请稍后重试")
+            return
+        self._send_bytes(HTTPStatus.SEE_OTHER, b"", content_type="text/html; charset=utf-8", extra_headers={"Location": return_to, "Set-Cookie": self._cookie(token, SESSION_SECONDS)})
+
+    def _cookie(self, token: str, max_age: int) -> str:
+        secure = "; Secure" if self.headers.get("X-Forwarded-Proto", "").lower() == "https" else ""
+        return f"atlas_session={token}; Path=/; Max-Age={max_age}; HttpOnly; SameSite=Lax{secure}"
 
     def _submit_event(self) -> None:
         origin = self.headers.get("Origin")
@@ -639,7 +748,13 @@ class WebUIRequestHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.UNSUPPORTED_MEDIA_TYPE, {"error": "expected JSON"}, close=True)
             return
         try:
-            event = validate_event(json.loads(self.rfile.read(length).decode("utf-8")))
+            payload = json.loads(self.rfile.read(length).decode("utf-8"))
+            if isinstance(payload, dict) and "expected_user_id" in payload:
+                expected_user_id = payload.pop("expected_user_id")
+                if self.server.users is None or expected_user_id != self.current_user_id:
+                    self._send_json(HTTPStatus.CONFLICT, {"error": "session changed"})
+                    return
+            event = validate_event(payload)
         except (ValueError, UnicodeDecodeError):
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid event"})
             return
@@ -647,7 +762,9 @@ class WebUIRequestHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "event store unavailable"})
             return
         try:
-            self.server.events.append_event(event)
+            self.server.events.append_event(
+                event, user_id=self.current_user_id if self.server.users is not None else None
+            )
         except Exception:  # noqa: BLE001 - request fails visibly and logs the storage error
             _log.exception("行为事件写入失败")
             self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "event storage failed"})
@@ -689,7 +806,7 @@ class WebUIRequestHandler(BaseHTTPRequestHandler):
             return
 
         try:
-            with server.labels.read_session() as session:
+            with self._request_labels().read_session() as session:
                 result = run_query(
                     server.resolve_source(),
                     query,
@@ -716,15 +833,16 @@ class WebUIRequestHandler(BaseHTTPRequestHandler):
             return
 
         notices = list(_entry_notices(result))
-        label_actor = getattr(server.labels, "actor", None)
+        label_actor = getattr(self._request_labels(), "actor", None)
         if label_actor is not None:
             notices.insert(0, f"当前署名：{label_actor}；标签展示与已打标筛选仅使用此署名的判断。")
         document = render_feed_page(
             result,
             industries=tuple(server.industry_provider()),
             values=values,
-            actor=server.actor,
+            actor=self._request_actor(),
             notices=notices,
+            show_account=server.users is not None,
         )
         self._send_html(HTTPStatus.OK, document)
 
@@ -815,7 +933,7 @@ class WebUIRequestHandler(BaseHTTPRequestHandler):
             return
 
         try:
-            with server.labels.read_session() as session:
+            with self._request_labels().read_session() as session:
                 if server.entry_projection:
                     located.entry = server.entry_projection((located.entry,), session)[0]
                     labels = dict(located.entry.confirmed_values or ())
@@ -841,11 +959,12 @@ class WebUIRequestHandler(BaseHTTPRequestHandler):
                         return
                     result = server.reader.translate(located.entry)
                     result["poll_url"] = "/translation?key=" + result.get("key", "")
+                    result["stream_url"] = "/translation-stream?key=" + result.get("key", "")
                     self._send_json(HTTPStatus.ACCEPTED if result["status"] == "running" else HTTPStatus.OK, result)
                     return
                 body = server.reader.document(located.entry)
                 document = render_article_page(
-                    located.entry, labels=labels, actor=server.actor,
+                    located.entry, labels=labels, actor=self._request_actor(),
                     industries=tuple(server.industry_provider()), back_to=back_to,
                     body_html=server.reader.render(body), native_chinese=body.native_chinese,
                     body_note=body.note,
@@ -893,6 +1012,57 @@ class WebUIRequestHandler(BaseHTTPRequestHandler):
         except (_FormRejected, ValueError) as exc:
             self._send_json(HTTPStatus.BAD_REQUEST, {"status": "error", "message": str(exc)})
 
+    def _translation_stream(self, query_string: str) -> None:
+        try:
+            params = parse_qs(query_string, keep_blank_values=True)
+            if set(params) != {"key"}:
+                raise ValueError("翻译查询参数非法")
+            key = _require_query_text(params, "key", max_length=64)
+            if self.server.reader is None:
+                raise ValueError("尚未配置阅读服务")
+            result = self.server.reader.translation_status(key)
+        except (_FormRejected, ValueError) as exc:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"status": "error", "message": str(exc)})
+            return
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache, no-transform")
+        self.send_header("X-Accel-Buffering", "no")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Connection", "close")
+        if getattr(self, "_session_cookie", None):
+            self.send_header("Set-Cookie", self._session_cookie)
+        self.end_headers()
+        self.close_connection = True
+        try:
+            # Bound the connection; clients can resume or fall back to polling.
+            sent_revision = None
+            sent_document = False
+            sent_nodes: dict[str, str] = {}
+            for _ in range(120):
+                revision = result.get("revision", 0)
+                if sent_revision != revision:
+                    payload = dict(result)
+                    nodes = payload.pop("translated_nodes", {})
+                    if payload.get("html") and not sent_document:
+                        sent_document = True
+                    else:
+                        payload.pop("html", None)
+                        payload["patches"] = {key: value for key, value in nodes.items() if sent_nodes.get(key) != value}
+                    sent_nodes = dict(nodes)
+                    self.wfile.write(("event: update\ndata: " + json.dumps(payload, ensure_ascii=False) + "\n\n").encode("utf-8"))
+                    self.wfile.flush()
+                    sent_revision = revision
+                if result.get("status") != "running":
+                    return
+                result = self.server.reader.wait_for_translation(key, revision, timeout=15)
+                if result.get("revision", 0) == revision:
+                    self.wfile.write(b": keep-alive\n\n")
+                    self.wfile.flush()
+        except OSError:
+            # A disconnected reader does not cancel the shared translation job.
+            _log.debug("翻译 SSE 连接已断开")
+
     # -- POST /label --------------------------------------------------------
     def _submit_label(self) -> None:
         server = self.server
@@ -909,7 +1079,7 @@ class WebUIRequestHandler(BaseHTTPRequestHandler):
             label_value = _require_text(
                 fields, "label_value", max_length=MAX_LABEL_VALUE_LENGTH
             )
-            actor = _require_text(fields, "actor", max_length=MAX_ACTOR_LENGTH)
+            actor = self._request_actor() if server.users is not None else _require_text(fields, "actor", max_length=MAX_ACTOR_LENGTH)
             return_to = _optional_text(fields, "return_to") or DEFAULT_RETURN_TO
             _validate_label(label_key, label_value, server.industry_provider())
             _validate_return_to(return_to)
@@ -973,7 +1143,7 @@ class WebUIRequestHandler(BaseHTTPRequestHandler):
         )
         if self._label_json_requested():
             try:
-                with server.labels.read_session() as session:
+                with self._request_labels().read_session() as session:
                     values = session.values_for_anchor(raw_id, anchor)
             except Exception:  # noqa: BLE001 - 写入成功不等于回读成功
                 _log.exception("标签已保存，但读取最新状态失败")
@@ -1070,8 +1240,10 @@ class WebUIRequestHandler(BaseHTTPRequestHandler):
             char_end=char_end,
         )
 
-    def _parse_form(self) -> Dict[str, str]:
+    def _parse_form(self, *, allowed_fields: frozenset[str] = FORM_FIELDS) -> Dict[str, str]:
         """读并校验表单体：类型 / 长度 / 字段白名单 / 单值。"""
+        if self.headers.get("Transfer-Encoding"):
+            raise _FormRejected(HTTPStatus.BAD_REQUEST, "请求编码非法", "不支持 Transfer-Encoding")
         media = self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
         if media != "application/x-www-form-urlencoded":
             raise _FormRejected(
@@ -1114,12 +1286,12 @@ class WebUIRequestHandler(BaseHTTPRequestHandler):
             ) from exc
 
         params = parse_qs(text, keep_blank_values=True)
-        unknown = sorted(set(params) - FORM_FIELDS)
+        unknown = sorted(set(params) - allowed_fields)
         if unknown:
             raise _FormRejected(
                 HTTPStatus.BAD_REQUEST,
                 "未知表单字段",
-                f"收到 {unknown}；允许：{sorted(FORM_FIELDS)}",
+                f"收到 {unknown}；允许：{sorted(allowed_fields)}",
             )
         duplicated = sorted(name for name, values in params.items() if len(values) > 1)
         if duplicated:
@@ -1139,6 +1311,9 @@ class WebUIRequestHandler(BaseHTTPRequestHandler):
         extra_headers: Mapping[str, str] | None = None,
         close: bool = False,
     ) -> None:
+        if self.server.users is not None and getattr(self, "_session_cookie", None):
+            user_id = self.current_user_id
+            document = document.replace("</head>", f'<meta name="atlas-user-id" content="{user_id}"></head>', 1)
         self._send_bytes(
             status,
             document.encode("utf-8"),
@@ -1178,7 +1353,7 @@ class WebUIRequestHandler(BaseHTTPRequestHandler):
                 close=close,
             )
             return
-        if self._label_json_requested() or urlsplit(self.path).path in ("/translate", "/translation"):
+        if self._label_json_requested() or urlsplit(self.path).path in ("/translate", "/translation", "/translation-stream"):
             self._send_json(
                 status, {"error": title, "message": message},
                 extra_headers=extra_headers, close=close,
@@ -1215,12 +1390,26 @@ class WebUIRequestHandler(BaseHTTPRequestHandler):
         if close:
             self.send_header("Connection", "close")
             self.close_connection = True
+        if getattr(self, "_session_cookie", None) and not any(key.lower() == "set-cookie" for key in (extra_headers or {})):
+            self.send_header("Set-Cookie", self._session_cookie)
         for key, value in (extra_headers or {}).items():
             if key.lower() != "cache-control":
                 self.send_header(key, value)
         self.end_headers()
         if body and self.command != "HEAD":
             self.wfile.write(body)
+
+
+def _safe_login_return(value: str) -> str:
+    if not value.isascii() or any(ord(c) < 32 or ord(c) == 127 for c in value):
+        return "/feed"
+    try:
+        parts = urlsplit(value)
+    except ValueError:
+        return "/feed"
+    if parts.scheme or parts.netloc or parts.fragment or parts.path not in ("/", "/feed", "/entry", "/article") or not value.startswith("/"):
+        return "/feed"
+    return value
 
 
 def _require_text(fields: Mapping[str, str], name: str, *, max_length: int) -> str:
@@ -1518,6 +1707,7 @@ class WebUIHTTPServer(ThreadingHTTPServer):
         entry_projection: Any = None,
         reader: Any = None,
         events: Any = None,
+        users: UserStore | None = None,
     ) -> None:
         self._source = source
         self.labels = labels
@@ -1532,6 +1722,7 @@ class WebUIHTTPServer(ThreadingHTTPServer):
         self.entry_projection = entry_projection
         self.reader = reader
         self.events = events
+        self.users = users
         super().__init__(server_address, WebUIRequestHandler)
 
     def resolve_source(self) -> Any:
@@ -1609,6 +1800,7 @@ class WebUIApplication:
         entry_projection: Any = None,
         reader: Any = None,
         events: Any = None,
+        users: UserStore | None = None,
         on_close: Optional[Callable[[], None]] = None,
         host: str = "127.0.0.1",
         port: int = 0,
@@ -1628,6 +1820,7 @@ class WebUIApplication:
             entry_projection=entry_projection,
             reader=reader,
             events=events,
+            users=users,
         )
         self._thread = threading.Thread(
             target=self._serve, name="atlas-webui-http", daemon=True

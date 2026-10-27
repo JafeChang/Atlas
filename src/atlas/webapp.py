@@ -398,6 +398,7 @@ def build_webapp(
     host: str = "127.0.0.1",
     port: int = 0,
     initialize_labels: bool = True,
+    require_login: bool = True,
     cache_root: Any = None,
     image_cache: Any = None,
     translation_client_factory: Any = None,
@@ -410,6 +411,7 @@ def build_webapp(
         industry_provider: 零参可调用对象，返回当前启用的行业 id
             （生产上接 `atlas.registry.RegistryService.label_space`，C8 闭环）。
         industry_of: 渠道 → 行业（`dict` 或可调用对象），喂给 feed 的筛选维度。
+        require_login: 是否要求名字登录；仅嵌入或测试时可显式关闭。
         initialize_labels: 是否在建服务前初始化标签库（建表 + 触发器，归 T-108）。
             默认 `True`（部署入口的语义）；**只想浏览、不想在磁盘上留下任何东西时
             传 `False`**（此时标签库文件不会被创建）。
@@ -540,9 +542,12 @@ def build_webapp(
         reader.close()
         archive.close()
 
+    from atlas.users import UserStore
+
     return WebUIApplication(
         source,
         labels=labels,
+        users=UserStore(Path(db_path).with_name("users.db")) if require_login else None,
         events=EventStore(Path(db_path).with_name("analytics.db")),
         industry_provider=industry_provider,
         raw_exists=raw_exists_from_source(source),
@@ -699,7 +704,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--actor",
         default=DEFAULT_ACTOR,
-        help="打标判断的署名（写进 ConfirmedLabel.actor；默认 %(default)s）",
+        help="历史标签的默认署名及配置作者（默认 %(default)s）；新标签使用登录名字",
     )
     return parser
 
@@ -719,8 +724,8 @@ def render_startup(
             f"  可浏览条目：{summary.entries} 条"
             f"（容器派生 {summary.derived_entries} + 直接 {summary.direct_entries}）"
         ),
-        f"  打标署名（actor）：{actor}（标签展示与已打标筛选仅使用此署名的判断）",
-        f"  Ctrl-C 退出（默认只监听 {host}，本机可见；服务无认证）",
+        f"  登录后按名字区分标签；已有标签的署名为 {actor}",
+        f"  Ctrl-C 退出（默认只监听 {host}，本机可见；仅名字登录，没有认证身份）",
     ]
     if port == 0:
         lines.insert(1, "  （--port 0 ⇒ 端口由内核分配，上面的 URL 是实际端口）")

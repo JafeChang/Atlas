@@ -72,6 +72,7 @@ def test_gate_filters_before_pagination_and_never_rewrites_raw_or_labels(tmp_pat
     store.close()
     app = build_webapp(
         root,
+        require_login=False,
         db_path=db_path,
         industry_provider=lambda: ("ai",),
         industry_of={"feed": "ai"},

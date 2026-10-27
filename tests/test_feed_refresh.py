@@ -177,6 +177,7 @@ def test_registered_subscription_error_is_not_an_article_and_true_article_surviv
         assert not access.entries_of(direct).unavailable_reason
     app = build_webapp(
         root,
+        require_login=False,
         db_path=root / "atlas.db",
         industry_provider=lambda: ("ai",),
         industry_of={"feed": "ai", "broken": "ai"},

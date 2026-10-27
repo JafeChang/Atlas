@@ -57,7 +57,7 @@ def test_ai_admission_tags_persist_and_filter(tmp_path, monkeypatch):
     store.close()
     assert read_admissions(root / 'atlas.db').reviews[source.key].tags == ('科技', '严肃内容')
     from atlas.webapp import build_webapp
-    app = build_webapp(root, db_path=root / 'atlas.db', industry_provider=lambda: ('ai',), industry_of={'feed': 'ai'})
+    app = build_webapp(root, require_login=False, db_path=root / 'atlas.db', industry_provider=lambda: ('ai',), industry_of={'feed': 'ai'})
     try:
         status, page, _ = _get(app, '/feed?tag=' + quote('严肃内容'))
         assert status == 200 and 'Article One' in page and '科技' in page

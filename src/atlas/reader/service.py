@@ -36,6 +36,10 @@ class ReaderService:
             )
         return result
 
+    def wait_for_translation(self, key, revision, timeout=15):
+        self.translations.wait_for_change(key, revision, timeout)
+        return self.translation_status(key)
+
     def translate(self, entry):
         document = self.document(entry)
         if not document.html.strip():
