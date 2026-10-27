@@ -1,5 +1,7 @@
 import fcntl
 import hashlib
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 from bs4 import BeautifulSoup
@@ -8,6 +10,7 @@ from atlas.archive import ArticleContentStore, open_archive
 from atlas.briefs_cli import main
 from atlas.cognition import ArticleBrief, BriefClient, BriefStore, read_articles
 from atlas.contracts import RawRecord
+from atlas.feed import ArchiveFeedSource, FeedQuery, run_query
 from atlas.registry import (
     Channel,
     FetchSpec,
@@ -36,6 +39,65 @@ def put(root, title="Article One", url="https://example.test/one"):
     with open_archive(root) as archive:
         archive.put(r, payload)
     return r
+
+
+def test_analysis_cache_reuses_recent_records_and_evicts_only_oldest(tmp_path, monkeypatch):
+    root = tmp_path / "store"
+    records = [put(root, f"Article {i}", f"https://example.test/{i}") for i in range(3)]
+    with open_archive(root) as archive:
+        access = ArchiveEntriesAccess(archive, cache_size=2)
+        calls = Counter()
+        original = access.content
+
+        def counted(raw_id):
+            calls[raw_id] += 1
+            return original(raw_id)
+
+        monkeypatch.setattr(access, "content", counted)
+        first = access.brief_sources(records[0].raw_id)
+        access.brief_sources(records[1].raw_id)
+        assert access.brief_sources(records[0].raw_id) == first
+        access.brief_sources(records[2].raw_id)
+        assert access.brief_sources(records[0].raw_id) == first
+        assert calls == {records[0].raw_id: 1, records[1].raw_id: 1, records[2].raw_id: 1}
+        access.brief_sources(records[1].raw_id)
+        assert calls[records[1].raw_id] == 2
+
+
+def test_analysis_cache_is_safe_for_concurrent_requests(tmp_path):
+    root = tmp_path / "store"
+    records = [put(root, f"Article {i}", f"https://example.test/{i}") for i in range(6)]
+    with open_archive(root) as archive:
+        access = ArchiveEntriesAccess(archive, cache_size=2)
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            results = list(pool.map(lambda record: access.brief_sources(record.raw_id), records * 8))
+        assert all(len(result) == 1 for result in results)
+        assert len(access._cache) <= 2
+        assert set(access._brief_sources) <= set(access._cache)
+
+
+def test_source_filter_precedes_expensive_archive_record_classification(tmp_path):
+    root = tmp_path / "store"
+    first = put(root)
+    payload = b"Another article"
+    second = RawRecord.create(channel_id="other", endpoint="https://example.test/other", content=payload, http_status=200)
+    with open_archive(root) as archive:
+        archive.put(second, payload)
+        access = ArchiveEntriesAccess(archive)
+        classified = []
+
+        def kind(raw_id):
+            classified.append(raw_id)
+            return "feed" if access.is_container(raw_id) else None
+
+        source = ArchiveFeedSource(archive, entry_kind_of=kind)
+        result = run_query(source, FeedQuery(channels=("feed",), granularity="entry"), entries_of=access.entries_of)
+        assert [entry.title for entry in result.items] == ["Article One"]
+        assert result.channels == ("feed", "other")
+        assert classified == [first.raw_id]
+        all_results = run_query(source, FeedQuery(granularity="entry"), entries_of=access.entries_of)
+        assert len(all_results.items) == 2
+        assert second.raw_id in classified
 
 
 def install_fake_model(monkeypatch, calls):

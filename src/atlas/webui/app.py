@@ -96,6 +96,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Mapping, Optional, Protocol, Sequence
 from urllib.parse import parse_qs, urlsplit
 
+from atlas.analytics import EventStore, validate_event
 from atlas.contracts import ConfirmedLabel, content_sha256
 from atlas.contracts.anchors import EvidenceAnchor
 from atlas.feed import (
@@ -582,6 +583,9 @@ class WebUIRequestHandler(BaseHTTPRequestHandler):
         if path == "/translate":
             self._reject_method(allow="POST", detail="翻译由点击中文 tab 后显式触发")
             return
+        if path == "/events":
+            self._reject_method(allow="POST", detail="行为上报只接受 POST")
+            return
         if path == "/label":
             self._reject_method(allow="POST", detail="打标是写操作，只接受 POST")
             return
@@ -590,6 +594,9 @@ class WebUIRequestHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802
         target = urlsplit(self.path)
         path = _normalize_path(target.path)
+        if path == "/events":
+            self._submit_event()
+            return
         if path == "/label":
             self._submit_label()
             return
@@ -609,6 +616,42 @@ class WebUIRequestHandler(BaseHTTPRequestHandler):
             self._reject_method(allow="GET", detail="feed / 条目页是只读投影，只接受 GET")
             return
         self._not_found(path)
+
+    def _submit_event(self) -> None:
+        origin = self.headers.get("Origin")
+        if self.headers.get("Sec-Fetch-Site") == "cross-site" or (
+            origin and urlsplit(origin).netloc != self.headers.get("Host")
+        ):
+            self._send_json(HTTPStatus.FORBIDDEN, {"error": "cross-origin request"}, close=True)
+            return
+        if self.headers.get("Transfer-Encoding"):
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid encoding"}, close=True)
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            length = 0
+        if not 0 < length <= 16384:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid body length"}, close=True)
+            return
+        if self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower() != "application/json":
+            self._send_json(HTTPStatus.UNSUPPORTED_MEDIA_TYPE, {"error": "expected JSON"}, close=True)
+            return
+        try:
+            event = validate_event(json.loads(self.rfile.read(length).decode("utf-8")))
+        except (ValueError, UnicodeDecodeError):
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid event"})
+            return
+        if self.server.events is None:
+            self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "event store unavailable"})
+            return
+        try:
+            self.server.events.append_event(event)
+        except Exception:  # noqa: BLE001 - request fails visibly and logs the storage error
+            _log.exception("行为事件写入失败")
+            self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "event storage failed"})
+            return
+        self._send_json(HTTPStatus.OK, {"status": "ok"})
 
     def do_PUT(self) -> None:  # noqa: N802
         self._reject_method(allow=", ".join(_ALLOWED_METHODS), detail="不支持该方法")
@@ -691,8 +734,11 @@ class WebUIRequestHandler(BaseHTTPRequestHandler):
         调用方显式传了 `granularity` 就尊重它（否则传 `document` 会被静默改写，
         那种"看着接受了其实没用"正是要避免的）；缺省时用条目粒度。
         """
-        if "tag" in params and not any(value.strip() for value in params["tag"]):
+        if "tag" in params:
+            tags = [value for value in params["tag"] if value.strip()]
             params = {key: value for key, value in params.items() if key != "tag"}
+            if tags:
+                params["tag"] = tags
         if "granularity" not in params:
             params = {**params, "granularity": [ENTRY_GRANULARITY]}
         return FeedQuery.from_params(params)
@@ -1470,6 +1516,7 @@ class WebUIHTTPServer(ThreadingHTTPServer):
         text_length: Any = None,
         entry_projection: Any = None,
         reader: Any = None,
+        events: Any = None,
     ) -> None:
         self._source = source
         self.labels = labels
@@ -1483,6 +1530,7 @@ class WebUIHTTPServer(ThreadingHTTPServer):
         self.text_length = text_length or _default_text_length
         self.entry_projection = entry_projection
         self.reader = reader
+        self.events = events
         super().__init__(server_address, WebUIRequestHandler)
 
     def resolve_source(self) -> Any:
@@ -1559,6 +1607,7 @@ class WebUIApplication:
         text_length: Any = None,
         entry_projection: Any = None,
         reader: Any = None,
+        events: Any = None,
         on_close: Optional[Callable[[], None]] = None,
         host: str = "127.0.0.1",
         port: int = 0,
@@ -1577,6 +1626,7 @@ class WebUIApplication:
             text_length=text_length,
             entry_projection=entry_projection,
             reader=reader,
+            events=events,
         )
         self._thread = threading.Thread(
             target=self._serve, name="atlas-webui-http", daemon=True
@@ -1663,6 +1713,7 @@ def build_application(
     return WebUIApplication(
         source,
         labels=labels,
+        events=EventStore(Path(db_path).with_name("analytics.db")),
         industry_provider=industry_provider,
         raw_exists=raw_exists,
         actor=actor,

@@ -119,10 +119,12 @@ def article_url(entry: FeedEntry, *, back_to: str = "/feed") -> str:
 # ---------------------------------------------------------------------- #
 # 查询串（分页与「返回本页」用）
 # ---------------------------------------------------------------------- #
-def feed_query_string(query: FeedQuery, *, offset: int = 0, labeled: Any = _KEEP) -> str:
+def feed_query_string(
+    query: FeedQuery, *, offset: int = 0, labeled: Any = _KEEP, channels: Any = _KEEP
+) -> str:
     """把 `FeedQuery` 投影回 URL 查询串（**只做投影**，筛选/排序语义仍归 `atlas.feed`）。
 
-    `labeled` 用于「全部 / 已打标 / 未打标」的快捷切换；不传时沿用查询自身的值。
+    `labeled` 和 `channels` 用于快捷切换；不传时沿用查询自身的值。
     """
     params: list[tuple[str, str]] = [
         ("order", query.order),
@@ -136,8 +138,10 @@ def feed_query_string(query: FeedQuery, *, offset: int = 0, labeled: Any = _KEEP
         params.append(("tag", tag))
     for industry in query.industries:
         params.append(("industry", industry))
-    for channel in query.channels:
+    for channel in query.channels if channels is _KEEP else channels:
         params.append(("channel", channel))
+    if query.granularity == "document":
+        params.append(("granularity", query.granularity))
     if query.labels:
         params.append(("labels", ",".join(query.labels)))
     if query.since is not None:
@@ -189,6 +193,13 @@ code, .raw-id { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; fon
 .quick > span { display: none; }
 .quick a { text-decoration: none; border-radius: 9px; min-height: 44px; padding: 0.5rem 0.85rem; }
 .quick a[aria-current=page] { background: var(--accent); color: #fff; }
+.source-tabs { display: flex; flex-wrap: wrap; gap: 0.35rem; margin: 0 0 1rem;
+               padding-bottom: 0.5rem; border-bottom: 1px solid var(--border); }
+.source-tabs a { display: inline-flex; align-items: center; min-height: 44px; max-width: 100%;
+                 padding: 0.5rem 0.85rem; border-radius: 8px; text-decoration: none;
+                 overflow-wrap: anywhere; }
+.source-tabs a[aria-current=page] { color: var(--accent); background: var(--tint);
+                                  box-shadow: inset 0 -2px var(--accent); font-weight: 650; }
 .item { position: relative; border: 1px solid var(--border); border-radius: 14px; padding: 1rem;
         margin: 0.8rem 0; background: var(--surface); }
 .item[data-detail-url] { cursor: pointer; }
@@ -499,6 +510,8 @@ if (tabs) {
 }
 </script>"""
 
+from atlas.analytics.tracking import TRACKING_SCRIPT
+
 _SHELL = Template(
     """<!DOCTYPE html>
 <html lang="zh-CN">
@@ -511,6 +524,7 @@ _SHELL = Template(
 <body>
 <h1>$heading</h1>
 $body
+$tracking
 <footer>Atlas · 个人信息流</footer>
 </body>
 </html>
@@ -555,7 +569,7 @@ $anchor_fields$select
 
 def _shell(*, title: str, heading: str, body: str) -> str:
     return _SHELL.substitute(
-        title=escape(title), heading=escape(heading), style=_STYLE, body=body
+        title=escape(title), heading=escape(heading), style=_STYLE, body=body, tracking=TRACKING_SCRIPT
     )
 
 
@@ -585,6 +599,7 @@ def render_feed_page(
     """
     page_url = return_to or feed_query_string(result.query, offset=result.offset)
     parts: list[str] = [
+        _render_source_tabs(result.query, result.channels),
         _render_filters(result.query, industries),
         _render_quick_switches(result.query),
         _render_pager(result),
@@ -631,10 +646,28 @@ def render_feed_page(
 def _render_filters(query: FeedQuery, industries: Sequence[str]) -> str:
     desc = " selected" if query.order == "desc" else ""
     asc = " selected" if query.order == "asc" else ""
+    preserved = [("channel", value) for value in query.channels]
+    preserved += [("industry", value) for value in query.industries]
+    preserved += [("tag", value) for value in query.tags[1:]]
+    if query.labels:
+        preserved.append(("labels", ",".join(query.labels)))
+    if query.labeled is not None:
+        preserved.append(("labeled", "true" if query.labeled else "false"))
+    if query.since is not None:
+        preserved.append(("since", query.since.isoformat()))
+    if query.until is not None:
+        preserved.append(("until", query.until.isoformat()))
+    if query.granularity == "document":
+        preserved.append(("granularity", query.granularity))
+    hidden = "".join(
+        f'<input type="hidden" name="{escape(name)}" value="{escape(value)}">'
+        for name, value in preserved
+    )
     return (
         '<details class="filter-panel"><summary>筛选与排序</summary>'
         '<form class="filters" method="get" action="/feed">'
-        '<label>标签'
+        + hidden
+        + '<label>标签'
         f'<input type="text" name="tag" value="{escape(query.tags[0] if query.tags else "")}" placeholder="输入标签筛选">'
         "</label>"
         "<label>排序"
@@ -648,6 +681,22 @@ def _render_filters(query: FeedQuery, industries: Sequence[str]) -> str:
         '<input type="hidden" name="offset" value="0">'
         '<button type="submit">筛选</button>'
         "</form></details>"
+    )
+
+
+def _render_source_tabs(query: FeedQuery, channels: Sequence[str]) -> str:
+    def link(label: str, selected_channels: tuple[str, ...]) -> str:
+        href = feed_query_string(query, offset=0, channels=selected_channels)
+        current = ' aria-current="page"' if query.channels == selected_channels else ''
+        return f'<a href="{escape(href)}"{current}>{escape(label)}</a>'
+
+    # 显式查询不存在的渠道时也保留当前选择，避免页面没有选中状态。
+    available = sorted(set(channels) | set(query.channels))
+    return (
+        '<nav class="source-tabs" aria-label="来源">'
+        + link("全部来源", ())
+        + "".join(link(channel, (channel,)) for channel in available)
+        + '</nav>'
     )
 
 
@@ -744,6 +793,16 @@ def _tag_editor(item: Any, labels: Mapping[str, str], industries: Sequence[str],
             + _industry_action(item, labels, industries, actor, return_to) + '</details>')
 
 
+def _tracking_identity(item: Any) -> str:
+    fields = {
+        "raw-id": item.raw_id, "entry-id": getattr(item, "entry_id", None),
+        "raw-sha256": getattr(item, "raw_sha256", None),
+        "char-start": getattr(item, "char_start", None),
+        "char-end": getattr(item, "char_end", None), "channel-id": item.channel_id,
+    }
+    return " ".join(f'data-{key}="{escape(value)}"' for key, value in fields.items() if value is not None and value != "")
+
+
 def _render_entry(
     entry: FeedEntry,
     labels: Mapping[str, str],
@@ -769,7 +828,7 @@ def _render_entry(
         f'<p class="problem">条目层问题：{escape(text)}</p>' for text in entry.problems
     )
     return (
-        f'<article class="item entry" id="item-{escape(entry.raw_id)}" data-detail-url="{escape(article_url(entry, back_to=return_to))}">'
+        f'<article class="item entry" id="item-{escape(entry.raw_id)}" data-detail-url="{escape(article_url(entry, back_to=return_to))}" data-tracking-list-item {_tracking_identity(entry)}>'
         '<div class="head">'
         f'<a class="title" href="{escape(article_url(entry, back_to=return_to))}">'
         f"{escape(entry.title)}</a>"
@@ -847,7 +906,7 @@ def render_entry_page(
         body = f'<blockquote class="entry-slice">{escape(content)}</blockquote>'
 
     parts = [
-        '<div class="notice">'
+        f'<div class="notice" data-tracking-detail {_tracking_identity(entry)}>'
         f'<p><strong>{escape(entry.title)}</strong></p>'
         f'<p><a href="{_safe_href(link)}" rel="noreferrer noopener">{escape(link)}</a></p>'
         f'<p class="meta">时间 {escape(entry.timestamp.isoformat())} · '
@@ -901,7 +960,7 @@ def render_article_page(
         original += '<div id="body-chinese" role="tabpanel" aria-labelledby="tab-chinese" tabindex="0" lang="zh-CN" hidden></div>'
     body = (
         f'<nav class="pager"><a href="{escape(back_to)}">返回信息流</a></nav>'
-        f'<article class="item article-detail" id="item-{escape(entry.raw_id)}">'
+        f'<article class="item article-detail" id="item-{escape(entry.raw_id)}" data-tracking-detail {_tracking_identity(entry)}>'
         + _menu_button()
         + f'<h2 class="article-title">{escape(entry.title)}</h2>'
         + (f'<p class="title-zh" lang="zh-CN">{escape(entry.title_zh)}</p>' if entry.title_zh else '')
@@ -945,7 +1004,7 @@ def _render_item(
 ) -> str:
     status = "" if item.http_status is None else f" · HTTP {item.http_status}"
     return (
-        f'<article class="item" id="item-{escape(item.raw_id)}">'
+        f'<article class="item" id="item-{escape(item.raw_id)}" data-tracking-list-item {_tracking_identity(item)}>'
         '<div class="head">'
         f'<code class="raw-id">{escape(item.raw_id)}</code>'
         "</div>"

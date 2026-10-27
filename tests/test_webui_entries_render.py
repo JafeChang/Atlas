@@ -27,6 +27,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from contextlib import contextmanager
+from html.parser import HTMLParser
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Dict, Iterator, Tuple
@@ -153,6 +154,68 @@ def _get(app, path: str) -> Tuple[int, str, Dict[str, str]]:
             return response.status, response.read().decode("utf-8"), dict(response.headers)
     except urllib.error.HTTPError as exc:
         return exc.code, exc.read().decode("utf-8"), dict(exc.headers)
+
+
+class _SourceTabs(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.in_tabs = False
+        self.links = []
+        self.current = None
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        if tag == "nav" and attrs.get("class") == "source-tabs":
+            self.in_tabs = True
+        elif self.in_tabs and tag == "a":
+            self.current = [attrs, ""]
+
+    def handle_data(self, data):
+        if self.current is not None:
+            self.current[1] += data
+
+    def handle_endtag(self, tag):
+        if tag == "a" and self.current is not None:
+            self.links.append(self.current)
+            self.current = None
+        elif tag == "nav" and self.in_tabs:
+            self.in_tabs = False
+
+
+def test_source_tabs_filter_across_pages_and_preserve_other_filters(tmp_path: Path) -> None:
+    with running_frontend(tmp_path) as world:
+        status, page, _ = _get(world.app, "/feed?order=asc&limit=1&offset=1&labeled=false")
+        assert status == 200
+        tabs = _SourceTabs()
+        tabs.feed(page)
+        assert [label for _, label in tabs.links] == ["全部来源", "chan-article", "chan-feed"]
+        assert tabs.links[0][0]["aria-current"] == "page"
+
+        href = tabs.links[2][0]["href"]
+        params = urllib.parse.parse_qs(urllib.parse.urlsplit(href).query)
+        assert params == {"order": ["asc"], "limit": ["1"], "offset": ["0"],
+                          "labeled": ["false"], "channel": ["chan-feed"]}
+        status, filtered, _ = _get(world.app, href)
+        assert status == 200
+        assert 'class="count">共 3 条' in filtered
+        assert "Gamma Report" not in filtered  # 限制每页一条
+        assert 'value="chan-feed"' in filtered  # 提交筛选表单时保留来源
+        assert 'value="false"' in filtered
+        selected = _SourceTabs()
+        selected.feed(filtered)
+        assert [label for attrs, label in selected.links if attrs.get("aria-current") == "page"] == ["chan-feed"]
+        assert "chan-article" in [label for _, label in selected.links]
+
+        status, article_page, _ = _get(world.app, selected.links[1][0]["href"])
+        assert status == 200
+        assert 'class="count">共 1 条' in article_page
+        assert "Gamma Report" not in article_page
+
+        status, empty, _ = _get(world.app, "/feed?channel=missing")
+        assert status == 200
+        missing = _SourceTabs()
+        missing.feed(empty)
+        assert [label for attrs, label in missing.links if attrs.get("aria-current") == "page"] == ["missing"]
 
 
 def _post(app, fields: Dict[str, str]) -> Tuple[int, str, Dict[str, str]]:

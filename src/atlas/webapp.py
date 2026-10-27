@@ -79,6 +79,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Sequence, Tuple
 
+from atlas.analytics import EventStore
 from atlas.archive import (
     ArchiveStore,
     enable_wal,
@@ -181,11 +182,14 @@ class ArchiveEntriesAccess:
     解析结果按 `raw_id` 缓存（同一进程内重复请求同一份 feed 不重复解析）。
     """
 
-    def __init__(self, archive: ArchiveStore, *, cache_size: int = 32) -> None:
+    def __init__(self, archive: ArchiveStore, *, cache_size: int = 256) -> None:
+        if cache_size < 1:
+            raise ValueError("cache_size 必须大于 0")
         self._archive = archive
         self._cache_size = cache_size
         self._cache: Dict[str, _Analysis] = {}
         self._brief_sources: Dict[str, Dict[tuple[int, int], BriefSource]] = {}
+        self._cache_lock = threading.RLock()
         self._subscription_sources = read_subscription_sources(archive.db_path)
 
     # -- 基础 -----------------------------------------------------------------
@@ -193,9 +197,11 @@ class ArchiveEntriesAccess:
         return self._archive.get_content(raw_id)
 
     def _analyse(self, record: RawRecord) -> _Analysis:
-        cached = self._cache.get(record.raw_id)
-        if cached is not None:
-            return cached
+        with self._cache_lock:
+            cached = self._cache.get(record.raw_id)
+            if cached is not None:
+                self._cache[record.raw_id] = self._cache.pop(record.raw_id)
+                return cached
 
         raw_bytes = self.content(record.raw_id)
         text = decode_bytes(raw_bytes)[0]
@@ -213,11 +219,18 @@ class ArchiveEntriesAccess:
         else:
             analysis = self._analyse_xml(record, raw_bytes)
 
-        if len(self._cache) >= self._cache_size:
-            self._cache.clear()
-            self._brief_sources.clear()
-        self._cache[record.raw_id] = analysis
-        return analysis
+        with self._cache_lock:
+            # 并发请求可能在解析期间已放入同一份不可变原文。
+            cached = self._cache.get(record.raw_id)
+            if cached is not None:
+                self._cache[record.raw_id] = self._cache.pop(record.raw_id)
+                return cached
+            while len(self._cache) >= self._cache_size:
+                evicted = next(iter(self._cache))
+                del self._cache[evicted]
+                self._brief_sources.pop(evicted, None)
+            self._cache[record.raw_id] = analysis
+            return analysis
 
     def _analyse_xml(self, record: RawRecord, raw_bytes: bytes) -> _Analysis:
         try:
@@ -267,8 +280,10 @@ class ArchiveEntriesAccess:
 
     def brief_sources(self, raw_id: str) -> Dict[tuple[int, int], BriefSource]:
         """简介的标题 / 正文来源；和文章区间对应，绝不把 JSON 元数据当成正文。"""
-        if raw_id in self._brief_sources:
-            return self._brief_sources[raw_id]
+        with self._cache_lock:
+            if raw_id in self._brief_sources:
+                self._cache[raw_id] = self._cache.pop(raw_id)
+                return self._brief_sources[raw_id]
         record = self._archive.get(raw_id)
         analysis = self._analyse(record)
         sources = {}
@@ -287,7 +302,10 @@ class ArchiveEntriesAccess:
                 sources[(0, max(1, analysis.text_length))] = brief_source(
                     title_from_endpoint(record.endpoint), text, kind="excerpt", url=record.endpoint,
                 )
-        self._brief_sources[raw_id] = sources
+        with self._cache_lock:
+            # 计算期间若另一请求淘汰了原文，不留下无界的孤立缓存。
+            if raw_id in self._cache:
+                self._brief_sources[raw_id] = sources
         return sources
 
     # -- 容器分类 -----------------------------------------------------------
@@ -439,8 +457,11 @@ def build_webapp(
         bodies = read_article_contents(db_path)
         articles = {v.raw_id: v for v in views.values() if v.unit_kind == "article"}
         projected = []
+        sources_by_raw: dict[str, dict[tuple[int, int], BriefSource]] = {}
         for entry in entries:
-            summary_source = access.brief_sources(entry.raw_id).get((entry.char_start, entry.char_end))
+            if entry.raw_id not in sources_by_raw:
+                sources_by_raw[entry.raw_id] = access.brief_sources(entry.raw_id)
+            summary_source = sources_by_raw[entry.raw_id].get((entry.char_start, entry.char_end))
             summary, summary_origin = display_brief(summary_source, briefs) if summary_source else ("", "")
             article = briefs.get(summary_source.key) if summary_source else None
             title_zh = article.title_zh if article and article.status == 'ready' and not summary_source.native_chinese else ''
@@ -522,6 +543,7 @@ def build_webapp(
     return WebUIApplication(
         source,
         labels=labels,
+        events=EventStore(Path(db_path).with_name("analytics.db")),
         industry_provider=industry_provider,
         raw_exists=raw_exists_from_source(source),
         actor=actor,

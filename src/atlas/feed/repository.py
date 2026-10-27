@@ -131,13 +131,20 @@ class ArchiveFeedSource:
         return self._archive
 
     def list_raw(self, limit: int, offset: int) -> Sequence[RawRecord]:
+        return [self.prepare_record(record) for record in self.list_raw_metadata(limit, offset)]
+
+    def list_raw_metadata(self, limit: int, offset: int) -> Sequence[RawRecord]:
+        """先读取元数据，允许查询筛选后再计算原文类型。"""
         if limit < 1:
             raise ValueError(f"limit 必须 ≥ 1（收到 {limit}）")
         if offset < 0:
             raise ValueError(f"offset 必须 ≥ 0（收到 {offset}）")
         raw_ids = self._archive.all_raw_ids()[offset : offset + limit]
-        records = [self._archive.get(raw_id) for raw_id in raw_ids]
-        return [_with_entry_kind(record, self._entry_kind_of) for record in records]
+        return [self._archive.get(raw_id) for raw_id in raw_ids]
+
+    def prepare_record(self, record: RawRecord) -> RawRecord:
+        """为通过元数据筛选的记录补齐原文类型。"""
+        return _with_entry_kind(record, self._entry_kind_of)
 
     def industry_of(self, channel_id: str) -> str | None:
         return self._industry_of(channel_id)

@@ -576,6 +576,8 @@ class FeedResult:
     has_more: bool
     next_offset: int | None
     notices: Tuple[str, ...] = ()
+    #: 本次扫描中出现的全部渠道，与筛选和分页无关，供浏览界面切换来源。
+    channels: tuple[str, ...] = ()
 
 
 def run_query(
@@ -612,7 +614,13 @@ def run_query(
     if query.tags and (not query.is_entry_mode or entry_projection is None):
         raise FeedQueryError("标签筛选需要文章级标签投影")
 
-    scanned = _scan_source(source)
+    # 归档源可把昂贵的原文类型识别延后到渠道等元数据筛选之后；
+    # 其他 FeedSource 仍按原契约读取已经准备好的记录。
+    list_metadata = getattr(source, "list_raw_metadata", None)
+    prepare_record = getattr(source, "prepare_record", None)
+    deferred = callable(list_metadata) and callable(prepare_record)
+    scanned = _scan_source(source, list_page=list_metadata if deferred else None)
+    channels = tuple(sorted({record.channel_id for record in scanned}))
     industries: Dict[str, str | None] = {}
     filtered: list[RawRecord] = []
     scan_query = replace(query, industries=(), labels=(), labeled=None) if query.is_entry_mode and entry_projection else query
@@ -621,16 +629,19 @@ def run_query(
         industries[record.raw_id] = industry
         if not _matches(record, scan_query, industry, label_lookup, wants_labels and scan_query is query):
             continue
-        filtered.append(record)
+        filtered.append(prepare_record(record) if deferred else record)
 
     if query.is_entry_mode:
-        return _run_entry_query(
-            filtered,
-            industries,
-            query,
-            label_lookup=label_lookup,
-            entries_of=entries_of,
-            entry_projection=entry_projection,
+        return replace(
+            _run_entry_query(
+                filtered,
+                industries,
+                query,
+                label_lookup=label_lookup,
+                entries_of=entries_of,
+                entry_projection=entry_projection,
+            ),
+            channels=channels,
         )
 
     ordered = _stable_order(filtered, query.order)
@@ -655,6 +666,7 @@ def run_query(
         offset=query.offset,
         has_more=has_more,
         next_offset=(query.offset + returned) if has_more else None,
+        channels=channels,
     )
 
 
@@ -899,12 +911,12 @@ def _stable_entry_order(entries: Sequence[FeedEntry], order: str) -> list[FeedEn
 # ---------------------------------------------------------------------- #
 
 
-def _scan_source(source: Any) -> list[RawRecord]:
+def _scan_source(source: Any, *, list_page: Any = None) -> list[RawRecord]:
     """按 `SOURCE_PAGE_SIZE` 分页拉完整个数据源（有硬上限保护）。"""
     collected: list[RawRecord] = []
     offset = 0
     while True:
-        page = list(source.list_raw(SOURCE_PAGE_SIZE, offset))
+        page = list((list_page or source.list_raw)(SOURCE_PAGE_SIZE, offset))
         if len(page) > SOURCE_PAGE_SIZE:
             raise SourceContractError(
                 f"数据源违反契约：请求 limit={SOURCE_PAGE_SIZE}，返回 {len(page)} 条"
