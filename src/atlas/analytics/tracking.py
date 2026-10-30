@@ -122,9 +122,18 @@ TRACKING_SCRIPT = r"""<script>
       const now = performance.now(), width = window.innerWidth, height = window.innerHeight;
       for (const card of visible) {
         const rect = card.getBoundingClientRect();
-        const area = Math.max(0, Math.min(rect.right, width) - Math.max(rect.left, 0)) *
-          Math.max(0, Math.min(rect.bottom, height) - Math.max(rect.top, 0));
-        const reference = Math.min(rect.width, width) * Math.min(rect.height, height);
+        const scrollport = card.closest('.feed-items');
+        const clip = scrollport ? scrollport.getBoundingClientRect() : {left: 0, top: 0, right: width, bottom: height};
+        const left = Math.max(0, clip.left), right = Math.min(width, clip.right);
+        let top = Math.max(0, clip.top);
+        const header = document.querySelector('.feed-header');
+        if (header && getComputedStyle(header).position === 'sticky') {
+          top = Math.max(top, header.getBoundingClientRect().bottom);
+        }
+        const bottom = Math.min(height, clip.bottom);
+        const area = Math.max(0, Math.min(rect.right, right) - Math.max(rect.left, left)) *
+          Math.max(0, Math.min(rect.bottom, bottom) - Math.max(rect.top, top));
+        const reference = Math.min(rect.width, Math.max(0, right - left)) * Math.min(rect.height, Math.max(0, bottom - top));
         if (reference <= 0 || area < reference * 0.5) { started.delete(card); continue; }
         if (!started.has(card)) started.set(card, now);
         else if (now - started.get(card) >= 1000) {

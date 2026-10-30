@@ -207,11 +207,17 @@ class ComposeDependencies:
     retry: RetryPolicy = field(default_factory=RetryPolicy)
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS
     user_agent_options: Optional[Mapping[str, str]] = None
+    collection_observer: Callable[[Any], Any] | None = None
 
     @classmethod
     def real(cls, store_root="data/store") -> "ComposeDependencies":
         """真实装配：`urllib` fetcher + 真 robots 检查 + 真同域限速（SPEC §2.12）。"""
         fetcher = UrllibFetcher(follow_redirects=False)
+        from atlas.collect.chromium import BrowserRoutedFetcher, browser_routes
+
+        routes = browser_routes(store_root)
+        if routes:
+            fetcher = BrowserRoutedFetcher(fetcher, routes)
         policy = SharedNetworkPolicy(store_root)
 
         def fetch_robots(url, *, user_agent):
@@ -238,10 +244,13 @@ class ComposeDependencies:
             return policy.robots(url, user_agent, guarded)
 
         robots = RobotsCache(fetch_robots, cache_ttl_seconds=86400)
+        from atlas.aluminium.sources import observe_result
+
         return cls(
             fetcher=PolicyFetcher(fetcher, robots, policy),
             robots=robots,
             throttle=SharedDomainThrottle(policy),
+            collection_observer=lambda result: observe_result(Path(store_root) / "atlas.db", result),
         )
 
 
@@ -405,6 +414,8 @@ class CollectStage(AtlasTask):
         per_channel: List[Dict[str, Any]] = []
 
         for result in results:
+            if self._deps.collection_observer is not None:
+                result = self._deps.collection_observer(result)
             per_channel.append(
                 {
                     "channel_id": result.channel_id,

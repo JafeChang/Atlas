@@ -7,6 +7,7 @@ XML 解析器与其既有 ID 保持原样；JSON 的区间由原始文本上的 
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from html.parser import HTMLParser
@@ -163,6 +164,10 @@ class _ChallengeRedirect(HTMLParser):
 
 
 def is_challenge_page(text: str) -> bool:
+    # HTMLParser 在大型 RSS/Atom 上逐标记扫描很昂贵；没有 meta 元素时不可能
+    # 命中刷新跳转。存在时仍走完整解析，保留属性实体解码与真实目标判定。
+    if re.search(r"<meta(?=[\s/>])", text, re.IGNORECASE) is None:
+        return False
     parser = _ChallengeRedirect()
     parser.feed(text)
     return parser.found

@@ -35,7 +35,7 @@ SPEC §2.11 的硬边界
 | GET | `/entry` | 原文 + 高亮该条目区间（`raw_id` / `char_start` / `char_end`）；只读 |
 | GET | `/article` | 完整阅读详情：元信息、简介、正文、有效性操作与归档详情 |
 | GET | `/image` | 通过签名校验的图片，读取独立 Disk LRU 缓存或按需抓取 |
-| POST | `/translate` | 显式启动中文全文翻译，不由打开详情页触发 |
+| POST | `/translate` | 启动或复用中文全文翻译，详情页默认通过同源 POST 请求 |
 | GET | `/translation` | 读取翻译进度或已缓存的完整译文 |
 | GET | `/translation-stream` | SSE 推送翻译进度及已完成的段落 |
 | POST | `/label` | 提交一个判断；`Accept: application/json` 返回当前标签，普通表单 `303` 回到 feed |
@@ -162,7 +162,8 @@ __all__ = [
 #: - **5**：新增行为事件上报接口。
 #: - **6**：正式前端要求名字登录，标签按当前会话署名。
 #: - **7**：翻译支持 SSE 推送已完成的段落。
-WEBUI_CONTRACT_VERSION = 7
+#: - **8**：文章详情支持嵌入信息流的宽屏分栏。
+WEBUI_CONTRACT_VERSION = 8
 
 #: 打标人的默认署名；也可由页面上的 `actor` 字段覆盖。
 DEFAULT_ACTOR = "me"
@@ -294,6 +295,8 @@ class _ReadOnlySession:
         return values
 
     def values_for_entry(self, entry: FeedEntry) -> Dict[str, str]:
+        if not self.keys_for(entry.raw_id):
+            return {}
         return self.values_for_anchor(
             entry.raw_id,
             EvidenceAnchor.create(
@@ -583,6 +586,9 @@ class WebUIRequestHandler(BaseHTTPRequestHandler):
         if path in ("/", "/feed"):
             self._render_feed(target.query)
             return
+        if path == "/sources" and self.server.source_management is not None:
+            self._send_html(HTTPStatus.OK, self.server.source_management.render())
+            return
         if path == "/entry":
             self._render_entry(target.query)
             return
@@ -599,7 +605,7 @@ class WebUIRequestHandler(BaseHTTPRequestHandler):
             self._translation_stream(target.query)
             return
         if path == "/translate":
-            self._reject_method(allow="POST", detail="翻译由点击中文 tab 后显式触发")
+            self._reject_method(allow="POST", detail="翻译通过同源 POST 请求启动")
             return
         if path == "/events":
             self._reject_method(allow="POST", detail="行为上报只接受 POST")
@@ -624,6 +630,25 @@ class WebUIRequestHandler(BaseHTTPRequestHandler):
                 return
         if path == "/events":
             self._submit_event()
+            return
+        if path == "/sources/toggle" and self.server.source_management is not None:
+            if not self._same_origin():
+                self._send_error(HTTPStatus.FORBIDDEN, "请求被拒绝", "请从 Atlas 页面发起请求", close=True)
+                return
+            try:
+                fields = self._parse_form(allowed_fields=frozenset({"source_id", "enabled", "version"}))
+                self.server.source_management.toggle(
+                    _require_text(fields, "source_id", max_length=64),
+                    _require_text(fields, "enabled", max_length=1),
+                    _require_text(fields, "version", max_length=20),
+                    self._request_actor(),
+                )
+            except _FormRejected as exc:
+                self._send_error(exc.status, exc.title, str(exc), close=True)
+            except ValueError as exc:
+                self._send_html(HTTPStatus.CONFLICT, self.server.source_management.render(str(exc)))
+            else:
+                self._redirect(HTTPStatus.SEE_OTHER, "/sources")
             return
         if path == "/label":
             self._submit_label()
@@ -675,7 +700,7 @@ class WebUIRequestHandler(BaseHTTPRequestHandler):
             self.current_actor, self.current_user_id, lifetime = session
             self._session_cookie = self._cookie(token, lifetime)
             return True
-        if self.command == "GET" and urlsplit(self.path).path in ("/", "/feed", "/entry", "/article"):
+        if self.command == "GET" and urlsplit(self.path).path in ("/", "/feed", "/entry", "/article", "/sources"):
             location = "/login?" + urlencode({"return_to": _safe_login_return(self.path)})
             self._redirect(HTTPStatus.SEE_OTHER, location)
         else:
@@ -832,17 +857,14 @@ class WebUIRequestHandler(BaseHTTPRequestHandler):
             )
             return
 
-        notices = list(_entry_notices(result))
-        label_actor = getattr(self._request_labels(), "actor", None)
-        if label_actor is not None:
-            notices.insert(0, f"当前署名：{label_actor}；标签展示与已打标筛选仅使用此署名的判断。")
         document = render_feed_page(
             result,
             industries=tuple(server.industry_provider()),
             values=values,
             actor=self._request_actor(),
-            notices=notices,
             show_account=server.users is not None,
+            channel_names=server.source_management.channel_names() if server.source_management else {},
+            channel_groups=server.source_management.channel_groups() if server.source_management else {},
         )
         self._send_html(HTTPStatus.OK, document)
 
@@ -873,7 +895,7 @@ class WebUIRequestHandler(BaseHTTPRequestHandler):
         """
         server = self.server
         params = parse_qs(query_string, keep_blank_values=True)
-        allowed = ENTRY_PARAMS | ({"back_to"} if view != "archive" else set())
+        allowed = ENTRY_PARAMS | ({"back_to"} if view != "archive" else set()) | ({"embedded"} if view == "article" else set())
         unknown = sorted(set(params) - allowed)
         if unknown:
             self._send_error(
@@ -893,6 +915,9 @@ class WebUIRequestHandler(BaseHTTPRequestHandler):
                     f"char_end({char_end}) 必须大于 char_start({char_start})",
                 )
             requested_entry_id = _optional_query_text(params, "entry_id")
+            embedded_value = _optional_query_text(params, "embedded") if view == "article" else None
+            if embedded_value not in (None, "1"):
+                raise _FormRejected(HTTPStatus.BAD_REQUEST, "显示方式非法", "embedded 只接受 1")
             back_to = _optional_query_text(params, "back_to") or "/feed"
             if not (back_to == "/feed" or back_to.startswith("/feed?")):
                 raise _FormRejected(HTTPStatus.BAD_REQUEST, "返回地址非法", "只允许返回站内 Feed")
@@ -967,7 +992,8 @@ class WebUIRequestHandler(BaseHTTPRequestHandler):
                     located.entry, labels=labels, actor=self._request_actor(),
                     industries=tuple(server.industry_provider()), back_to=back_to,
                     body_html=server.reader.render(body), native_chinese=body.native_chinese,
-                    body_note=body.note,
+                    body_note=body.note, embedded=embedded_value == "1",
+                    source_name=(server.source_management.channel_names().get(located.entry.channel_id, located.entry.channel_id) if server.source_management else ""),
                 )
             except Exception as exc:
                 _log.exception("阅读服务失败")
@@ -982,6 +1008,7 @@ class WebUIRequestHandler(BaseHTTPRequestHandler):
             sliced=located.sliced,
             labels=labels,
             notice=located.notice,
+            source_name=(server.source_management.channel_names().get(located.entry.channel_id, located.entry.channel_id) if server.source_management else ""),
         )
         self._send_html(HTTPStatus.OK, document)
 
@@ -1407,7 +1434,7 @@ def _safe_login_return(value: str) -> str:
         parts = urlsplit(value)
     except ValueError:
         return "/feed"
-    if parts.scheme or parts.netloc or parts.fragment or parts.path not in ("/", "/feed", "/entry", "/article") or not value.startswith("/"):
+    if parts.scheme or parts.netloc or parts.fragment or parts.path not in ("/", "/feed", "/entry", "/article", "/sources") or not value.startswith("/"):
         return "/feed"
     return value
 
@@ -1534,16 +1561,6 @@ def _record_of(source: Any, raw_id: str) -> Any:
         if len(page) < SOURCE_PAGE_SIZE:
             return None
         offset += len(page)
-
-
-def _entry_notices(result: Any) -> tuple[str, ...]:
-    """把条目层的 `problems` 聚合成页面顶部的显式提示（**绝不静默**）。"""
-    seen: list[str] = list(getattr(result, "notices", ()))
-    for item in result.items:
-        for problem in getattr(item, "problems", ()):
-            if problem not in seen:
-                seen.append(problem)
-    return tuple(seen)
 
 
 def _derive_entries_lookup(source: Any) -> Any:
@@ -1708,6 +1725,7 @@ class WebUIHTTPServer(ThreadingHTTPServer):
         reader: Any = None,
         events: Any = None,
         users: UserStore | None = None,
+        source_management: Any = None,
     ) -> None:
         self._source = source
         self.labels = labels
@@ -1723,6 +1741,7 @@ class WebUIHTTPServer(ThreadingHTTPServer):
         self.reader = reader
         self.events = events
         self.users = users
+        self.source_management = source_management
         super().__init__(server_address, WebUIRequestHandler)
 
     def resolve_source(self) -> Any:
@@ -1801,6 +1820,7 @@ class WebUIApplication:
         reader: Any = None,
         events: Any = None,
         users: UserStore | None = None,
+        source_management: Any = None,
         on_close: Optional[Callable[[], None]] = None,
         host: str = "127.0.0.1",
         port: int = 0,
@@ -1821,6 +1841,7 @@ class WebUIApplication:
             reader=reader,
             events=events,
             users=users,
+            source_management=source_management,
         )
         self._thread = threading.Thread(
             target=self._serve, name="atlas-webui-http", daemon=True

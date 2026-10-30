@@ -3014,3 +3014,472 @@ SSE 有心跳、无代理缓冲提示，断开不取消共享任务；重连可�
 真实使用反馈发现，上节的批次推送对只有一两个大型文本节点的文章仍会整篇一起变化：旧实现等待节点全部片段以及整批模型响应完成才更新。现在长文本按句子或词边界拆成约 900 字符的片段；使用模型上游流式 JSON，在每个完整译文片段生成时向页面推送，单个长节点也可逐段变化。输出仍按文本转义；一批响应完整通过格式、完整性和语言检查后才写入可复用缓存，失败批次的临时显示不会被当成已验证结果。已完成的旧全文缓存继续复用；旧版未完成分段因分段方式不同，不混用到新版。
 
 若 SSE 连接未报错但被代理缓冲，前端在约 4 秒没有事件时并行读取进度；按任务版本忽略迟到的旧状态，避免倒退。以正式库中此前出现“一次全部变中文”的 3709 字符正文，在隔离服务及真实 `deepseek-v4.1-flash` 上验证：单次模型响应拆成 5 个片段，页面约第 3.6、4.5、6.0、6.9 和 7.9 秒先后更新，全文完成；没有写入正式翻译缓存。公网代理链路仍需用户实际会话验证。
+
+### 宽屏信息流与详情分栏（2026-10-28）
+
+视口宽度达到 1100 CSS 像素时，信息流和文章详情左右分栏并分别滚动；默认选中第一篇，点击卡片或标题在右侧切换详情，当前页刷新后恢复选中项。标题的修饰键打开新标签页仍走独立详情页。详情内部保留正文、图片、翻译和打标功能，左右两侧按原文及精确锚点同步成功的判断和标签；加载中的保存也会在详情就绪后同步。宽屏下添加标签原位更新；窄屏采用整页导航，列表和详情各自占满屏幕。用户手动选中详情后从宽屏缩窄时，进入该篇独立详情；加载详情时发现会话过期，主页面回到登录页。未登录的详情不能绕过现有会话检查。
+
+界面视觉按提供的 Atlas 原型调整：信息流采用紧凑的列表、来源选择、筛选和分页，详情采用固定操作栏与阅读排版；窄屏在列表和全屏详情之间导航，不分栏。分页位于信息流顶部筛选栏右侧，空间不足时自动换行；窄屏隐藏条目范围和总数，保留页码与翻页按钮。窄屏信息流使用页面滚动并延伸到屏幕底部，适配浏览器的动态工具栏和安全区域。列表优先展示中文标题；超过三个标签时显示数量，详情中仍可查看全部标签。深浅主题可手动切换并在刷新后保留，列表与详情同步；未手动设置时跟随系统。来源、筛选、分页及用户菜单均使用真实数据和原有操作。
+
+信息流曝光按列表滚动区域与浏览器视口的交集计算，并扣除窄屏固定顶部栏的遮挡，避免未实际可见的卡片误计曝光；曝光的可见面积参考尺寸也以这个可见区域为准。
+
+### 海外电解铝产能监测（2026-10-29）
+
+用户提供的 37 项目录原样保存在 `config/overseas_aluminium_sources.json`。行业为
+`overseas_primary_aluminium` / 海外电解铝 / Overseas Primary Aluminium。
+该用户指定标识仅在行业 ID 与行业引用上例外接受，不放宽渠道 ID；没有给既有配置
+模型增加默认字段，因此旧配置快照摘要、版本回放与历史标签保持兼容。
+
+**实施前架构检查**：信源是 `atlas.registry` 的 `Industry` / `Channel` / `FetchSpec`，
+SQLite 的 `config_versions` 保存完整版本与 diff，`industries/channels` 是当前投影；
+CRUD 统一进入注册表提交校验，禁用保留历史。生产采集入口是 `atlas.compose` →
+`atlas.collect.Collector`，RSS/Atom、HTML、JSON 都先经统一 HTTP、逐跳 robots 与共享限流，
+再按内容解析；`collectors/` 的旧 WebCollector 不在当前生产主路径，不能为接入而绕开
+共享网络策略。现有 JSON 浏览适配针对 Algolia，目录并未提供已验证的电解铝 API。
+cron 每五分钟调用 `scripts/collect-due.sh`，旧渠道依据 Raw 最近采集时间判定到期。
+Raw 按渠道、端点和内容指纹寻址，内容变化保留新版本；条目身份与人工标签不合并。
+行业/标签空间来自当前启用的注册表配置，机器分类经 Proposed 与证据验证，中文译题
+和简介使用独立的增量处理任务。数据库由各领域的显式初始化建表，现有 Python 3.13、
+uv、SQLite、标准库 HTTP Web UI、systemd 和 pytest 部署/测试方式继续使用，无新增依赖。
+原 UI 有来源筛选，没有完整的渠道配置页；本次增加行业信源管理页并保留原信息流。
+
+**导入与验证结果**：37 项全部登记，重复执行新增 0 项；新建 29 个禁用待验证渠道
+（26 Web + 3 RSS）。另外 8 项仅登记目录：RSS 目录 1、邮件 1、待配置 API 1、付费 5。
+输入的 URL、地区、优先级、focus、ingestion、type、status 全部保留，输入 `verified`
+不解释为自动采集验证；`constructed-unfetched` 和 `domain-only` 不自动启用。
+真实探测每项至多一次目标请求，无重试，先检查 robots，遵守重定向和限流；未知或拒绝
+的 robots 不请求正文，付费项只测试公开入口。16 个 Web 页面通过结构验证并启用，
+其中 9 页可发现候选新闻/PDF 链接，其余使用页面快照监控。该结果不声称已经获得
+统计 API、JS 数据表或下载文件中的全部数据；3 个 RSS 搜索实际验证可采集数为 0。
+
+| 未接入来源 | 原因 |
+|---|---|
+| Google News New Smelters / Capacity / Curtailments | robots 明确拒绝，未请求 RSS 正文 |
+| GlobeNewswire RSS Directory | 目录不是 feed；robots HTTP 403 |
+| NALCO Press Releases | robots 请求证书验证失败，未关闭 TLS 校验 |
+| USGS Aluminum Statistics | robots 请求超时，保守禁止 |
+| NSE Hindalco Announcements | 目标请求超时 |
+| Rio Tinto Media Releases / Key Project Updates | HTTP 200，但标题或正文不足，未验证为可解析页面 |
+| Press Metal Investor Relations | HTTP 200，但标题或正文不足 |
+| Alcoa Press Releases / Investor Relations | HTTP 200，但标题或正文不足 |
+| Century Aluminum Investor Relations | HTTP 200，但标题或正文不足 |
+| Bahrain Investment Line 6 | HTTP 405 |
+| Hydro Email News Subscription | 未实现邮件接收器，待配置 |
+| SEC EDGAR | 仅有搜索入口；没有已验证 API、发行人及合规身份配置 |
+| CRU Aluminium / S&P Global Commodity Insights / Fastmarkets / Argus Media / Wood Mackenzie | 缺少订阅授权；不请求付费内容或绕过限制 |
+
+逐项 URL、HTTP/robots 原因、时间、结构与候选链接数量：
+`data/store/aluminium-source-validation-2026-10-29.json`。16 个真实成功响应直接归档，
+没有再次抓取；测试缓存位于 `.tmp_atlas/aluminium-validation/probe-content/`。
+导入前的 13 个渠道、9 个行业、310 份 Raw 与 16 行人工标签逐项对账保持原样；
+正式库成为 42 个渠道、10 个行业、326 份 Raw，注册表版本 14 → 15（导入）→ 16（启用）。
+保全对账记录在 `data/store/aluminium-import-verification-2026-10-29.json`。
+
+**新增存储**：在同一 `data/store/atlas.db` 增量创建 8 张领域表：
+`aluminium_meta`、`aluminium_sources`、`aluminium_probes`、`aluminium_attempts`、
+`aluminium_candidates`、`aluminium_extractions`、`aluminium_processing_errors`、
+`aluminium_inputs`，领域 schema 版本为 1。旧表结构、旧 schema 版本不变，无需重建数据库。
+除目录映射与元数据外均有禁止 UPDATE/DELETE 的触发器。数字原文、模型输入正文与指纹、
+来源、模型/提示版本、更正关系保留。行业源轮询记录补充调度状态：内容相同和失败都
+等待该源的 6/12/24 小时周期，不因没有新增 Raw 而每五分钟重复请求；旧渠道调度不变。
+
+**语义规则**：行业词任一 + 事件词任一；已知企业渠道省略 aluminium 的设施事件短标题
+也进入候选，最终业务类型仍须从正文分类。保留原铝、氧化铝、再生铝、混合及未知业务，
+只有明确分开的海外原铝实际事件具有 `eligible_for_capacity` 资格；不自动将名义产能、
+运行产能、实际产量相加。13 种事件标识齐备，FIRST_METAL 与 FULL_CAPACITY 分开，
+实际日期和计划日期分栏，日期不完整保留 null。每个非 null 数字须逐字证据及原始数字/
+单位，经确定性换算校验才保存；实际产量不年化。未披露数据不猜测。中文标题/摘要与
+英文原题同时保存。公司、国家与明确项目/设施名称一致才关联实体，缺信息留空，不做
+未经验证的别名合并。多来源按同项目、同事件、同日期及规范化原标题保守关联，优先官网；
+其他报道和旧版本只在主展示中折叠，Raw/候选/标签身份和全部历史均保留。
+单篇多事件批量保存是事务性的，一条证据失败不会留下半篇提取结果。
+
+**界面与运行**：`/sources` 沿用现有样式、登录和同源检查，展示全部 37 项的优先级、
+启用状态、输入验证状态、实际结构验证、最近尝试/成功及错误。需要授权、待配置、
+已配置、已验证、运行正常和不可用分别显示；启用前要求结构验证，启停产生审计版本，
+不删除内容。页面 GET 只读；配置提交有版本冲突检查，并与 cron 共用锁。
+默认 cron 采集后仅整理离线候选，不新增模型请求；当前整理出 17 条待提取候选，
+没有伪造结构化事件（当前 0 条）。复用现有 CognitionConfig 和模型路由的提取命令如下。
+`--extract` 显式调用已配置模型；`--fetch-articles` 才会经现有正文阅读器请求详情，
+原始响应与清洗正文复用 article_contents。失败留诊断，需 `--retry-errors` 显式重试。
+
+```bash
+# 在项目根目录执行；验证与导入可重复运行，不覆盖已有渠道设置。
+PYTHONPATH=src .venv-new/bin/python -m atlas.aluminium validate config/overseas_aluminium_sources.json
+PYTHONPATH=src .venv-new/bin/python -m atlas.aluminium import config/overseas_aluminium_sources.json
+PYTHONPATH=src .venv-new/bin/python -m atlas.aluminium status
+PYTHONPATH=src .venv-new/bin/python -m atlas.compose plan --due-only
+
+# 重新做一次有限的真实验证；只有显式提供启用选项才启用通过者。
+ATLAS_LIVE=1 PYTHONPATH=src .venv-new/bin/python -m atlas.aluminium probe --report data/store/aluminium-recheck.json --enable-verified
+
+# 显式调用现有模型；不需新信源订阅凭据，但消耗现有模型额度。
+ATLAS_LIVE=1 PYTHONPATH=src .venv-new/bin/python -m atlas.aluminium process --extract --fetch-articles --limit 10
+PYTHONPATH=src .venv-new/bin/python -m atlas.aluminium export --output data/store/aluminium-intelligence.json
+
+# 启动前端；已在运行的服务可用 systemctl restart atlas-web.service 载入代码。
+PYTHONPATH=src .venv-new/bin/python -m atlas.webapp --host 127.0.0.1 --port 8765
+# 若要定时提取，在现有 cron 环境中显式设置 ATLAS_ALUMINIUM_EXTRACT=1；
+# scripts/collect-due.sh 会在采集后至多处理 10 条候选，默认不开启该模型开关。
+```
+
+**文件清单**：
+
+- 新增 `config/overseas_aluminium_sources.json`（用户原始目录）。
+- 新增 `src/atlas/aluminium/__init__.py`、`__main__.py`（行业标识、CLI）。
+- 新增 `src/atlas/aluminium/models.py`、`rules.py`（字段校验、单位、词组与事件/业务枚举）。
+- 新增 `src/atlas/aluminium/sources.py`、`store.py`（幂等导入、探测、运行状态、追加存储）。
+- 新增 `src/atlas/aluminium/processing.py`、`ui.py`（候选、结构化模型输出、信源管理）。
+- 新增 `tests/test_aluminium.py`（51 项 Mock/本地自动化验收）。
+- 修改 `src/atlas/registry/schema.py`（指定行业 ID 的兼容校验）。
+- 修改 `src/atlas/cognition/prompt.py`（新行业的语义分类约束）。
+- 修改 `src/atlas/compose/tasks.py`、`src/atlas/schedule/core.py`（运行观测、轮询间隔）。
+- 修改 `scripts/collect-due.sh`（采集后的候选整理和显式模型开关）。
+- 修改 `src/atlas/webapp.py`、`src/atlas/webui/app.py`、`src/atlas/webui/pages.py`（接线、路由、入口）。
+- 修改本 `SPEC.md`；保留本次开始时已经存在的所有未提交修改。
+
+**测试证据**：新增 51 项全部通过，覆盖 JSON/37 项计数、非法输入不写库、重复导入与
+已有源保全、RSS 正常/异常、网页更新、关键词 OR/AND、三种业务/混合业务、首次出铝与达产、
+计划与实际日期、单位/非法单位、数字证据、修正历史、多来源优先级、失败与重试、调度、
+UI 只读/登录回跳/启停/CSRF、详情归档与限速失败、LLM 截断/工具响应拒绝和真实流水线接线；均不依赖外站在线。
+早期相关回归 153 项通过。完整回归首次为 1909 通过 / 43 跳过 / 1 失败；失败是既有
+`tests/test_admission.py:94` 的 `assert "下一页" not in page`，现有禁用分页控件有
+`aria-label="下一页"`。在移除本次页面入口及 Web 装配改动的隔离副本中同样失败，
+记录为 `.tmp_atlas/aluminium-existing-failure.txt`，未更改该无关分页逻辑或断言。
+后续完整回归单独排除此已确认的既有失败，1914 通过 / 43 跳过 / 1 排除；执行输出
+在 `.tmp_atlas/aluminium-final-suite.txt`。跳过项为需 Playwright/Chromium 或显式真实模型调用的测试。
+新模块与测试 Ruff 检查通过，`git diff --check` 与 shell 语法检查通过。
+正式库隔离 HTTP 服务的 `/sources` 已返回 200，显示 37 项来源和真实状态。
+
+最终验收为 51 项通过；新增正文归档/限速及登录回跳检查后，相关 UI 回归 87 项通过。
+正式 `atlas-web.service` 已重新加载并保持 active，`/health` HTTP 200；未登录 GET
+`/sources` 返回 303 到 `/login?return_to=%2Fsources`，登录后的完整页面在隔离 HTTP
+测试中验证为 200。结构化测试汇总与完整输出分别保存在
+`data/store/aluminium-test-results-2026-10-29.json`、
+`data/store/aluminium-test-output-2026-10-29.txt`；服务检查结果为
+`data/store/aluminium-deployment-verification-2026-10-29.json`。
+
+#### 现有模型处理与自动提取启用（2026-10-29）
+
+本节取代上文首次导入时“17 条待提取、0 条事件、实例未启用模型”的运行快照。
+用户已明确要求使用现有模型处理完该批，并启用后续自动结构化提取。
+
+- 使用既有 OpenCode Go 路由的 `deepseek-v4.1-flash`，没有更换模型或凭据来源。
+  真实调用暴露了结构化客户端缺少 `x-opencode-session` 的问题（网关 HTTP 400 / MissingSessionID）；
+  已按现有 BriefClient 约定补齐稳定的会话头，并验证真实 HTTP 200 与事件入库。
+- 原始 17 条候选全部完成：7 条提取出共 16 条结构化事件记录，10 条明确判定无相关事件，
+  该批剩余 0 条。未把无事件分类伪装成产能事件，也没有把历史请求错误清除或改成成功。
+- 新增只追加的 `aluminium_processing_results` 处理结果表（领域表合计 9 张，兼容增量建表），
+  区分 `processed` / `no_event` / `failed`。成功及无事件不重复调用模型；失败保存原错误，
+  冷却一小时后可由自动任务重试，显式 `--retry-errors` 可立即重试。历史错误继续留存。
+- 实际证据校验不放宽：`1.5m tonnes per year` 按原文缩写确定性换算，引用明确
+  `annual production capacity` 时才允许将同段 `tonnes` 解释为年度产能。没有年度说明的吨数
+  不自动年化。字段须分别有原文数字和单位证据，完整日期须出现在引用内；月份、季度、
+  月末及文章发布日期不能自动补成事件日期。提示版本升级到 `overseas-primary-aluminium/2`，
+  重试会携带上次校验诊断，不能靠改写证据绕过校验。同候选的模型修正保留旧记录和替代关系。
+- 新闻卡片使用自身标题/摘要边界，避免把整页新闻混入单篇输入；同一 Raw 的同一文章重分析
+  不另造候选。企业季度结果进入模型筛选，正文仍需区分原铝与其他业务。监控页更新使用本次
+  Raw 快照，不被同 URL 的旧正文缓存覆盖；需要重新获取的详情继续走共享 robots 与限速。
+- 后续检查又发现 8 条季度公告，已完成其中 5 条并新增 5 条事件记录；3 条 Maaden 公告详情
+  缺少足够可读正文，真实失败保留并等待重试，不伪装成功。当前共 25 条候选：10 条有事件、
+  12 条无事件、3 条待重试；累计 21 条事件记录。这不改变原始 17 条均已完成的结论。
+- 正式 `/etc/cron.d/atlas` 已原子更新为 `ATLAS_ALUMINIUM_EXTRACT=1`，保留原有代理、
+  ATLAS_LIVE、超时、日志、权限及其他配置；旧文件备份于
+  `.tmp_atlas/atlas.cron.before-aluminium-extraction`。cron 已记录重新加载并实际执行携带该开关的
+  调用。沿用每五分钟调度与进程互斥，每批最多 10 条；源的 P0/P1/P2 采集周期不变。
+
+验证：新功能验收 **60 项通过**；相关全量回归 **1923 通过 / 43 跳过 / 1 排除**。
+排除项仍是上文已独立复现的既有分页断言，未修改该无关逻辑。新增覆盖会话请求头、
+无事件完成状态、失败冷却续跑、部分日期拒绝补全、原文缩写/明确年产能换算、修正历史、
+新闻边界、旧缓存不覆盖新快照及 cron 开关实际命令分支。Ruff 与 diff/脚本语法检查通过。
+
+结果与证据：`data/store/aluminium-processing-enabled-2026-10-29.json` 保存原始 17 项逐条结果、
+自动配置及后续队列；`data/store/aluminium-intelligence.json` 为最新事件导出；
+`data/store/aluminium-live-processing/` 保存本批真实模型响应与输入指纹。
+
+#### 来源显示名称修正（2026-10-29）
+
+来源菜单、选中项、文章卡片、阅读详情及归档页的普通来源文字改为目录中的可读名称，
+例如 `Alba News`、`Hydro News`、`INALUM Official English`。下拉列表按显示名称排序，
+长名称保留完整文字及 title 提示。名称通过只读查询按请求读取，不缓存过期的显示映射。
+未登记名称的旧渠道仍沿用既有标识显示；筛选 URL、埋点、锚点、Raw 和标签继续使用
+原来的 channel_id，不修改数据库身份或历史配置。内部渠道 ID 仍可在技术详情查看。
+
+实现涉及 `src/atlas/aluminium/ui.py`、`src/atlas/webui/app.py`、
+`src/atlas/webui/pages.py`；新增 `tests/test_source_display_names.py`，验证真实 HTTP
+筛选与详情、名称转义、未知旧渠道兼容及只读性。定向回归 70 项通过、3 项浏览器测试
+因未安装 Playwright 跳过；生产数据隔离服务验证所有导入来源菜单均显示名称。
+
+#### 来源下拉框按行业分组（2026-10-29）
+
+来源菜单按注册表的渠道行业归属分区，原有机器学习、计算机视觉、自然语言处理、统计学习
+及数据科学子行业统一显示在“AI 信源”下，海外电解铝来源单独显示在“海外电解铝”下。
+组标题显示当前可选来源数量，组内按可读名称排序；“全部来源”保留在顶部，当前选中项
+和现有筛选链接保持不变。其他行业沿用配置中的行业名称，无法确认归属的历史来源放入
+“其他来源”，不根据渠道 ID 前缀猜行业或隐藏历史来源。分组仅用于来源选择，不改变文章分类。
+
+分组信息只读查询，前端通过注入的映射渲染；使用 role=group / aria-labelledby 标记组标题，
+并沿用下拉框的窄屏宽度限制、长名称换行和滚动区域。无数据库迁移，无新依赖。
+相关回归 72 项通过，3 项需 Playwright 的测试因环境缺少依赖跳过；正式数据隔离 HTTP
+验证菜单显示“AI 信源（12）”和“海外电解铝（16）”，选择 INALUM 的原链接继续有效。
+
+#### 来源分组一键查看全部（2026-10-30）
+
+来源菜单顶部、“全部来源”之后集中显示分组“全部”入口，包括“AI全部”和“海外电解铝全部”，复用现有
+多渠道筛选，涵盖该组所有当前可选来源。切换保留标签、排序、每页数量等筛选条件并
+回到第一页；分页继续保留渠道集合。完整选中多来源分组时，按钮显示分组入口名称，
+对应入口标记为当前选择；单来源组仍优先显示具体来源，URL 参数顺序不影响选中识别。
+
+来源展示、HTTP 筛选与分页、320/375/1100/1366/1500px 页头回归通过，Ruff 检查通过。
+正式服务已重新加载，健康检查 HTTP 200；实际页面验证“AI全部”覆盖 12 个来源，
+“海外电解铝全部”覆盖 17 个来源，返回文章与选中状态均正确。
+
+#### 首页读取性能修复（2026-10-29）
+
+首页慢的根因是完整原文 LRU 容量 256 份，正式归档已超过 330 份：一次请求在类型识别、
+条目展开、简介定位三个阶段依次扫描，先前解析结果被淘汰，连续访问仍重复解析 RSS/Atom。
+当时共约 6.8 万个可浏览单元，验证码判定还会对没有 meta 元素的大型 XML 执行 HTMLParser。
+
+新增按不可变 Raw 身份保存的轻量浏览索引，只持有标题、链接、时间、原文坐标及既有简介键，
+不保存 XML 或文章正文。Web 的完整文本 LRU 缩至 8 份，详情和后台任务仍可读取完整内容。
+列表读取 feed_articles 时跳过 article_text；没有 meta 元素时跳过验证码 HTML 解析，
+实际跳转判定仍保留完整解析和属性实体解码。没有当前用户标签的文档跳过无用的锚点构造。
+正式启动入口在开始服务前预热索引，后续新 Raw 仍按需加入；原始归档清单、审核、分类、
+中文标题摘要和个人标签逐请求读取，保留实时更新与用户隔离。无数据库迁移，无新依赖。
+
+真实数据隔离 HTTP 对照（相同代码仅还原本次性能变更作为基线，关闭测试页面的埋点）：
+修复前首次请求 19.65 秒、连续请求 14.29 / 13.82 秒；修复后未预热首次 7.00 秒、连续
+请求 1.31 / 1.26 秒。按正式启动方式预热约 5.61 秒后，首个请求 1.42 秒、后续约 1.3 秒，
+均返回 50 张卡片及相同响应字节数。该测量为本机源站耗时，不包含公网认证及浏览器渲染。
+证据位于 `.tmp_atlas/home-performance/` 的 before/after/after-prewarmed JSON 与 profile。
+
+新增 `tests/test_home_performance.py` 覆盖超过 LRU 容量的重复扫描、条目身份/坐标一致、
+完整详情回读、预热首请求不读原文、追加 Raw 及摘要/审核变更即时生效、列表省略正文时
+默认全文读取契约保持，以及验证码快速判定的正反对照。个人标签及跨用户隔离沿用现有
+端到端测试验证。
+
+验证：全量回归 1932 通过、43 跳过，排除 1 项此前已复现的既有分页断言；新增预热
+及启动定向测试 11 项通过。`atlas-web.service` 已重启并完成预热，健康端点 HTTP 200，
+未登录首页仍跳转原登录入口，正式归档仍为 333 份 / 68450 个可浏览单元。
+
+#### 信源管理紧凑视图（2026-10-29）
+
+按用户选择的“更紧凑，便于同时查看大量信源”方向，沿用 Atlas 的字体、颜色变量及
+服务端 HTML 架构，将海外电解铝的 37 个来源改为对齐列表，默认按优先级及名称排序。
+主行展示可读名称、域名/地区、接入方式、优先级、采集状态、最近成功时间及启停操作；
+详细监控内容、原始 URL、错误原因、结构验证和采集记录折叠展示，原始数据和版本化启停
+流程保持原有契约。时间显示为北京时间，time 元素及提示仍保留原 UTC 时间戳。
+
+新增本地搜索（名称、域名、地区和监控内容）、接入方式/优先级筛选，以及“全部信源”、
+“已启用”、“不可用”、“待配置 / 授权”快捷筛选；显示匹配数量与可恢复的空结果状态。
+筛选条件存于当前浏览器会话，启停提交后仍保留，不缓存源数据。配置未完成、验证未通过
+或缺少授权的来源仍无法启用。产能事件及其证据、其他报道、历史版本继续保留。
+
+桌面使用紧凑表格，1440×1000 实测首屏可见约 10 行；手机自动采用两行布局，避免横向
+滚动。支持系统与显式暗色模式；状态文字与颜色同时展示，操作目标至少 44px，详情可用
+键盘展开。禁用 JavaScript 时显示完整详情，启停仍走既有表单，不依赖新框架或构建步骤。
+
+实现位于 `src/atlas/aluminium/source_page.py` 与 `src/atlas/aluminium/ui.py`；新增
+`tests/test_source_management_design.py`。相关 **74 项测试通过**，包括隔离真实 HTTP
+启停、版本冲突、只读性、转义、时间、筛选保留及 Chromium 实际点击。另对 320px、375px、
+390px 手机、平板、桌面及手机暗色共六种视口执行浏览器检查，未发现页面横向溢出或
+JavaScript 错误；窄屏筛选栏可独立滚动，标签保持完整。禁用 JavaScript 的浏览器验证
+37 条来源及完整详情仍可阅读，原有启停表单仍存在。浏览器工具
+使用独立 uv 环境，项目依赖、数据库结构和采集配置不变。
+
+设计预览位于 `designs/source-management/source-management.html`，保留原页面快照与
+桌面/移动截图，资产登记在同目录 `_d_meta.json`。预览使用真实数据快照，启停提示前往
+正式页面操作，不模拟配置成功。验证记录位于 `.tmp_atlas/source-management/`。
+正式服务已重启，登录后的 `/sources` HTTP 200，实际展示 37 条来源、16 条启用；
+验证前后配置版本均为 16、渠道均为 42，不修改生产信源配置。临时验证会话已登出。
+
+#### 统一行业信源管理（2026-10-29）
+
+信源管理改为同时只读加载通用注册表与海外电解铝目录，修正此前仅显示电解铝来源的问题。
+正式数据共 **50 个来源**：**AI 信源 13**、**海外电解铝 37**；其中启用 29 个。
+现有机器学习、计算机视觉、自然语言处理、统计学习、数据科学行业在管理视图统一归入
+“AI 信源”，原始子行业在详情保留。其他配置行业按原名称分组，不按渠道 ID 前缀猜测。
+没有电解铝目录的旧库也可管理原有渠道，不建立行业附加表。
+
+各组独立显示标题与数量；行业筛选可与搜索、状态、接入方式、优先级组合使用，组标题
+和状态数量随行业筛选更新。空组不残留，筛选条件在启停跳转后继续保留。原有紧凑布局、
+移动端及暗色样式延续；Atom、既有 JSON API 与未设置优先级可直接筛选。
+
+通用渠道展示配置中的真实 URL、协议、周期和标签；没有优先级显示“— / 未设置”，
+没有独立验证记录明确显示“未单独验证”。已有 Raw 仅支持“已归档”的事实判断，不将
+历史 HTTP 2xx 响应冒充当前结构验证通过或持续运行正常；最近归档响应和成功响应时间
+分别保留。有历史错误响应时显示其 HTTP 状态，未归档的渠道仍按配置展示。
+
+启停仍经版本化注册表、当前操作者及既有互斥锁提交，仅修改选中渠道的 enabled 字段。
+目录来源依据 source_id 与关联 channel_id 识别，复用旧渠道时仅显示一次；通过旧渠道 ID
+提交也不能绕过目录来源的验证与授权检查。普通通用渠道沿用原有配置与采集机制，
+不新增来源、不重建数据库、不改动历史记录或原有行业归属。
+
+新增 `tests/test_source_industry_management.py`，覆盖无行业附加表的旧库、跨行业列表、
+目录复用渠道去重、验证限制防绕过、真实历史状态、HTTP 启停及版本冲突，以及实际浏览器
+行业筛选、空组隐藏、API/网页/未设置优先级与筛选保留。功能及界面 **79 项通过**，
+注册表、版本化、调度与用户隔离相关 **195 项通过**；六种桌面/移动/暗色视口和禁用
+JavaScript 场景检查通过，浏览未修改生产配置。证据在 `.tmp_atlas/source-groups/`。
+
+#### Feed 页头固定两行（2026-10-29）
+
+按用户截图将页头改为两条不换行的操作栏：首行显示品牌、信源管理、筛选、主题及账号，
+第二行显示来源、打标状态和分页。来源长名称在按钮中截断，菜单与提示保留完整名称；
+窄至 320px 时使用“来源”短标签。条目范围计数在窄列表栏隐藏，在分页提示保留；
+是否隐藏按列表栏实际宽度判断，避免宽屏双栏界面再次被挤成三行。
+
+头部浮层继续支持点击外部和 Escape 关闭，筛选面板改为相对整个页头定位，避免移位后
+超出窄屏边界。更新移动端条目滚动避让高度，不改动筛选、分页、登录及采集业务逻辑。
+新增 `tests/test_webui_header.py` 验证长来源、大分页数字、账号及 320/375/1100/1366/1500
+视口；相关浏览器与 HTTP 回归 **41 项通过**，更新滚动避让后的定向回归通过。
+正式服务已重启，真实页面验证桌面页头高 93px、手机高 99px，均为两行，浮层与页面均无
+横向溢出。截图及结果保存在 `.tmp_atlas/header-two-rows/`。
+
+信源管理入口随后统一为与相邻操作一致的线性图标，保留 `/sources` 链接、悬停提示和
+无障碍名称“信源管理”，不再在图标操作区显示四字文字链接。页头相关 10 项回归通过；
+正式页面的桌面及手机视口保持两行，验证截图位于 `.tmp_atlas/header-source-icon/`。
+
+按用户要求移除信息流的“订阅与浏览提示”区块及其聚合渲染逻辑、样式。正常文章列表
+直接接在页头下方；空订阅、验证码响应、入站审核及原文归档的既有处理继续由数据层负责。
+相关渲染、采集刷新、入站审核、用户与页头回归 61 项通过。验证记录位于
+`.tmp_atlas/remove-feed-notices/`。
+
+#### 详情默认中文（2026-10-29）
+
+用户要求详情默认展示中文，取代此前“先显示原文、手动点击中文才发起翻译”的交互。
+独立详情与桌面嵌入阅读区初始均选中“中文”；原文面板保留，可随时切换。浏览器打开
+非中文正文后自动通过既有同源 `POST /translate` 请求或复用翻译；完成缓存直接显示，
+未完成时沿用逐段推送、轮询回退及失败重试。原生中文直接显示，不重复发起翻译。
+
+页面 GET 继续只读，不在服务端读取页面时调用模型。原有审核、登录、同源校验、共享
+任务及缓存机制保留；不触发全库翻译。初始 HTML 就选择中文并显示准备状态，避免先闪出
+英文正文。已完成译文在重载后继续复用；手动切回原文不改变下一篇详情的中文默认值。
+
+相关阅读、流式翻译、缓存、跨栏交互、打标、用户与入站审核 **134 项测试通过**。
+浏览器测试使用 Mock 翻译客户端，验证自动发起、原文切换、重载复用、原生中文零请求、
+逐段更新、失败续传及审核拦截；验证证据保存在 `.tmp_atlas/default-chinese/`。
+正式服务已更新；使用已有 MarkTechPost 译文实测独立详情、刷新及嵌入阅读区均默认显示
+中文，三次请求直接复用完成缓存，缓存文件未改写，浏览器未出现脚本错误。
+
+#### GlobeNewswire 公开 RSS 配置与 SEC 暂缓（2026-10-29）
+
+用户随后要求先接入 SEC 与 GlobeNewswire，收到 SEC 真实联系人邮箱要求后明确选择
+“先跳过”。SEC 保留待配置；5 个付费信源和 Hydro 邮件订阅的配置、启停、验证记录均未更改。
+
+从 [GlobeNewswire 官方订阅目录](https://www.globenewswire.com/rss/list) 的 Aluminum
+条目确认具体 RSS 地址：
+`https://www.globenewswire.com/RssFeed/industry/1753-Aluminum/feedTitle/GlobeNewswire%20-%20Industry%20News%20on%20Aluminum`。
+原目录 URL、输入 ingestion、原始验证状态和稳定 source/channel ID 均保留；实际订阅地址
+单独保存到增量创建的 `aluminium_rss_connections` 表，不修改旧表或删除数据，兼容现有
+领域 schema 1 的只读打开。配置采用既有版本化注册表，首次创建禁用 RSS 渠道；重复配置
+不新增记录、不改已有启停。授权、邮件和 SEC 渠道不能通过这个目录配置入口启用。
+
+**实际结果**：正式配置版本 16 → 17，新增 1 个禁用的 RSS 渠道，总渠道 42 → 43；
+逻辑管理目录仍为 AI 13 + 海外电解铝 37。37 项原始 JSON、原有 42 个渠道的完整配置、
+其他 36 个目录项的探测记录保持原样；新闻及提取历史保留。RSS 采集复用现有 robots、
+限流、优先级调度、归档、去重、候选筛选和自动结构化提取，无新增依赖或模型路由。
+
+本机有限连通性验证及单次 robots 复核都收到 **robots.txt HTTP 403**。没有继续请求
+订阅内容，已验证可采集数为 **0**，不能声称接入运行成功；正式管理页显示 RSS 订阅、
+“不可用”、403 原因及原始/实际两个 URL，保持禁用。既有自动结构化提取仍开启，
+GlobeNewswire 必须通过实际网络与结构验证后才会加入采集。
+
+配置和复验命令如下；`--source-id` 只检测该信源，`--enable-verified` 只在 robots、
+连通性、RSS/Atom 结构均通过后启用。目录旧探测和其他端点的成功证据不能启用新订阅。
+
+```bash
+PYTHONPATH=src .venv-new/bin/python -m atlas.aluminium configure-rss \
+  opa-038978e34d52268d6b1db9a0 \
+  'https://www.globenewswire.com/RssFeed/industry/1753-Aluminum/feedTitle/GlobeNewswire%20-%20Industry%20News%20on%20Aluminum'
+ATLAS_LIVE=1 PYTHONPATH=src .venv-new/bin/python -m atlas.aluminium probe \
+  --source-id opa-038978e34d52268d6b1db9a0 --enable-verified \
+  --report .tmp_atlas/globenewswire-probe.json
+```
+
+网络代理沿用运行环境；robots 缓存及站点限速仍按既有策略生效，不绕过访问限制。
+相关 **89 项 Mock/管理界面回归通过**，包括配置幂等、端点去重、付费/邮件/SEC 拒绝接入、
+定向探测、错误 XML/HTML/503、robots 403 零内容请求、启停门禁及 RSS → 归档 →
+候选 → 中文结构化事件完整 Mock 流程；Ruff 检查通过。正式验证及保全对账位于
+`.tmp_atlas/globenewswire-20261029/`，89 项测试日志为 `.tmp_atlas/globenewswire-tests.log`。
+
+#### GlobeNewswire 403 实时复核（2026-10-29）
+
+用户要求排查代理及请求配置，修复并验证通过后直接启用。本次在现有共享站点限速下，
+对官方 `https://www.globenewswire.com/robots.txt` 执行 5 次有限的实时 GET，均未使用
+旧 robots 缓存作诊断依据，也未请求 RSS 正文：
+
+| 对照 | 结果 |
+| --- | --- |
+| urllib，现用代理，现有 Atlas UA | 403，AkamaiGHost，Access Denied |
+| urllib，禁用客户端代理，现有 Atlas UA | 403，AkamaiGHost，Access Denied |
+| requests，现用代理，现有 Atlas UA，标准压缩及连接头 | 403，AkamaiGHost，Access Denied |
+| requests，禁用客户端代理，其余相同 | 403，AkamaiGHost，Access Denied |
+| urllib，声明真实 Atlas 网站及 RSS reader 用途，文本 Accept | 403，AkamaiGHost，Access Denied |
+
+采集 cron 的代理与当前命令环境一致；Web systemd 服务未配置代理。两种网络路径、
+两种既有 HTTP 客户端及透明身份的请求对照都被站点边缘拒绝；不能把当前失败仅归于
+旧缓存或某一客户端配置，也不能据此确定站点具体按 IP、UA 还是其他规则拦截。
+现有 24 小时负缓存确实包含早先的 403，但本轮实时请求证明不是仅由该缓存导致。
+
+没有找到能通过普通代理/请求设置修复的方式。需由 GlobeNewswire 确认并允许 Atlas
+访问，或提供可用的官方订阅交付地址；未采用浏览器伪装、验证码绕过或代理轮换。
+原 RSS 地址、UA、配置版本 17 和禁用状态保留，SEC、付费和邮件信源未变更；没有改
+采集业务代码或重复运行 Mock 回归。5 次真实 HTTP 对照及状态核验结果保存在
+`.tmp_atlas/globenewswire-403-diagnosis/`。尚未满足用户要求的启用条件。
+
+#### GlobeNewswire 桌面浏览器对照与正式启用（2026-10-29）
+
+用户提供四个可正常打开的公开 RSS，并确认浏览器使用与 Atlas 相同的代理。本轮补测
+这四个实际订阅及 Aluminum 订阅：普通 HTTP 客户端仍收到 403，带用户原始 `_gl`
+查询参数也未改善；`_gl` 是浏览器链接附带的追踪参数，不作为授权凭据或永久配置。
+无头 Chromium 与声明 Atlas UA 的 Chromium 也收到 403。**实际桌面 Chromium 使用
+自身真实身份，在相同代理下成功获取 robots.txt 和 Aluminum RSS，均为 HTTP 200**；
+robots 允许 `/RssFeed/`。桌面 Chromium 直连 robots 也返回 200。该对照确认存在客户端
+兼容性差异，不能再从先前的失败推导出必须由站方开通。此前要求联系站方的阶段性判断
+由本节结果替代；没有尝试冒充客户端、读取登录会话或处理访问挑战。
+
+**实现**：增加可选 `browser` 依赖组（Playwright 及其两个运行依赖），复用机器已安装的
+Chromium 156 与 Xvfb。`atlas.collect.chromium` 只为注册表中显式标记 `chromium` 的
+站点选择真实桌面浏览器，其余来源使用现有 HTTP 客户端。频道保存真实 UA 与用途说明；
+浏览器版本/身份变化必须重新配置和验证。浏览器接收原站响应后结束内部导航，将原站的
+状态、头和正文交回原有 Collector；不渲染网页脚本或抓取图标等资源，3xx 由原来的策略
+逐跳检查后处理。原站错误状态不改成成功，robots、共享限速和采集失败记录继续生效。
+正文读取器对显式配置的站点复用相同读取方式，仍使用原有正文清洗、存储和模型流程。
+
+相关文件：`src/atlas/collect/chromium.py`、`collect/article.py`、`compose/tasks.py`、
+`aluminium/{sources,models,source_page,ui,__main__}.py`、`pyproject.toml`、`uv.lock`、
+`tests/test_collect_chromium.py`；相对模块路径均在 `src/atlas/` 下。
+无数据库表结构迁移，不修改原始信源目录。
+
+**正式验证**：配置版本 17 → 18（浏览器读取，保持禁用）→ 19（RSS 验证后启用），
+没有新建或重复导入渠道。首轮经既有采集器读取并读回核验归档，获得 **HTTP 200、
+20 个 RSS 条目、48359 字节**；Raw 为 `raw_ac4d4b0a3eef4cb0ad5cca73a4ca6908`。
+实际采集时间为北京时间 **2026-10-29 20:02:41**；默认 P0 每 6 小时，由原有每五分钟
+调度器检查到期。管理页真实 HTTP 验证显示“运行正常”、已启用、最近成功时间。
+另从首条新闻实际读取并保存 259259 字节 HTML，清洗正文 35334 字符、无截断。
+首批 20 条短标题/摘要均未满足既有行业加事件关键词筛选，新增结构化候选为 0；
+这不等于结构化处理失败，也不声称已从这 20 条提取出产能事件。后续符合规则的内容
+继续由已启用的自动结构化任务处理。
+
+**保全与回归**：37 项原始来源 JSON、其他 42 个渠道完整配置均保留，历史新闻和提取
+记录无删除。重复执行浏览器配置新增 0 条、版本仍为 19、启用状态保持。SEC 仍跳过，
+付费和邮件信源未更改。真实本地 Mock HTTP 与现有采集/正文/管理回归 **256 项全部通过**，
+覆盖真实浏览器读取、原始响应/503、身份变更、无脚本或子资源请求、禁止的重定向、
+robots 拒绝、完整采集归档及 Mock 模型提取。新模块及本次相关模块的 Ruff 检查通过；
+证据保存在 `.tmp_atlas/globenewswire-browser-enabled/`，JUnit 报告为
+`.tmp_atlas/globenewswire-browser-tests.xml`。服务已重启并通过健康及管理页核验。
+
+部署需要安装可选依赖及浏览器运行环境；本机已经具备 Chromium/Xvfb。新机器可运行
+`UV_PROJECT_ENVIRONMENT=.venv-new uv sync --frozen --extra browser`，按 Playwright
+标准安装 Chromium 及系统运行库；可用 `ATLAS_CHROMIUM_EXECUTABLE` 指定已有浏览器。
+配置/复验使用同一来源及 RSS 地址：
+
+```bash
+PYTHONPATH=src .venv-new/bin/python -m atlas.aluminium configure-rss \
+  opa-038978e34d52268d6b1db9a0 \
+  'https://www.globenewswire.com/RssFeed/industry/1753-Aluminum/feedTitle/GlobeNewswire%20-%20Industry%20News%20on%20Aluminum' \
+  --browser
+ATLAS_LIVE=1 PYTHONPATH=src .venv-new/bin/python -m atlas.aluminium probe \
+  --source-id opa-038978e34d52268d6b1db9a0 --enable-verified \
+  --report .tmp_atlas/globenewswire-probe.json
+```

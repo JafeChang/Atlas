@@ -266,6 +266,15 @@ class SqliteLastCollectionSource:
                     f"SELECT channel_id AS channel_id, MAX(fetched_at) AS last_at "
                     f"FROM {self._table} GROUP BY channel_id ORDER BY channel_id"
                 ).fetchall()
+                # 海外原铝端点用实际轮询记录控制间隔：内容未变化或失败也应等待
+                # 6/12/24 小时，不能因 Raw 内容寻址没有新增行而每 5 分钟重抓。
+                if connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='aluminium_attempts'"
+                ).fetchone():
+                    rows = list(rows) + connection.execute(
+                        "SELECT channel_id, MAX(attempted_at) AS last_at "
+                        "FROM aluminium_attempts GROUP BY channel_id"
+                    ).fetchall()
             except sqlite3.Error as exc:
                 raise ScheduleError(
                     f"读取 {self._path} 的 {self._table} 表失败：{exc}；"
@@ -283,8 +292,11 @@ class SqliteLastCollectionSource:
                     f"{self._table} 里有 channel_id 为 NULL 的行；"
                     "调度无法把它归属到任何渠道（数据损坏，拒绝静默跳过）"
                 )
-            collected[str(channel_id)] = parse_timestamp(
+            timestamp = parse_timestamp(
                 last_at, channel_id=str(channel_id)
+            )
+            collected[str(channel_id)] = max(
+                timestamp, collected.get(str(channel_id), timestamp)
             )
         return collected
 

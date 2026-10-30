@@ -134,6 +134,10 @@ def running_frontend(tmp_path: Path, *, actor: str = "tester", require_login: bo
         archive.close()
 
     db_path = root / "atlas.db"
+    class TranslationClient:
+        def translate(self, segments):
+            return {key: "测试中文译文：" + text for key, text in segments.items()}
+
     app = build_webapp(
         root,
         require_login=require_login,
@@ -142,6 +146,7 @@ def running_frontend(tmp_path: Path, *, actor: str = "tester", require_login: bo
         industry_of={"chan-feed": "ai", "chan-article": "web"},
         actor=actor,
         initialize_labels=True,
+        translation_client_factory=TranslationClient,
     )
     try:
         yield SimpleNamespace(app=app, root=root, db_path=db_path)
@@ -308,7 +313,7 @@ def test_new_feed_collected_after_startup_can_be_browsed_and_labeled(tmp_path: P
             assert labels[0].anchor.char_end == int(fields["char_end"])
 
 
-def test_empty_rss_and_atom_are_subscription_notices_instead_of_articles(tmp_path: Path) -> None:
+def test_empty_rss_and_atom_do_not_become_articles_or_show_notice_panel(tmp_path: Path) -> None:
     from atlas.webapp import store_summary
 
     with running_frontend(tmp_path) as world:
@@ -330,7 +335,8 @@ def test_empty_rss_and_atom_are_subscription_notices_instead_of_articles(tmp_pat
         status, page, _ = _get(world.app, "/feed?limit=200")
         assert status == 200
         assert 'class="count">共 4 条' in page
-        assert "本次订阅没有可展示的文章" in page
+        assert "订阅与浏览提示" not in page
+        assert 'class="feed-notices' not in page
         assert "Gamma Report" in page  # 非空订阅仍展示真实文章。
         for raw_id in empty_ids:
             assert f'id="item-{raw_id}"' not in page
@@ -380,7 +386,7 @@ def test_json_news_are_articles_and_challenges_are_not(tmp_path: Path) -> None:
         assert hits[0]["title"] in page and hits[1]["title"] in page
         assert 'href="https://example.test/news"' in page
         assert 'href="https://news.ycombinator.com/item?id=124"' in page
-        assert "验证码验证页" in page
+        assert "订阅与浏览提示" not in page
         assert f'id="item-{blocked.raw_id}"' not in page
         status, documents, _ = _get(world.app, "/feed?granularity=document&limit=200")
         assert status == 200 and f'id="item-{blocked.raw_id}"' in documents

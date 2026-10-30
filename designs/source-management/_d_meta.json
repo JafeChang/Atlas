@@ -1,0 +1,50 @@
+{
+  "type": "design",
+  "designSystems": [],
+  "primaryDesignSystem": null,
+  "assets": {
+    "信源管理": {
+      "versions": [
+        {
+          "path": "source-management-before.html",
+          "createdAt": "2026-10-29T08:45:13.746Z",
+          "status": "needs-review",
+          "subtitle": "原有页面",
+          "viewport": {
+            "width": 1440,
+            "height": 1000
+          }
+        },
+        {
+          "path": "source-management.html",
+          "createdAt": "2026-10-29T08:45:13.766Z",
+          "status": "needs-review",
+          "subtitle": "统一管理 · AI 与海外电解铝按行业分组",
+          "viewport": {
+            "width": 1440,
+            "height": 1000
+          }
+        },
+        {
+          "path": "source-management-compact.html",
+          "createdAt": "2026-10-29T09:04:29.881Z",
+          "status": "needs-review",
+          "subtitle": "紧凑版 · 电解铝目录",
+          "viewport": {
+            "width": 1440,
+            "height": 1000
+          }
+        }
+      ]
+    }
+  },
+  "createdAt": "2026-10-29T08:45:13.746Z",
+  "updatedAt": "2026-10-29T09:04:29.902Z",
+  "title": "Atlas 信源管理",
+  "prompt": "将原有 AI 信源与海外电解铝信源放在统一管理页，按行业分组管理，保留紧凑视图。",
+  "references": [
+    "src/atlas/webui/pages.py",
+    "src/atlas/aluminium/ui.py",
+    "src/atlas/aluminium/source_page.py"
+  ]
+}

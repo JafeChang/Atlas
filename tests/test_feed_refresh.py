@@ -187,7 +187,8 @@ def test_registered_subscription_error_is_not_an_article_and_true_article_surviv
         status, page, _ = _get(app, "/feed?limit=200")
         soup = BeautifulSoup(page, "html.parser")
         assert status == 200 and len(soup.select("article.entry")) == 2
-        assert "订阅端点" in page and "Article One" in page
+        assert "Article One" in page
+        assert not soup.select(".feed-notices")
         assert not soup.select(f"#item-{broken.raw_id}")
         assert soup.select(f"#item-{direct.raw_id}")
         assert hashlib.sha256((root / "atlas.db").read_bytes()).digest() == digest

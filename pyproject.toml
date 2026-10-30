@@ -44,6 +44,11 @@ dependencies = [
     "minio>=7.2.20",
 ]
 
+[project.optional-dependencies]
+browser = [
+    "playwright>=1.64.1",
+]
+
 [dependency-groups]
 dev = [
     "pytest>=8.0.0",

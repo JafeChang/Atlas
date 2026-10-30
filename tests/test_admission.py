@@ -90,8 +90,8 @@ def test_gate_filters_before_pagination_and_never_rewrites_raw_or_labels(tmp_pat
             and "Buy now" not in page
             and "Pending article" not in page
         )
-        assert "1 条待审" in page and "1 条已拦截" in page
-        assert "下一页" not in page
+        assert not soup.select(".feed-notices")
+        assert not soup.select('a[aria-label="下一页"]')
         assert list(db.iterdump()) == snapshot
         db.close()
     finally:

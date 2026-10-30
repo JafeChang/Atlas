@@ -152,6 +152,14 @@ def validate_endpoint(url: str) -> str:
     return url
 
 
+def validate_industry_id(value: str, *, what: str) -> str:
+    # 用户指定的行业标识。仅行业引用接受此兼容值，既有渠道 ID 规则保持不变；
+    # 不给历史记录增加默认字段，避免改变配置版本的内容摘要。
+    if value == "overseas_primary_aluminium":
+        return value
+    return validate_id(value, what=what)
+
+
 def require_adapter_plugin(fetch_type: str) -> None:
     """未知协议类型的扩展边界（SPEC §2.6）。
 
@@ -260,7 +268,7 @@ class Industry(ContractModel):
     @field_validator("id")
     @classmethod
     def _check_id(cls, value: str) -> str:
-        return validate_id(value, what="industry.id")
+        return validate_industry_id(value, what="industry.id")
 
     @field_validator("name")
     @classmethod
@@ -274,7 +282,7 @@ class Industry(ContractModel):
     def _check_parent_id(cls, value: Optional[str]) -> Optional[str]:
         if value is None:
             return None
-        validate_id(value, what="industry.parent_id")
+        validate_industry_id(value, what="industry.parent_id")
         return value
 
     @field_validator("keywords")
@@ -327,7 +335,7 @@ class Channel(ContractModel):
     @field_validator("industry_id")
     @classmethod
     def _check_industry_id(cls, value: str) -> str:
-        return validate_id(value, what="channel.industry_id")
+        return validate_industry_id(value, what="channel.industry_id")
 
     @field_validator("endpoint")
     @classmethod

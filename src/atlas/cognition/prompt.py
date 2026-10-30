@@ -66,6 +66,13 @@ def build_system_prompt(candidate_labels: Iterable[str], kind: str) -> str:
         '- If nothing applies, return {"schema_version": "cognition-output/1", "claims": []}.\n'
         "- Never add any other key to the object or to a claim.\n\n"
         f"{label_block}"
+        + (
+            "\n`overseas_primary_aluminium` means overseas (outside China) primary aluminium "
+            "smelter capacity and commissioning/curtailment/restart events. Alumina refining "
+            "and secondary/recycled aluminium are separate businesses; do not classify their "
+            "capacity as primary smelting. First metal is not full capacity."
+            if "overseas_primary_aluminium" in labels else ""
+        )
     )
 
 

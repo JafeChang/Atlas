@@ -173,7 +173,7 @@ def test_browser_reads_completed_parts_and_preserves_nodes(tmp_path, stream_mode
             elif stream_mode == 'stalled':
                 page.route('**/translation-stream?*', lambda route: pending.append(route))
             page.goto(app.base_url + link)
-            page.get_by_role('tab', name='中文').click()
+            assert page.get_by_role('tab', name='中文').get_attribute('aria-selected') == 'true'
             assert fake.waiting.wait(5)
             page.wait_for_function("""() => {
               const body = document.querySelector('#body-chinese');
@@ -224,7 +224,7 @@ def test_browser_keeps_partial_text_on_failure_and_retry(tmp_path):
         try:
             page = browser.new_page()
             page.goto(app.base_url + link)
-            page.get_by_role('tab', name='中文').click()
+            assert page.get_by_role('tab', name='中文').get_attribute('aria-selected') == 'true'
             assert fake.waiting.wait(5)
             page.wait_for_function("document.querySelector('#body-chinese').textContent.includes('已翻译')")
             fake.release.set()

@@ -70,7 +70,7 @@ def test_browser_impressions_click_and_detail_are_linked(tmp_path):
                 pytest.skip("browser test requires Chromium")
             raise
         try:
-            page = browser.new_page(viewport={"width": 900, "height": 500})
+            page = browser.new_page(viewport={"width": 900, "height": 450})
             errors = []
             page.on("pageerror", lambda error: errors.append(str(error)))
             page.goto(world.app.base_url + "/feed?order=asc&limit=50")
@@ -79,8 +79,10 @@ def test_browser_impressions_click_and_detail_are_linked(tmp_path):
             first = cards.first
             last = cards.last
             last_identity = (last.get_attribute("data-raw-id"), int(last.get_attribute("data-char-start")))
-            assert last.bounding_box()["y"] >= 500
-            page.wait_for_timeout(500)
+            last_box = last.bounding_box()
+            scroll_box = page.locator('.feed-items').bounding_box()
+            assert last_box['y'] >= min(450, scroll_box['y'] + scroll_box['height']) - last_box['height'] * 0.5
+            page.wait_for_timeout(1500)
             initial = _rows(world.db_path.with_name("analytics.db"))
             assert not any(r["event_type"] == "list_impression" and
                            (r["raw_id"], r["char_start"]) == last_identity for r in initial)
@@ -97,6 +99,10 @@ def test_browser_impressions_click_and_detail_are_linked(tmp_path):
                     page.wait_for_timeout(50)
                 raise AssertionError(_rows(path))
             wait_for(lambda rows: any(r["event_type"] == "list_impression" and r["raw_id"] == raw_id and r["char_start"] == start for r in rows))
+            last.scroll_into_view_if_needed()
+            wait_for(lambda rows: any(r['event_type'] == 'list_impression' and
+                                     (r['raw_id'], r['char_start']) == last_identity for r in rows))
+            first.scroll_into_view_if_needed()
             first.get_by_role("button", name="标记有效", exact=True).click()
             wait_for(lambda rows: any(r["action"] == "label_valid" and r["raw_id"] == raw_id and r["char_start"] == start for r in rows))
             first.locator("a.title").click()
@@ -254,7 +260,7 @@ def test_browser_qualified_exposure_reading_and_attribution(tmp_path):
             page.locator("#name").fill("alice")
             page.get_by_role("button", name="登录", exact=True).click()
             page.wait_for_url("**/feed")
-            card = page.locator('article[data-tracking-list-item]').first
+            card = page.locator('article[data-tracking-list-item]').filter(has_text='Alpha & Beta')
             card.scroll_into_view_if_needed()
             raw_id = card.get_attribute("data-raw-id")
             start = int(card.get_attribute("data-char-start"))
@@ -273,9 +279,12 @@ def test_browser_qualified_exposure_reading_and_attribution(tmp_path):
             assert served['strategy'] == 'chronological-v1' and served['collection_version'] == 'v2'
             assert served['view_id'] == impressions[0]['view_id'] and served['user_id']
             card.locator('a.title').click()
-            page.wait_for_url('**/article?**')
+            view = page.frame(name='atlas-detail')
+            assert view is not None
+            view.locator('.article-title').filter(has_text='Alpha & Beta').wait_for()
+            view.locator('.article-title').click()
             page.wait_for_timeout(1250)
-            page.evaluate("document.dispatchEvent(new Event('visibilitychange'))")
+            view.evaluate("document.dispatchEvent(new Event('visibilitychange'))")
             deadline = time.monotonic() + 10
             while time.monotonic() < deadline:
                 rows = _rows(path)
@@ -286,6 +295,32 @@ def test_browser_qualified_exposure_reading_and_attribution(tmp_path):
             assert reading and reading[0]['read_ms'] >= 1000
             assert reading[0]['parent_view_id'] == served['view_id']
             assert reading[0]['user_id'] == served['user_id']
+        finally:
+            browser.close()
+
+
+def test_mobile_sticky_header_does_not_count_covered_card_as_exposed(tmp_path):
+    api = pytest.importorskip('playwright.sync_api')
+    with running_frontend(tmp_path) as world, api.sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=True, args=['--no-sandbox'])
+        try:
+            page = browser.new_page(viewport={'width': 393, 'height': 600}, is_mobile=True, has_touch=True)
+            page.goto(world.app.base_url + '/feed?order=asc&limit=50')
+            first = page.locator('article[data-tracking-list-item]').first
+            raw_id = first.get_attribute('data-raw-id')
+            start = int(first.get_attribute('data-char-start'))
+            page.locator('.feed-items').evaluate("el => el.insertAdjacentHTML('beforeend', '<div style=height:1200px></div>')")
+            first.evaluate("el => window.scrollTo(0, el.getBoundingClientRect().bottom + window.scrollY - document.querySelector('.feed-header').offsetHeight - 10)")
+            page.wait_for_timeout(1600)
+            path = world.db_path.with_name('analytics.db')
+            def exposed(rows):
+                return any(r['event_type'] == 'list_impression' and r['raw_id'] == raw_id and r['char_start'] == start for r in rows)
+            assert not exposed(_rows(path))
+            page.evaluate('window.scrollTo(0, 0)')
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline and not exposed(_rows(path)):
+                page.wait_for_timeout(100)
+            assert exposed(_rows(path))
         finally:
             browser.close()
 

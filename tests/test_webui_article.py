@@ -156,6 +156,9 @@ def test_detail_contains_article_fields_and_rich_body_without_writes_or_translat
             "原文",
             "中文",
         ]
+        assert soup.select_one('#tab-chinese')['aria-selected'] == 'true'
+        assert not soup.select_one('#body-chinese').has_attr('hidden')
+        assert soup.select_one('#body-original').has_attr('hidden')
         assert len(soup.select(".vote-button[aria-pressed=false]")) == 2
         assert calls == images == [] and not cache.exists()
         assert hashlib.sha256(db_path.read_bytes()).hexdigest() == before
@@ -303,61 +306,99 @@ def test_browser_card_detail_tabs_images_and_label_actions(
             page.goto(app.base_url + "/feed?order=asc&limit=50")
             card = page.locator("article.item").filter(has_text="Alpha & Beta")
             card.click(position={"x": 7, "y": 7})
-            page.wait_for_url("**/article?**")
-            assert page.get_by_role("heading", name="正文", exact=True).count() == 1
+            if width >= 1100:
+                view = page.frame(name="atlas-detail")
+                assert view is not None
+                view.locator(".article-title").filter(has_text="Alpha & Beta").wait_for()
+                assert "/feed?" in page.url
+            else:
+                page.wait_for_url("**/article?**")
+                view = page
+            assert view.get_by_role("heading", name="正文", exact=True).count() == 1
+            assert view.get_by_role("tab", name="中文", exact=True).get_attribute("aria-selected") == "true"
+            view.locator("#body-chinese .translation-status").filter(has_text="AI 中文译文").wait_for()
+            assert not view.locator("#body-original").is_visible()
+            assert sum("Original heading" in batch.values() for batch in calls) == 1
+            translated_calls = len(calls)
+            view.get_by_role("tab", name="原文", exact=True).click()
             assert (
-                page.locator(".article-body strong").inner_text()
+                view.locator("#body-original .article-body strong").inner_text()
                 == "Original bold text"
             )
-            assert not calls and page.evaluate("window.bad !== true")
-            photo = page.locator('.article-body img[alt="Example figure"]')
+            assert view.evaluate("window.bad !== true")
+            photo = view.locator('#body-original .article-body img[alt="Example figure"]')
             photo.scroll_into_view_if_needed()
-            page.wait_for_function(
-                "document.querySelector('.article-body img').complete"
+            view.wait_for_function(
+                "document.querySelector('#body-original .article-body img').complete"
             )
             assert photo.evaluate("el => el.naturalWidth > 0")
-            page.locator(".image-unavailable").wait_for()
-            page.get_by_role("tab", name="中文", exact=True).click()
-            page.locator("#body-chinese .article-body h2").filter(
+            view.locator("#body-original .image-unavailable").wait_for()
+            view.get_by_role("tab", name="中文", exact=True).click()
+            view.locator("#body-chinese .article-body h2").filter(
                 has_text="中文译文"
             ).wait_for()
             assert (
-                page.locator("#body-chinese pre code").inner_text()
+                view.locator("#body-chinese pre code").inner_text()
                 == 'print("original code")'
             )
-            assert len(calls) == 1
-            page.get_by_role("tab", name="中文", exact=True).focus()
+            assert len(calls) == translated_calls
+            view.get_by_role("tab", name="中文", exact=True).focus()
             page.keyboard.press("ArrowLeft")
             assert (
-                page.get_by_role("tab", name="原文", exact=True).get_attribute(
+                view.get_by_role("tab", name="原文", exact=True).get_attribute(
                     "aria-selected"
                 )
                 == "true"
             )
             page.keyboard.press("ArrowRight")
             assert (
-                page.get_by_role("tab", name="中文", exact=True).get_attribute(
+                view.get_by_role("tab", name="中文", exact=True).get_attribute(
                     "aria-selected"
                 )
                 == "true"
             )
-            assert len(calls) == 1
+            assert len(calls) == translated_calls
             navigations = []
             page.on("framenavigated", lambda frame: navigations.append(frame.url))
-            page.get_by_role("button", name="标记有效", exact=True).click()
-            page.locator('.act-valid .vote-button[aria-pressed="true"]').wait_for()
+            view.get_by_role("button", name="标记有效", exact=True).click()
+            view.locator('.act-valid .vote-button[aria-pressed="true"]').wait_for()
             assert (
                 not navigations
-                and "valid=" not in page.locator(".article-detail").inner_text()
+                and "valid=" not in view.locator(".article-detail").inner_text()
             )
             page.reload()
-            page.get_by_role("tab", name="中文", exact=True).click()
-            page.locator("#body-chinese .article-body h2").wait_for()
-            assert len(calls) == 1
+            if width >= 1100:
+                view = page.frame(name="atlas-detail")
+                assert view is not None
+                view.locator(".article-title").filter(has_text="Alpha & Beta").wait_for()
+            assert view.get_by_role("tab", name="中文", exact=True).get_attribute("aria-selected") == "true"
+            view.locator("#body-chinese .article-body h2").wait_for()
+            assert len(calls) == translated_calls
             assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
+            assert view.evaluate("document.documentElement.scrollWidth <= innerWidth")
             assert (
-                page.locator(".act-valid .vote-button").get_attribute("aria-pressed")
+                view.locator(".act-valid .vote-button").get_attribute("aria-pressed")
                 == "true"
             )
+        finally:
+            browser.close()
+
+
+def test_native_chinese_browser_does_not_start_translation(tmp_path):
+    api = pytest.importorskip("playwright.sync_api")
+    with (
+        article_world(tmp_path, chinese=True) as (app, _, _, _, calls, _),
+        api.sync_playwright() as p,
+    ):
+        target = article_link(app)
+        browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
+        try:
+            page = browser.new_page(viewport={"width": 375, "height": 812})
+            translation_requests = []
+            page.on("request", lambda request: translation_requests.append(request.url) if "/translate?" in request.url else None)
+            page.goto(app.base_url + target)
+            assert page.locator(".article-body").filter(has_text="这是中文的完整文章正文").is_visible()
+            assert page.get_by_role("tab").count() == 0
+            assert calls == [] and translation_requests == []
         finally:
             browser.close()

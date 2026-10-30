@@ -58,8 +58,9 @@ PYTHONPATH=src ./.venv-new/bin/python -m atlas.webapp
 风格照 `atlas.compose.cli`：argparse、`--store-root` 默认 `data/store`
 （可用 `ATLAS_STORE_ROOT` 覆盖）、失败打印到 stderr 并非零退出。
 
-**它负责界面与按需阅读服务**：Feed / 原文详情不采集、不调用模型、不改配置；
-图片按浏览需要进入独立缓存，中文全文仅由用户切换 tab 后显式生成。三条硬要求：
+**它负责界面与按需阅读服务**：页面 GET 只读取既有数据，不采集、不调用模型、不改配置；
+图片按浏览需要进入独立缓存，详情页的浏览器默认通过同源 POST 请求中文全文，复用翻译缓存。
+三条硬要求：
 
 1. 启动时打印**真实 URL**（`--port 0` 时是内核分配的那个端口）与退出方式；
 2. **store 不存在 / 没有归档时响亮失败**，并写清下一步（先跑采集）——
@@ -161,6 +162,27 @@ class _Analysis:
     unavailable_reason: str = ""
 
 
+@dataclass(frozen=True, slots=True)
+class _BrowseEntry:
+    """列表需要的不可变条目元数据；不持有 XML 原文和文章正文。"""
+
+    entry_id: str
+    raw_id: str
+    raw_sha256: str
+    index: int
+    char_start: int
+    char_end: int
+    title: str
+    link: str
+    published_at: str | None
+
+
+@dataclass(frozen=True)
+class _BrowseRecord:
+    view: _RawEntriesView
+    sources: dict[tuple[int, int], BriefSource]
+
+
 class LocatedEntry:
     """`/entry` 所需的定位结果：条目 + **已切好的展示文本** + 是否精确命中。"""
 
@@ -190,11 +212,55 @@ class ArchiveEntriesAccess:
         self._cache: Dict[str, _Analysis] = {}
         self._brief_sources: Dict[str, Dict[tuple[int, int], BriefSource]] = {}
         self._cache_lock = threading.RLock()
+        self._browse_cache: dict[str, _BrowseRecord] = {}
+        self._browse_lock = threading.RLock()
         self._subscription_sources = read_subscription_sources(archive.db_path)
 
     # -- 基础 -----------------------------------------------------------------
     def content(self, raw_id: str) -> bytes:
         return self._archive.get_content(raw_id)
+
+    def browse_record(self, record: RawRecord) -> _BrowseRecord:
+        """Raw 不变，浏览索引可复用；审核、模型结果与个人标签不进入此缓存。
+
+        完整文本缓存仍受 LRU 限制，轻量索引独立保存，避免整批扫描超过 LRU
+        容量后在类型识别、条目展开、简介定位三个阶段反复重解析全部订阅。
+        """
+        with self._browse_lock:
+            cached = self._browse_cache.get(record.raw_id)
+            if cached is not None:
+                return cached
+            analysis = self._analyse(record)
+            sources = self.brief_sources(record.raw_id)
+            view = _RawEntriesView(
+                entries=tuple(
+                    _BrowseEntry(
+                        entry_id=e.entry_id,
+                        raw_id=e.raw_id,
+                        raw_sha256=e.raw_sha256,
+                        index=e.index,
+                        char_start=e.char_start,
+                        char_end=e.char_end,
+                        title=e.title,
+                        link=e.link,
+                        published_at=e.published_at,
+                    )
+                    for e in analysis.entries
+                ),
+                text_length=analysis.text_length,
+                is_feed=analysis.is_feed,
+                problems=analysis.problems,
+                unavailable_reason=analysis.unavailable_reason,
+            )
+            # key 已按原始摘要算出，列表只需要 key / URL / 语言判定；完整
+            # BriefSource 留给详情与后台处理路径，不能把数万篇正文常驻列表缓存。
+            refs = {
+                span: BriefSource(s.key, s.title, "", s.kind, s.url)
+                for span, s in sources.items()
+            }
+            cached = _BrowseRecord(view, refs)
+            self._browse_cache[record.raw_id] = cached
+            return cached
 
     def _analyse(self, record: RawRecord) -> _Analysis:
         with self._cache_lock:
@@ -402,6 +468,7 @@ def build_webapp(
     cache_root: Any = None,
     image_cache: Any = None,
     translation_client_factory: Any = None,
+    prewarm_browse: bool = False,
 ) -> WebUIApplication:
     """装配一个**按条目渲染**的真实前端（已启动）。
 
@@ -415,6 +482,7 @@ def build_webapp(
         initialize_labels: 是否在建服务前初始化标签库（建表 + 触发器，归 T-108）。
             默认 `True`（部署入口的语义）；**只想浏览、不想在磁盘上留下任何东西时
             传 `False`**（此时标签库文件不会被创建）。
+        prewarm_browse: 上线启动时预建已有 Raw 的轻量索引，避免首个用户请求承担解析。
 
     注入的三件套（`entries_of` / `locate_entry` / `text_length`）都来自
     `atlas.entries`（T-130），且**必须**注入：缺了它们 `/feed` 会响亮失败，
@@ -424,13 +492,20 @@ def build_webapp(
     `atlas.webui` 不需要知道 `atlas.archive` 的存在）。
     """
     archive = open_archive(root)
-    access = ArchiveEntriesAccess(archive)
+    access = ArchiveEntriesAccess(archive, cache_size=8)
+    if prewarm_browse:
+        try:
+            for raw_id in archive.all_raw_ids():
+                access.browse_record(archive.get(raw_id))
+        except Exception:
+            archive.close()
+            raise
     kinds: Dict[str, Optional[str]] = {}
 
     def entry_kind_of(raw_id: str) -> Optional[str]:
         # Raw 不可变，单条分类可缓存；归档清单不能缓存，采集进程会持续追加。
         if raw_id not in kinds:
-            kinds[raw_id] = FEED_ENTRY_KIND if access.is_container(raw_id) else None
+            kinds[raw_id] = FEED_ENTRY_KIND if access.browse_record(archive.get(raw_id)).view.is_feed else None
         return kinds[raw_id]
 
     source = ArchiveFeedSource(
@@ -440,7 +515,7 @@ def build_webapp(
     )
 
     def entries_of(record: RawRecord) -> RawEntriesView:
-        return access.entries_of(record)
+        return access.browse_record(record).view
 
     def locate_entry(record: RawRecord, **kwargs: Any) -> LocatedEntry:
         return access.locate_entry(record, **kwargs)
@@ -454,7 +529,7 @@ def build_webapp(
 
     def project_entries(entries: Sequence[FeedEntry], session: Any) -> Sequence[FeedEntry]:
         views = read_classifications(db_path)
-        briefs = read_articles(db_path)
+        briefs = read_articles(db_path, include_text=False)
         admission = read_admissions(db_path)
         bodies = read_article_contents(db_path)
         articles = {v.raw_id: v for v in views.values() if v.unit_kind == "article"}
@@ -462,7 +537,7 @@ def build_webapp(
         sources_by_raw: dict[str, dict[tuple[int, int], BriefSource]] = {}
         for entry in entries:
             if entry.raw_id not in sources_by_raw:
-                sources_by_raw[entry.raw_id] = access.brief_sources(entry.raw_id)
+                sources_by_raw[entry.raw_id] = access.browse_record(archive.get(entry.raw_id)).sources
             summary_source = sources_by_raw[entry.raw_id].get((entry.char_start, entry.char_end))
             summary, summary_origin = display_brief(summary_source, briefs) if summary_source else ("", "")
             article = briefs.get(summary_source.key) if summary_source else None
@@ -542,6 +617,7 @@ def build_webapp(
         reader.close()
         archive.close()
 
+    from atlas.aluminium.ui import SourceManagement
     from atlas.users import UserStore
 
     return WebUIApplication(
@@ -550,6 +626,7 @@ def build_webapp(
         users=UserStore(Path(db_path).with_name("users.db")) if require_login else None,
         events=EventStore(Path(db_path).with_name("analytics.db")),
         industry_provider=industry_provider,
+        source_management=SourceManagement(db_path),
         raw_exists=raw_exists_from_source(source),
         actor=actor,
         entries_lookup=entries_of,
@@ -792,6 +869,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             actor=str(args.actor),
             host=args.host,
             port=args.port,
+            prewarm_browse=True,
         )
         print(
             render_startup(

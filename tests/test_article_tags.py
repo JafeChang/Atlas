@@ -129,7 +129,7 @@ def test_article_actions_and_bottom_sheet_in_browser(tmp_path, width, height):
             assert field.is_visible()
             field.click()
             assert field.is_visible()
-            card.locator('.meta').first.click()
+            card.locator('.meta').first.click(position={'x': 5, 'y': 5})
             assert not field.is_visible()
             assert '/feed?' in page.url
             card.locator('.industry-editor summary').click()

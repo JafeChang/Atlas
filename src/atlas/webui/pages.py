@@ -48,7 +48,7 @@ from __future__ import annotations
 
 import html
 from string import Template
-from typing import Any, Mapping, Optional, Sequence
+from typing import Any, Mapping, Sequence  # noqa: UP035
 from urllib.parse import urlencode
 
 from atlas.analytics.tracking import TRACKING_SCRIPT
@@ -288,7 +288,6 @@ code, .raw-id { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; fon
 .record-details summary { border-top: 1px solid var(--border); font-weight: 600; }
 .record-details .meta { display: block; }
 .notice { border-left: 4px solid currentColor; padding: 0.4rem 0.6rem; margin: 0.8rem 0; }
-.feed-notices { font-size: 0.875rem; color: var(--muted); overflow-wrap: anywhere; }
 .empty { opacity: 0.8; }
 .entry-slice { margin: 0.8rem 0; padding: 0.6rem 0.8rem; border-left: 4px solid currentColor;
                white-space: pre-wrap; overflow-wrap: anywhere; max-height: 60rem; overflow: auto; }
@@ -335,18 +334,403 @@ footer { margin-top: 2rem; font-size: 0.75rem; opacity: 0.7; }
   .pager .count { flex-basis: auto; margin-right: auto; }
   .item { padding: 1.25rem; }
 }
+/* Feed and article keep independent scroll positions on wide screens. */
+.feed-detail { display: none; }
+@media (min-width: 1100px) {
+  body.feed-page { max-width: none; height: 100dvh; padding: 1rem 1.5rem; overflow: hidden;
+                   display: flex; flex-direction: column; }
+  .feed-page > h1 { flex: none; margin: 0 0 0.8rem; }
+  .feed-page > footer { display: none; }
+  .feed-layout { display: grid; grid-template-columns: minmax(20rem, 38%) minmax(0, 1fr);
+                 gap: 1rem; flex: 1; min-height: 0; }
+  .feed-list { min-width: 0; min-height: 0; overflow-y: auto; overscroll-behavior: contain;
+               padding: 0 0.5rem 2rem 0; }
+  .feed-detail { display: flex; flex-direction: column; min-width: 0; min-height: 0;
+                 overflow: hidden; border: 1px solid var(--border); border-radius: 14px;
+                 background: var(--surface); }
+  .feed-detail iframe { flex: 1; width: 100%; min-height: 0; border: 0; }
+  .feed-detail iframe[hidden] { display: none; }
+  .detail-placeholder { margin: auto; padding: 2rem; color: var(--muted); text-align: center; }
+  .item.is-selected { border-color: var(--accent); box-shadow: inset 3px 0 0 var(--accent); }
+}
+body.embedded-detail { max-width: none; padding: 1.25rem; }
+body.embedded-detail > h1, body.embedded-detail > footer { display: none; }
+body.embedded-detail .article-detail { margin: 0; padding: 0; border: 0; }
 @media (prefers-color-scheme: dark) {
-  :root { --bg: #101720; --surface: #18212d; --text: #e5ebf3; --muted: #a8b6c8;
+  :root:not([data-theme=light]) { --bg: #101720; --surface: #18212d; --text: #e5ebf3; --muted: #a8b6c8;
           --border: #354357; --accent: #8dbaff; --tint: #233653;
           --valid: #7cdbac; --valid-bg: #183c2d; --invalid: #ffa0b3; --invalid-bg: #45232d;
           --manual: #ccb0ff; --manual-bg: #342743; --neutral-bg: #25303d;
           --history: #efca83; --history-bg: #3c3220; }
-  button, .quick a[aria-current=page] { color: #101720; }
-  .vote-button, .icon-action { color: var(--muted); }
 }
+:root[data-theme=dark] { --bg: #101720; --surface: #18212d; --text: #e5ebf3; --muted: #a8b6c8;
+  --border: #354357; --accent: #8dbaff; --tint: #233653;
+  --valid: #7cdbac; --valid-bg: #183c2d; --invalid: #ffa0b3; --invalid-bg: #45232d;
+  --manual: #ccb0ff; --manual-bg: #342743; --neutral-bg: #25303d;
+  --history: #efca83; --history-bg: #3c3220; color-scheme: dark; }
+:root[data-theme=light] { color-scheme: light; }
+
+/* The reading interface follows the supplied Atlas prototype. */
+.feed-brand, .source-menu, .theme-toggle, .feed-user, .compact-pager, .tag-overflow, .filter-panel summary svg { display: none; }
+  body.feed-page { --bg: #eceff1; --surface: #fbfcfc; --text: #181b1f; --muted: #626a73;
+    --border: #d9dee2; --accent: #27508a; --tint: #dbe5f4; --neutral-bg: #e1e6ea;
+    --valid: #1f6e45; --valid-bg: #dcefe3; --invalid: #a23a28; --invalid-bg: #f5dfd9;
+    padding: 0; font-size: 14px; -webkit-font-smoothing: antialiased; }
+  .feed-page > h1 { display: none; }
+  .feed-layout { grid-template-columns: clamp(360px, 31vw, 450px) minmax(0, 1fr); gap: 0; }
+  .feed-list { display: flex; flex-direction: column; overflow: hidden; padding: 0;
+               border-right: 1px solid var(--border); background: var(--bg);
+               container: feed-list / inline-size; }
+  .feed-header { position: relative; z-index: 4; display: flex; flex-direction: column;
+                 align-items: stretch; gap: 4px; flex: none; padding: 0 10px 10px 14px;
+                 border-bottom: 1px solid var(--border); }
+  .feed-header-main, .feed-header-controls { display: flex; flex-wrap: nowrap;
+    align-items: center; gap: 4px; min-width: 0; }
+  .feed-header-main { min-height: 44px; }
+  .feed-brand { display: flex; align-items: center; gap: 8px; flex: 1 1 auto;
+                min-width: 0; height: 44px; font-size: 15px; }
+  .feed-brand span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .feed-source-management { flex: none; text-decoration: none; }
+  .feed-brand strong { font-weight: 650; }
+  .feed-brand span { color: var(--muted); }
+  .feed-brand svg, .feed-source-management svg, .theme-toggle svg, .feed-user svg, .filter-panel summary svg, .source-menu svg {
+    width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 1.75;
+    stroke-linecap: round; stroke-linejoin: round; flex: none; }
+  .feed-brand svg { width: 20px; height: 20px; color: var(--accent); }
+  .account, .source-tabs, .feed-top-pager { display: none; }
+  .filter-panel { order: 1; position: static; padding: 0; border: 0; background: transparent; }
+  .feed-source-management, .filter-panel summary, .feed-user summary, .theme-toggle { display: grid; place-items: center;
+    width: 36px; height: 36px; min-height: 36px; padding: 0; border: 0; border-radius: 8px;
+    color: var(--muted); background: transparent; list-style: none; cursor: pointer; }
+  .filter-panel summary::-webkit-details-marker, .feed-user summary::-webkit-details-marker,
+  .source-menu summary::-webkit-details-marker { display: none; }
+  .filter-panel summary svg { display: block; }
+  .filter-panel summary span { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
+  .feed-source-management:hover, .filter-panel summary:hover, .feed-user summary:hover, .theme-toggle:hover { background: var(--neutral-bg); color: var(--text); }
+  .filter-panel .filters { position: absolute; top: calc(100% + 4px); right: 10px; z-index: 8;
+    display: flex; width: min(21rem, calc(100vw - 2rem)); padding: 0.85rem; border: 1px solid var(--border);
+    border-radius: 12px; background: var(--surface); box-shadow: 0 10px 30px #141e2d2e; }
+  .filter-panel .filters label:first-child { flex: 1 1 100%; }
+  .theme-toggle { order: 2; }
+  .feed-user { display: block; position: relative; order: 3; }
+  .feed-user > div { position: absolute; right: 0; top: calc(100% + 4px); z-index: 8; min-width: 12rem;
+    padding: 0.8rem; border: 1px solid var(--border); border-radius: 12px; background: var(--surface);
+    box-shadow: 0 10px 30px #141e2d2e; overflow-wrap: anywhere; }
+  .feed-user form { margin-top: 0.5rem; }
+  .feed-user button { min-height: 36px; width: 100%; }
+  .source-menu { display: block; position: relative; order: 4; flex: 1 1 0; min-width: 0; max-width: none; }
+  .source-menu summary { display: flex; align-items: center; gap: 6px; width: fit-content; max-width: 100%;
+    height: 34px; min-height: 34px; padding: 0 8px 0 10px; border: 1px solid var(--border);
+    border-radius: 8px; background: var(--surface); cursor: pointer; font-size: 13px; list-style: none; }
+  .source-menu summary span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .source-menu summary svg { width: 14px; height: 14px; }
+  .source-menu nav { position: absolute; top: calc(100% + 6px); left: 0; z-index: 8;
+    width: min(19rem, calc(100vw - 2rem)); max-height: min(60dvh, 28rem); overflow-y: auto;
+    padding: 6px; border: 1px solid var(--border); border-radius: 12px; background: var(--surface);
+    box-shadow: 0 10px 30px #141e2d2e; }
+  .source-menu nav a { display: block; min-height: 36px; padding: 8px 10px; border-radius: 8px;
+    color: var(--text); text-decoration: none; overflow-wrap: anywhere; }
+  .source-menu nav a:hover, .source-menu nav a[aria-current=page] { background: var(--tint); }
+  .source-menu-group + .source-menu-group { margin-top: 4px; padding-top: 4px; border-top: 1px solid var(--border); }
+  .source-menu-group-title { padding: 6px 10px; font-size: 12px; font-weight: 650; color: var(--muted); overflow-wrap: anywhere; }
+  .source-menu-group-count { font-weight: 400; }
+  .quick { order: 5; flex: none; gap: 1px; margin: 0 0 0 4px; padding: 2px;
+           border-radius: 8px; background: var(--neutral-bg); }
+  .quick a { display: inline-flex; align-items: center; min-height: 30px; padding: 0 7px;
+             border-radius: 6px; color: var(--text); font-size: 13px; white-space: nowrap; }
+  .quick a[aria-current=page] { background: var(--surface); color: var(--text); font-weight: 600;
+                                box-shadow: 0 1px 2px #0002; }
+  .feed-items { flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain; }
+  .compact-pager { order: 6; display: flex; flex: none; align-items: center; gap: 1px;
+    margin-left: auto; color: var(--muted); font-size: 11px; white-space: nowrap; }
+  .compact-count { margin-right: 3px; }
+  .page-number { min-width: 28px; max-width: 6ch; overflow: hidden; text-overflow: ellipsis;
+    text-align: center; font-variant-numeric: tabular-nums; }
+  .page-arrow { display: inline-grid; place-items: center; width: 24px; height: 34px;
+    border-radius: 8px; color: var(--muted); text-decoration: none; }
+  .page-arrow:hover { color: var(--text); background: var(--neutral-bg); }
+  .page-arrow[aria-disabled=true] { opacity: 0.35; }
+  .page-arrow svg { width: 18px; height: 18px; fill: none; stroke: currentColor;
+    stroke-width: 1.75; stroke-linecap: round; stroke-linejoin: round; }
+@container feed-list (max-width: 430px) {
+  .compact-count { display: none; }
+}
+  .feed-items > .empty { padding: 2rem 16px; text-align: center; }
+  .feed-items .item { display: flex; flex-direction: column; position: relative; margin: 0;
+    padding: 10px 16px 12px; border: 0; border-bottom: 1px solid var(--border); border-radius: 0;
+    background: transparent; }
+  .feed-items .item:hover { background: #e3e8ec; }
+  .feed-items .item.is-selected { background: #dfe7f2; box-shadow: inset 3px 0 0 var(--accent); }
+  .feed-items .item .head { display: flex; flex-direction: column; order: 1; padding: 0; }
+  .feed-items .item .title { font-size: 14.5px; line-height: 1.42; font-weight: 650;
+    display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+  .feed-items .item .title-zh { order: -1; margin: 0; font-size: 14.5px; line-height: 1.42; font-weight: 650;
+    display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+  .feed-items .item .head:has(.title-zh) .title { color: var(--muted); font-size: 12px; font-weight: 400;
+    display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .feed-items .item > .feed-item-meta { order: 0; min-height: 30px; margin: 0;
+    padding-right: 156px; color: var(--muted); font-size: 12px; white-space: nowrap; overflow: hidden; }
+  .feed-items .item .summary, .feed-items .item .summary-origin { order: 2; margin: 6px 0 8px;
+    color: #454c54; font-size: 13px; line-height: 1.5; display: -webkit-box; -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical; overflow: hidden; }
+  .feed-items .item .summary-pending { color: var(--muted); font-style: italic; }
+  .feed-items .item .tag-row { order: 3; flex-wrap: nowrap; min-height: 0; gap: 4px; margin: 0; overflow: hidden; }
+  .feed-items .item .badge, .feed-items .item .label-tag { flex: none; max-width: 9em;
+    padding: 0 8px; border-radius: 99px; color: #454c54; background: var(--neutral-bg);
+    font-size: 11.5px; line-height: 19px; text-decoration: none;
+    text-overflow: ellipsis; white-space: nowrap; overflow: hidden; }
+  .feed-items .item .badge:hover { background: var(--tint); }
+  .feed-items .industry-badges .badge:nth-of-type(n+4) { display: none; }
+  .feed-items .industry-badges .tag-overflow { display: inline-flex; flex: none; align-items: center;
+    padding: 0 8px; border-radius: 99px; background: var(--neutral-bg); color: var(--muted);
+    font-size: 11.5px; line-height: 19px; }
+  .feed-items .item .actions { position: absolute; top: 7px; right: 38px; z-index: 2; margin: 0; gap: 1px; }
+  .feed-items .item .menu-trigger { top: 7px; right: 6px; z-index: 2; }
+  .feed-items .item .actions button, .feed-items .item .icon-action, .feed-items .item .industry-editor summary {
+    width: 32px; height: 32px; min-height: 32px; border-radius: 8px; padding: 0; }
+  .feed-items .act-valid .vote-button svg, .feed-items .act-invalid .vote-button svg { display: none; }
+  .feed-items .act-valid .vote-button::before, .feed-items .act-invalid .vote-button::before {
+    content: '✓'; display: inline-grid; place-items: center; width: 14px; height: 14px;
+    border: 1.5px solid currentColor; border-radius: 50%; font: 600 10px/1 system-ui, sans-serif; }
+  .feed-items .act-invalid .vote-button::before { content: '×'; font-size: 12px; }
+  .feed-items .item .actions, .feed-items .item .menu-trigger { opacity: 0; }
+  .feed-items .item:hover .actions, .feed-items .item:focus-within .actions,
+  .feed-items .item.is-selected .actions, .feed-items .item:hover .menu-trigger,
+  .feed-items .item:focus-within .menu-trigger, .feed-items .item.is-selected .menu-trigger { opacity: 1; }
+  .feed-items .item .menu-trigger svg { transform: rotate(90deg); }
+  .feed-items .item .industry-editor form { left: auto; right: 0; width: min(19rem, calc(100vw - 2rem)); }
+  .feed-items .item .label-status { order: 4; font-size: 12px; }
+  .feed-detail { border: 0; border-radius: 0; background: var(--surface); }
+@media (hover: none) {
+  .feed-items .item .actions, .feed-items .item .menu-trigger { opacity: 1; }
+  .feed-items .item .actions button, .feed-items .item .icon-action,
+  .feed-items .item .industry-editor summary { width: 44px; height: 44px; min-height: 44px; }
+  .feed-items .item .actions { right: 48px; }
+  .feed-items .item > .feed-item-meta { min-height: 44px; padding-right: 216px; }
+}
+@media (max-width: 1099px) {
+  body.feed-page { max-width: none; min-height: 100dvh; height: auto; overflow: visible; display: block; }
+  .feed-page > footer { display: none; }
+  .feed-layout { display: block; }
+  .feed-list { display: block; min-width: 0; overflow: visible; border-right: 0; }
+  .feed-header { position: sticky; top: 0; background: var(--bg);
+    padding-top: env(safe-area-inset-top, 0px);
+    padding-left: max(14px, env(safe-area-inset-left, 0px));
+    padding-right: max(10px, env(safe-area-inset-right, 0px)); }
+  .feed-items { overflow: visible; padding-bottom: env(safe-area-inset-bottom, 0px); }
+  .feed-items .item { scroll-margin-top: calc(104px + env(safe-area-inset-top, 0px)); }
+  .feed-brand { flex-basis: auto; }
+  .source-menu { min-width: 0; max-width: none; }
+  .source-menu summary { min-height: 40px; height: 40px; }
+  .quick a { min-height: 36px; }
+  .feed-source-management, .filter-panel summary, .feed-user summary, .theme-toggle { width: 40px; height: 40px; min-height: 40px; }
+  .compact-count { display: none; }
+  .page-arrow { width: 40px; height: 40px; }
+  .feed-items .item .actions, .feed-items .item .menu-trigger { opacity: 1; }
+  .feed-items .item .actions button, .feed-items .item .icon-action,
+  .feed-items .item .industry-editor summary { width: 36px; height: 36px; min-height: 36px; }
+  .feed-items .item .actions { right: 42px; }
+  .feed-items .item > .feed-item-meta { min-height: 36px; padding-right: 178px; }
+  .feed-items .item .industry-editor form { width: min(19rem, calc(100vw - 4rem)); }
+}
+@media (max-width: 360px) {
+  .feed-brand span { display: none; }
+  .quick { margin-left: 0; }
+  .quick a { font-size: 12px; padding-inline: 3px; }
+  .source-menu summary { gap: 4px; padding-inline: 6px; }
+  .source-menu summary span { display: none; }
+  .source-menu summary::before { content: '来源'; white-space: nowrap; font-size: 12px; }
+}
+:is(body.embedded-detail, body.article-page) { --bg: #eceff1; --surface: #fbfcfc; --text: #181b1f; --muted: #626a73;
+  --border: #d9dee2; --accent: #27508a; --tint: #dbe5f4; --neutral-bg: #e1e6ea;
+  --valid: #1f6e45; --valid-bg: #dcefe3; --invalid: #a23a28; --invalid-bg: #f5dfd9;
+  max-width: none; margin: 0; padding: 0; background: var(--surface); font-size: 14px; -webkit-font-smoothing: antialiased; }
+:is(body.embedded-detail, body.article-page) > h1, :is(body.embedded-detail, body.article-page) > footer { display: none; }
+:is(body.embedded-detail, body.article-page) .article-detail { margin: 0; padding: 0; border: 0; border-radius: 0; }
+:is(body.embedded-detail, body.article-page) .reader-toolbar { position: sticky; top: 0; z-index: 3; display: flex;
+  align-items: center; gap: 6px; min-height: 48px; padding: 6px 16px; border-bottom: 1px solid var(--border);
+  background: var(--surface); }
+:is(body.embedded-detail, body.article-page) .reader-tabs { flex: none; gap: 1px; margin: 0 auto 0 0; padding: 2px;
+  border: 0; border-radius: 8px; background: var(--neutral-bg); }
+:is(body.embedded-detail, body.article-page) .reader-tabs button { min-width: 0; min-height: 28px; padding: 0 10px;
+  border-radius: 6px; color: var(--muted); font-size: 13px; }
+:is(body.embedded-detail, body.article-page) .reader-tabs button[aria-selected=true] { color: var(--text); background: var(--surface);
+  box-shadow: 0 1px 2px #0002; font-weight: 600; }
+:is(body.embedded-detail, body.article-page) .reader-toolbar .actions { margin: 0 0 0 auto; gap: 2px; }
+:is(body.embedded-detail, body.article-page) .reader-toolbar .vote-button, :is(body.embedded-detail, body.article-page) .reader-toolbar .icon-action,
+:is(body.embedded-detail, body.article-page) .reader-toolbar .industry-editor summary { width: 36px; height: 36px; min-height: 36px;
+  padding: 0; border-radius: 8px; }
+:is(body.embedded-detail, body.article-page) .reader-toolbar .act-valid .vote-button,
+:is(body.embedded-detail, body.article-page) .reader-toolbar .act-invalid .vote-button { width: auto; gap: 6px; padding: 0 8px; font-size: 13px; }
+:is(body.embedded-detail, body.article-page) .reader-toolbar .act-valid .vote-button svg,
+:is(body.embedded-detail, body.article-page) .reader-toolbar .act-invalid .vote-button svg { display: none; }
+:is(body.embedded-detail, body.article-page) .reader-toolbar .act-valid .vote-button::before,
+:is(body.embedded-detail, body.article-page) .reader-toolbar .act-invalid .vote-button::before { content: '✓'; display: inline-grid;
+  place-items: center; width: 14px; height: 14px; border: 1.5px solid currentColor; border-radius: 50%;
+  font: 600 10px/1 system-ui, sans-serif; }
+:is(body.embedded-detail, body.article-page) .reader-toolbar .act-invalid .vote-button::before { content: '×'; font-size: 12px; }
+:is(body.embedded-detail, body.article-page) .reader-toolbar .act-valid .vote-button::after { content: '有效'; }
+:is(body.embedded-detail, body.article-page) .reader-toolbar .act-invalid .vote-button::after { content: '无效'; }
+:is(body.embedded-detail, body.article-page) .reader-toolbar .menu-trigger { position: static; flex: none; }
+:is(body.embedded-detail, body.article-page) .reader-toolbar .menu-trigger svg { transform: rotate(90deg); }
+:is(body.embedded-detail, body.article-page) .reader-back { display: inline-grid; place-items: center; flex: none;
+  width: 40px; height: 40px; border-radius: 8px; color: var(--muted); text-decoration: none; }
+:is(body.embedded-detail, body.article-page) .reader-back:hover { background: var(--neutral-bg); color: var(--text); }
+:is(body.embedded-detail, body.article-page) .reader-back svg { width: 20px; height: 20px; fill: none; stroke: currentColor;
+  stroke-width: 1.75; stroke-linecap: round; stroke-linejoin: round; }
+:is(body.embedded-detail, body.article-page) .reader-back span { position: absolute; width: 1px; height: 1px;
+  padding: 0; margin: -1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+:is(body.embedded-detail, body.article-page) .reader-toolbar .industry-editor form { left: auto; right: 0; width: 19rem; max-width: calc(100vw - 2rem); }
+:is(body.embedded-detail, body.article-page) .reader-toolbar .label-status { position: absolute; right: 16px; top: calc(100% + 8px); z-index: 5;
+  margin: 0; min-height: 0; padding: 6px 10px; border-radius: 8px; background: var(--text); color: var(--surface);
+  box-shadow: 0 3px 12px #0002; font-size: 12px; }
+:is(body.embedded-detail, body.article-page) .reader-toolbar .label-status:empty { display: none; }
+:is(body.embedded-detail, body.article-page) .reader-toolbar .label-status[data-error] { background: var(--invalid-bg); color: var(--invalid); }
+:is(body.embedded-detail, body.article-page) .reader-paper { max-width: 780px; min-height: calc(100dvh - 48px); margin: 0 auto;
+  padding: 34px clamp(20px, 4vw, 52px) 24px; display: flex; flex-direction: column; }
+:is(body.embedded-detail, body.article-page) .reader-heading { display: flex; flex-direction: column; }
+:is(body.embedded-detail, body.article-page) .reader-heading > .meta { order: -2; margin: 0; color: var(--muted); font-size: 13px; }
+:is(body.embedded-detail, body.article-page) .article-title { margin: 12px 0 6px; padding: 0;
+  font: 650 28px/1.32 'Source Serif 4', 'Noto Serif SC', 'Songti SC', Georgia, serif; letter-spacing: 0; }
+:is(body.embedded-detail, body.article-page) .reader-heading:has(.title-zh) .title-zh { order: -1; margin: 12px 0 6px;
+  font: 650 28px/1.32 'Source Serif 4', 'Noto Serif SC', 'Songti SC', Georgia, serif; }
+:is(body.embedded-detail, body.article-page) .reader-heading:has(.title-zh) .article-title { margin: 0 0 12px; color: var(--muted);
+  font: 400 15px/1.5 system-ui, sans-serif; }
+:is(body.embedded-detail, body.article-page) .tag-row { gap: 4px; margin: 0.3rem 0 0; }
+:is(body.embedded-detail, body.article-page) .badge, :is(body.embedded-detail, body.article-page) .label-tag { padding: 0 8px; border-radius: 99px;
+  color: #454c54; background: var(--neutral-bg); font-size: 11.5px; line-height: 19px; text-decoration: none; }
+:is(body.embedded-detail, body.article-page) .badge:hover { background: var(--tint); }
+:is(body.embedded-detail, body.article-page) .article-intro { margin: 20px 0 0; padding: 2px 0 2px 14px;
+  border-left: 3px solid var(--accent); border-radius: 0; background: transparent;
+  color: #454c54; font-size: 15.5px; line-height: 1.75; }
+:is(body.embedded-detail, body.article-page) .article-intro h3, :is(body.embedded-detail, body.article-page) .reader-content > h3 { position: absolute;
+  width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+:is(body.embedded-detail, body.article-page) .article-intro p { margin: 0; }
+:is(body.embedded-detail, body.article-page) .reader-content { margin: 28px 0 44px; }
+:is(body.embedded-detail, body.article-page) .article-body { color: var(--text); font-size: 16px; line-height: 1.85; }
+:is(body.embedded-detail, body.article-page) .article-body h1, :is(body.embedded-detail, body.article-page) .article-body h2,
+:is(body.embedded-detail, body.article-page) .article-body h3 { font-family: 'Source Serif 4', 'Noto Serif SC', 'Songti SC', Georgia, serif; }
+:is(body.embedded-detail, body.article-page) .reader-footer { margin-top: auto; padding-top: 16px; border-top: 1px solid var(--border);
+  display: flex; flex-wrap: wrap; gap: 6px 22px; color: var(--muted); font-size: 13px; opacity: 1; }
+:is(body.embedded-detail, body.article-page) .reader-footer a { margin-left: auto; text-decoration: none; }
+@media (max-width: 1099px) {
+  body.article-page .reader-toolbar { gap: 2px; padding: 4px 6px; }
+  body.article-page .reader-toolbar .actions { flex-wrap: nowrap; gap: 0; }
+  body.article-page .reader-toolbar .act-valid .vote-button,
+  body.article-page .reader-toolbar .act-invalid .vote-button { width: 36px; padding: 0; }
+  body.article-page .reader-toolbar .act-valid .vote-button::after,
+  body.article-page .reader-toolbar .act-invalid .vote-button::after { content: none; }
+  body.article-page .reader-toolbar .industry-editor form { max-width: calc(100vw - 4rem); }
+  body.article-page .reader-paper { padding: 24px 18px 20px; }
+  body.article-page .article-title, body.article-page .reader-heading:has(.title-zh) .title-zh { font-size: 24px; }
+}
+@media (max-width: 360px) {
+  body.article-page .reader-back, body.article-page .reader-toolbar .vote-button,
+  body.article-page .reader-toolbar .icon-action, body.article-page .reader-toolbar .industry-editor summary,
+  body.article-page .reader-toolbar .act-valid .vote-button, body.article-page .reader-toolbar .act-invalid .vote-button {
+    width: 34px; height: 38px; min-height: 38px; }
+  body.article-page .reader-tabs button { padding: 0 7px; }
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme=light]) body.feed-page, :root:not([data-theme=light]) :is(body.embedded-detail, body.article-page) {
+    --bg: #14171a; --surface: #1a1d21; --text: #e9ecef; --muted: #8b939c; --border: #2a2f35;
+    --accent: #8db4f0; --tint: #233450; --neutral-bg: #262b31; --valid: #6fd09a;
+    --valid-bg: #1b3326; --invalid: #f09a86; --invalid-bg: #3a2420; }
+  :root:not([data-theme=light]) .feed-items .item:hover { background: #1e2227; }
+  :root:not([data-theme=light]) .feed-items .item.is-selected { background: #1f2a3b; }
+  :root:not([data-theme=light]) .feed-items .item .summary, :root:not([data-theme=light]) .feed-items .item .badge,
+  :root:not([data-theme=light]) :is(body.embedded-detail, body.article-page) .badge, :root:not([data-theme=light]) :is(body.embedded-detail, body.article-page) .article-intro { color: #b3bac2; }
+}
+:root[data-theme=dark] body.feed-page, :root[data-theme=dark] :is(body.embedded-detail, body.article-page) {
+  --bg: #14171a; --surface: #1a1d21; --text: #e9ecef; --muted: #8b939c; --border: #2a2f35;
+  --accent: #8db4f0; --tint: #233450; --neutral-bg: #262b31; --valid: #6fd09a;
+  --valid-bg: #1b3326; --invalid: #f09a86; --invalid-bg: #3a2420; }
+:root[data-theme=dark] .feed-items .item:hover { background: #1e2227; }
+:root[data-theme=dark] .feed-items .item.is-selected { background: #1f2a3b; }
+:root[data-theme=dark] .feed-items .item .summary, :root[data-theme=dark] .feed-items .item .badge,
+:root[data-theme=dark] :is(body.embedded-detail, body.article-page) .badge, :root[data-theme=dark] :is(body.embedded-detail, body.article-page) .article-intro { color: #b3bac2; }
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme=light]) button, :root:not([data-theme=light]) .quick a[aria-current=page] { color: #101720; }
+  :root:not([data-theme=light]) .vote-button, :root:not([data-theme=light]) .icon-action { color: var(--muted); }
+  :root:not([data-theme=light]) .theme-toggle, :root:not([data-theme=light]) .feed-user summary,
+  :root:not([data-theme=light]) .filter-panel summary, :root:not([data-theme=light]) .quick a[aria-current=page] { color: var(--text); }
+}
+:root[data-theme=dark] button, :root[data-theme=dark] .quick a[aria-current=page] { color: #101720; }
+:root[data-theme=dark] .vote-button, :root[data-theme=dark] .icon-action { color: var(--muted); }
+:root[data-theme=dark] .theme-toggle, :root[data-theme=dark] .feed-user summary,
+:root[data-theme=dark] .filter-panel summary, :root[data-theme=dark] .quick a[aria-current=page] { color: var(--text); }
 """
 
 _LABEL_SCRIPT = """<script>
+function atlasApplyLabels(card, values, tagValue) {
+  const labels = card.querySelector('.labels');
+  const badges = card.querySelector('.industry-badges');
+  const row = card.querySelector('.tag-row');
+  if (!labels || !badges || !row) return;
+  if (tagValue && !Array.from(badges.querySelectorAll('.badge')).some(node => node.textContent === tagValue)) {
+    const badge = document.createElement('a');
+    badge.className = 'badge tag-ai';
+    badge.href = '/feed?' + new URLSearchParams({tag: tagValue});
+    badge.textContent = tagValue;
+    if (document.body.classList.contains('embedded-detail')) badge.target = '_top';
+    badges.append(badge);
+  }
+  const allBadges = Array.from(badges.querySelectorAll('.badge'));
+  let overflow = badges.querySelector('.tag-overflow');
+  if (allBadges.length > 3) {
+    if (!overflow) { overflow = document.createElement('span'); overflow.className = 'tag-overflow'; }
+    overflow.textContent = '+' + (allBadges.length - 3);
+    overflow.title = allBadges.slice(3).map(node => node.textContent).join('、');
+    overflow.setAttribute('aria-label', '另有 ' + (allBadges.length - 3) + ' 个标签');
+    badges.append(overflow);
+  } else if (overflow) overflow.remove();
+  const keys = Object.keys(values).filter(key => key !== 'industry' && key !== 'valid' && !key.startsWith('tag:')).sort();
+  labels.replaceChildren();
+  keys.forEach(key => {
+    const tag = document.createElement('span');
+    tag.className = 'label-tag tag-neutral';
+    tag.dataset.labelKey = key;
+    tag.dataset.labelValue = values[key];
+    tag.textContent = key + '=' + values[key];
+    labels.append(tag);
+  });
+  row.classList.toggle('is-empty', !badges.children.length && !labels.children.length);
+  card.querySelectorAll('.vote-button').forEach(button => {
+    button.setAttribute('aria-pressed', String(button.form.elements.label_value.value === values.valid));
+  });
+}
+function atlasLabelIdentity(card) {
+  return ['rawId', 'rawSha256', 'charStart', 'charEnd'].map(key => card.dataset[key] || '');
+}
+const atlasPendingLabels = [];
+function atlasNotifyLabels(card, values, tagValue) {
+  const message = {type: 'atlas-label-saved', identity: atlasLabelIdentity(card), values, tagValue};
+  if (window.parent !== window && document.body.classList.contains('embedded-detail')) {
+    window.parent.postMessage(message, location.origin);
+  } else {
+    const frame = document.getElementById('feed-detail-frame');
+    if (frame && frame.contentWindow && window.matchMedia('(min-width: 1100px)').matches) {
+      if (frame.hidden) atlasPendingLabels.push(message);
+      else frame.contentWindow.postMessage(message, location.origin);
+    }
+  }
+}
+function atlasFlushLabels(frame) {
+  while (atlasPendingLabels.length) frame.contentWindow.postMessage(atlasPendingLabels.shift(), location.origin);
+}
+window.addEventListener('message', event => {
+  if (event.origin !== location.origin || !event.data || event.data.type !== 'atlas-label-saved') return;
+  const frame = document.getElementById('feed-detail-frame');
+  const fromDetail = frame && event.source === frame.contentWindow;
+  const fromFeed = document.body.classList.contains('embedded-detail') && event.source === window.parent;
+  if (!fromDetail && !fromFeed) return;
+  if (!Array.isArray(event.data.identity) || !event.data.values || typeof event.data.values !== 'object') return;
+  document.querySelectorAll('article.item[data-raw-id]').forEach(card => {
+    if (atlasLabelIdentity(card).every((value, index) => value === event.data.identity[index])) {
+      atlasApplyLabels(card, event.data.values, event.data.tagValue);
+    }
+  });
+});
 document.addEventListener('submit', async (event) => {
   const form = event.target;
   if (!form.matches('form.act[action="/label"]')) return;
@@ -357,6 +741,7 @@ document.addEventListener('submit', async (event) => {
 
   const body = new URLSearchParams(new FormData(form));
   const status = card.querySelector('.label-status');
+  clearTimeout(status._clearTimer);
   const focused = card.contains(document.activeElement) ? document.activeElement : null;
   const controls = Array.from(card.querySelectorAll('.actions button, .actions select, .actions input:not([type=hidden])'));
   const disabled = controls.map((control) => control.disabled);
@@ -374,25 +759,23 @@ document.addEventListener('submit', async (event) => {
     if (result.raw_id !== body.get('raw_id') || !result.values) {
       throw new Error('未能确认最新标签，请刷新后确认。');
     }
-    if (body.get('label_key') === 'tag') { window.location.reload(); return; }
-    const labels = card.querySelector('.labels');
-    const keys = Object.keys(result.values).filter((key) => key !== 'industry' && key !== 'valid' && !key.startsWith('tag:')).sort();
-    labels.replaceChildren();
-    keys.forEach((key) => {
-      const tag = document.createElement('span');
-      const value = result.values[key];
-      tag.className = 'label-tag tag-neutral';
-      tag.dataset.labelKey = key;
-      tag.dataset.labelValue = value;
-      tag.textContent = key + '=' + result.values[key];
-      labels.append(tag);
-    });
-    card.querySelector('.tag-row').classList.toggle('is-empty',
-      !card.querySelector('.industry-badges').children.length && !labels.children.length);
-    card.querySelectorAll('.vote-button').forEach((button) => {
-      button.setAttribute('aria-pressed', String(button.form.elements.label_value.value === result.values.valid));
-    });
+    const tagValue = body.get('label_key') === 'tag' ? body.get('label_value').trim() : null;
+    atlasApplyLabels(card, result.values, tagValue);
+    atlasNotifyLabels(card, result.values, tagValue);
+    const splitActive = document.getElementById('feed-detail-frame') && window.matchMedia('(min-width: 1100px)').matches;
+    if (tagValue && !splitActive && !document.body.classList.contains('embedded-detail')) {
+      window.location.reload();
+      return;
+    }
+    if (tagValue) {
+      form.reset();
+      const editor = form.closest('.industry-editor');
+      if (editor) editor.open = false;
+    }
     status.textContent = '已保存';
+    if (document.body.matches('.embedded-detail, .article-page')) {
+      status._clearTimer = setTimeout(() => { status.textContent = ''; }, 2500);
+    }
   } catch (error) {
     status.setAttribute('data-error', '');
     status.textContent = error instanceof TypeError || error instanceof SyntaxError
@@ -408,8 +791,110 @@ document.addEventListener('submit', async (event) => {
 _LABEL_STATUS = '<p class="label-status" role="status" aria-live="polite"></p>'
 
 _READER_SCRIPT = """<script>
+const atlasThemeButton = document.querySelector('.theme-toggle');
+function atlasThemeDark() {
+  const theme = document.documentElement.dataset.theme;
+  return theme ? theme === 'dark' : window.matchMedia('(prefers-color-scheme: dark)').matches;
+}
+function atlasUpdateThemeButton() {
+  if (!atlasThemeButton) return;
+  const dark = atlasThemeDark();
+  atlasThemeButton.setAttribute('aria-label', dark ? '切换到浅色模式' : '切换到深色模式');
+  atlasThemeButton.title = dark ? '切换到浅色模式' : '切换到深色模式';
+  atlasThemeButton.innerHTML = dark
+    ? '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.9 4.9l1.4 1.4m11.4 11.4 1.4 1.4M2 12h2m16 0h2M4.9 19.1l1.4-1.4m11.4-11.4 1.4-1.4"/></svg>'
+    : '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 14.5A8 8 0 0 1 9.5 4 8 8 0 1 0 20 14.5z"/></svg>';
+}
+function atlasSetTheme(theme) {
+  if (theme === 'light' || theme === 'dark') document.documentElement.dataset.theme = theme;
+  else delete document.documentElement.dataset.theme;
+  atlasUpdateThemeButton();
+}
+if (atlasThemeButton) {
+  atlasUpdateThemeButton();
+  atlasThemeButton.addEventListener('click', () => {
+    const theme = atlasThemeDark() ? 'light' : 'dark';
+    atlasSetTheme(theme);
+    try { localStorage.setItem('atlas-theme', theme); } catch (_) {}
+    const frame = document.getElementById('feed-detail-frame');
+    if (frame && frame.contentWindow) frame.contentWindow.postMessage({type: 'atlas-theme', theme}, location.origin);
+  });
+  window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', atlasUpdateThemeButton);
+}
+window.addEventListener('storage', event => {
+  if (event.key === 'atlas-theme') atlasSetTheme(event.newValue);
+});
+window.addEventListener('message', event => {
+  if (event.origin === location.origin && event.source === window.parent &&
+      document.body.classList.contains('embedded-detail') && event.data && event.data.type === 'atlas-theme') {
+    atlasSetTheme(event.data.theme);
+  }
+});
+const atlasDetailFrame = document.getElementById('feed-detail-frame');
+const atlasWideFeed = atlasDetailFrame && window.matchMedia('(min-width: 1100px)');
+let atlasManualSelection = false;
+let atlasSelectedUrl = '';
+function atlasOpenDetail(card, manual = false) {
+  if (!atlasDetailFrame || !card || !card.dataset.detailUrl) return;
+  const url = card.dataset.detailUrl;
+  atlasManualSelection = atlasManualSelection || manual;
+  document.querySelectorAll('article[data-detail-url]').forEach(item => {
+    const selected = item === card;
+    item.classList.toggle('is-selected', selected);
+    const link = item.querySelector('a.title');
+    if (link) {
+      if (selected) link.setAttribute('aria-current', 'true');
+      else link.removeAttribute('aria-current');
+    }
+  });
+  try { sessionStorage.setItem('atlas-detail:' + location.pathname + location.search, url); } catch (_) {}
+  if (url === atlasSelectedUrl) return;
+  atlasSelectedUrl = url;
+  const placeholder = document.querySelector('.detail-placeholder');
+  placeholder.hidden = false;
+  placeholder.textContent = '正在加载文章…';
+  atlasDetailFrame.hidden = true;
+  const target = new URL(url, location.href);
+  target.searchParams.set('embedded', '1');
+  atlasDetailFrame.contentWindow.location.replace(target.href);
+}
+if (atlasDetailFrame) {
+  atlasDetailFrame.addEventListener('load', () => {
+    if (!atlasSelectedUrl) return;
+    try {
+      const current = new URL(atlasDetailFrame.contentWindow.location.href);
+      if (current.pathname === '/login') {
+        location.assign('/login?' + new URLSearchParams({return_to: location.pathname + location.search}));
+        return;
+      }
+      const expected = new URL(atlasSelectedUrl, location.href);
+      if (current.pathname !== expected.pathname ||
+          Array.from(expected.searchParams).some(([key, value]) => current.searchParams.get(key) !== value)) return;
+    } catch (_) { /* A cross-origin access page remains in the detail pane. */ }
+    document.querySelector('.detail-placeholder').hidden = true;
+    atlasDetailFrame.hidden = false;
+    atlasFlushLabels(atlasDetailFrame);
+  });
+  const selectInitial = () => {
+    let saved = '';
+    try { saved = sessionStorage.getItem('atlas-detail:' + location.pathname + location.search) || ''; } catch (_) {}
+    const cards = Array.from(document.querySelectorAll('article[data-detail-url]'));
+    atlasOpenDetail(cards.find(card => card.dataset.detailUrl === saved) || cards[0]);
+  };
+  if (atlasWideFeed.matches) selectInitial();
+  atlasWideFeed.addEventListener('change', event => {
+    if (event.matches && !atlasSelectedUrl) selectInitial();
+    else if (!event.matches && atlasManualSelection && atlasSelectedUrl) location.assign(atlasSelectedUrl);
+  });
+}
+if (document.body.classList.contains('embedded-detail')) {
+  document.querySelectorAll('a[href^="/feed"], a[href^="/entry"]').forEach(link => { link.target = '_top'; });
+}
 document.addEventListener('click', (event) => {
   let dismissed = false;
+  document.querySelectorAll('.feed-header details[open]').forEach((panel) => {
+    if (!panel.contains(event.target)) panel.open = false;
+  });
   document.querySelectorAll('.industry-editor[open]').forEach((editor) => {
     if (!editor.contains(event.target)) { editor.open = false; dismissed = true; }
   });
@@ -438,11 +923,23 @@ document.addEventListener('click', (event) => {
 document.addEventListener('click', (event) => {
   const card = event.target.closest('article[data-detail-url]');
   if (!card || event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+  const title = event.target.closest('a.title');
+  if (title && atlasWideFeed && atlasWideFeed.matches) {
+    event.preventDefault();
+    atlasOpenDetail(card, true);
+    return;
+  }
   if (event.target.closest('a,button,input,select,textarea,summary,details,form,dialog') || window.getSelection().toString()) return;
-  window.location.assign(card.dataset.detailUrl);
+  if (atlasWideFeed && atlasWideFeed.matches) atlasOpenDetail(card, true);
+  else window.location.assign(card.dataset.detailUrl);
 });
 document.addEventListener('keydown', (event) => {
   if (event.key !== 'Escape' || event.defaultPrevented) return;
+  document.querySelectorAll('.feed-header details[open]').forEach(panel => {
+    const focusedInside = panel.contains(document.activeElement);
+    panel.open = false;
+    if (focusedInside) panel.querySelector('summary').focus();
+  });
   document.querySelectorAll('.industry-editor[open]').forEach((editor) => {
     const focusedInside = editor.contains(document.activeElement);
     editor.open = false;
@@ -589,6 +1086,7 @@ if (tabs) {
       : (index + (event.key === 'ArrowRight' ? 1 : -1) + buttons.length) % buttons.length;
     buttons[next].focus(); buttons[next].click();
   });
+  if (document.getElementById('tab-chinese').getAttribute('aria-selected') === 'true') loadTranslation();
 }
 </script>"""
 
@@ -597,11 +1095,12 @@ _SHELL = Template(
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1$viewport_fit">
 <title>$title</title>
+<script>try { const theme = localStorage.getItem('atlas-theme'); if (theme === 'light' || theme === 'dark') document.documentElement.dataset.theme = theme; } catch (_) {}</script>
 <style>$style</style>
 </head>
-<body>
+<body class="$body_class">
 <h1>$heading</h1>
 $body
 $tracking
@@ -647,9 +1146,11 @@ $anchor_fields$select
 )
 
 
-def _shell(*, title: str, heading: str, body: str) -> str:
+def _shell(*, title: str, heading: str, body: str, body_class: str = "") -> str:
     return _SHELL.substitute(
-        title=escape(title), heading=escape(heading), style=_STYLE, body=body, tracking=TRACKING_SCRIPT
+        title=escape(title), heading=escape(heading), style=_STYLE, body=body,
+        body_class=escape(body_class), tracking=TRACKING_SCRIPT,
+        viewport_fit=", viewport-fit=cover" if body_class == "feed-page" else "",
     )
 
 
@@ -695,9 +1196,10 @@ def render_feed_page(
     industries: Sequence[str],
     values: Mapping[str, Mapping[str, str]],
     actor: str,
-    return_to: Optional[str] = None,
-    notices: Sequence[str] = (),
+    return_to: str | None = None,
     show_account: bool = False,
+    channel_names: Mapping[str, str] | None = None,
+    channel_groups: Mapping[str, str] | None = None,
 ) -> str:
     """渲染一页 feed：筛选器 + 排序 + 分页 + 每条一次点击打标。
 
@@ -709,8 +1211,8 @@ def render_feed_page(
         values: `raw_id -> {label_key: 最新取值}`，由调用方从 Confirmed 存储读出。
         actor: 打标人（写进 `ConfirmedLabel.actor`）。
         return_to: 打标成功后回到的地址；默认为本页的规范查询串。
-        notices: 需要显式告诉用户的事实（例如"若干条目由容器回落而来"）。
     """
+    channel_names = channel_names or {}
     page_url = return_to or feed_query_string(result.query, offset=result.offset)
     filter_mask = sum(bit for enabled, bit in (
         (bool(result.query.channels), 1), (bool(result.query.industries), 2),
@@ -726,18 +1228,24 @@ def render_feed_page(
     if show_account:
         parts.append(f'<div class="account"><span>当前用户：{escape(actor)}</span><form method="post" action="/logout"><button type="submit">退出登录</button></form></div>')
     parts += [
-        _render_source_tabs(result.query, result.channels),
+        '<div class="feed-header-main">',
+        '<div class="feed-brand"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><ellipse cx="12" cy="12" rx="4" ry="9"/><path d="M3 12h18"/></svg><strong>Atlas</strong><span>Feed</span></div>',
+        '<a class="feed-source-management" href="/sources" aria-label="信源管理" title="信源管理"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 11a9 9 0 0 1 9 9M4 4a16 16 0 0 1 16 16"/><circle cx="5" cy="19" r="1"/></svg></a>',
         _render_filters(result.query, industries),
-        _render_quick_switches(result.query),
-        _render_pager(result),
+        '<button class="theme-toggle" type="button" aria-label="切换主题" title="切换主题"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 14.5A8 8 0 0 1 9.5 4 8 8 0 1 0 20 14.5z"/></svg></button>',
     ]
-    if notices:
-        parts.append(
-            '<details class="feed-notices"><summary>'
-            f'订阅与浏览提示（{len(notices)}）</summary>'
-            + "".join(f'<p>{escape(notice)}</p>' for notice in notices)
-            + '</details>'
-        )
+    if show_account:
+        parts.append(f'<details class="feed-user"><summary title="用户" aria-label="当前用户：{escape(actor)}"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/></svg></summary><div><span>当前用户：{escape(actor)}</span><p>标签展示与筛选仅使用当前用户的判断。</p><form method="post" action="/logout"><button type="submit">退出登录</button></form></div></details>')
+    parts += [
+        '</div><div class="feed-header-controls">',
+        _render_source_menu(result.query, result.channels, channel_names, channel_groups),
+        _render_source_tabs(result.query, result.channels, channel_names),
+        _render_quick_switches(result.query),
+        _render_compact_pager(result),
+        '</div>',
+    ]
+    header = "\n".join(parts)
+    parts = ['<div class="feed-top-pager">' + _render_pager(result) + '</div>']
     if not result.items:
         parts.append(
             '<p class="empty">没有符合条件的记录。可放宽筛选条件，或先跑采集。</p>'
@@ -754,6 +1262,7 @@ def render_feed_page(
                     industries=industries,
                     actor=actor,
                     return_to=page_url,
+                    source_name=channel_names.get(item.channel_id, item.channel_id),
                 )
             )
         else:
@@ -764,10 +1273,19 @@ def render_feed_page(
                     industries=industries,
                     actor=actor,
                     return_to=page_url,
+                    source_name=channel_names.get(item.channel_id, item.channel_id),
                 )
             )
-    parts.append(_render_pager(result))
-    return _shell(title="Atlas Feed", heading="Atlas Feed", body="\n".join(parts) + _LABEL_SCRIPT + _READER_SCRIPT)
+    layout = (
+        '<main class="feed-layout"><section class="feed-list" aria-label="信息流">'
+        '<header class="feed-header">' + header + '</header>'
+        '<div class="feed-items">' + "\n".join(parts) + '</div></section>'
+        '<aside class="feed-detail" aria-label="文章详情">'
+        '<p class="detail-placeholder" role="status">选择一篇文章查看详情</p>'
+        '<iframe id="feed-detail-frame" name="atlas-detail" title="文章详情" hidden></iframe>'
+        '</aside></main>'
+    )
+    return _shell(title="Atlas Feed", heading="Atlas Feed", body=layout + _LABEL_SCRIPT + _READER_SCRIPT, body_class="feed-page")
 
 
 def _render_filters(query: FeedQuery, industries: Sequence[str]) -> str:
@@ -791,7 +1309,7 @@ def _render_filters(query: FeedQuery, industries: Sequence[str]) -> str:
         for name, value in preserved
     )
     return (
-        '<details class="filter-panel"><summary>筛选与排序</summary>'
+        '<details class="filter-panel"><summary aria-label="筛选与排序"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h10M18 7h2M4 17h2M10 17h10"/><circle cx="16" cy="7" r="2"/><circle cx="8" cy="17" r="2"/></svg><span>筛选与排序</span></summary>'
         '<form class="filters" method="get" action="/feed">'
         + hidden
         + '<label>标签'
@@ -811,18 +1329,63 @@ def _render_filters(query: FeedQuery, industries: Sequence[str]) -> str:
     )
 
 
-def _render_source_tabs(query: FeedQuery, channels: Sequence[str]) -> str:
+def _render_source_menu(query: FeedQuery, channels: Sequence[str], names: Mapping[str, str] | None = None, groups: Mapping[str, str] | None = None) -> str:
+    names = names or {}
+    selected = "全部来源" if not query.channels else "、".join(names.get(channel, channel) for channel in query.channels)
+    active_channels = frozenset(query.channels)
+
+    def link(label: str, selected_channels: tuple[str, ...], *, active: bool | None = None) -> str:
+        href = feed_query_string(query, offset=0, channels=selected_channels)
+        if active is None:
+            active = active_channels == frozenset(selected_channels)
+        current = ' aria-current="page"' if active else ''
+        return f'<a href="{escape(href)}" title="{escape(label)}"{current}>{escape(label)}</a>'
+
+    available = sorted(set(channels) | set(query.channels), key=lambda channel: (names.get(channel, channel).casefold(), channel))
+    if groups:
+        grouped: dict[str, list[str]] = {}
+        for channel in available:
+            grouped.setdefault(groups.get(channel, "其他来源"), []).append(channel)
+        shortcuts = []
+        sections = []
+        for index, group in enumerate(sorted(grouped, key=lambda label: (label == "其他来源", label.casefold()))):
+            channels_in_group = grouped[group]
+            all_label = group.removesuffix(" 信源") + "全部"
+            # 单来源组仍优先展示具体来源；多来源选择不受 URL 参数顺序影响。
+            group_active = len(channels_in_group) > 1 and active_channels == frozenset(channels_in_group)
+            if group_active:
+                selected = all_label
+            shortcuts.append(link(all_label, tuple(channels_in_group), active=group_active))
+            label_id = f"source-group-{index}"
+            sections.append(
+                f'<div class="source-menu-group" role="group" aria-labelledby="{label_id}">'
+                f'<div class="source-menu-group-title" id="{label_id}">{escape(group)}'
+                f'<span class="source-menu-group-count">（{len(channels_in_group)}）</span></div>'
+                + "".join(link(names.get(channel, channel), (channel,)) for channel in channels_in_group)
+                + '</div>'
+            )
+        items = "".join(shortcuts + sections)
+    else:
+        items = "".join(link(names.get(channel, channel), (channel,)) for channel in available)
+    return (f'<details class="source-menu"><summary aria-label="切换来源" title="{escape(selected)}">'
+            f'<span title="{escape(selected)}">{escape(selected)}</span><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg></summary>'
+            '<nav aria-label="切换来源">' + link("全部来源", ())
+            + items + '</nav></details>')
+
+
+def _render_source_tabs(query: FeedQuery, channels: Sequence[str], names: Mapping[str, str] | None = None) -> str:
+    names = names or {}
     def link(label: str, selected_channels: tuple[str, ...]) -> str:
         href = feed_query_string(query, offset=0, channels=selected_channels)
         current = ' aria-current="page"' if query.channels == selected_channels else ''
         return f'<a href="{escape(href)}"{current}>{escape(label)}</a>'
 
     # 显式查询不存在的渠道时也保留当前选择，避免页面没有选中状态。
-    available = sorted(set(channels) | set(query.channels))
+    available = sorted(set(channels) | set(query.channels), key=lambda channel: (names.get(channel, channel).casefold(), channel))
     return (
         '<nav class="source-tabs" aria-label="来源">'
         + link("全部来源", ())
-        + "".join(link(channel, (channel,)) for channel in available)
+        + "".join(link(names.get(channel, channel), (channel,)) for channel in available)
         + '</nav>'
     )
 
@@ -857,6 +1420,29 @@ def _render_pager(result: FeedResult) -> str:
     return '<nav class="pager">' + " ".join(parts) + "</nav>"
 
 
+def _render_compact_pager(result: FeedResult) -> str:
+    shown = len(result.items)
+    first = result.offset + 1 if shown else 0
+    last = result.offset + shown if shown else 0
+    pages = max(1, (result.total + result.limit - 1) // result.limit)
+    current = min(pages, result.offset // result.limit + 1)
+    previous = max(0, result.offset - result.limit)
+
+    def arrow(label: str, href: str | None, path: str) -> str:
+        icon = f'<svg viewBox="0 0 24 24" aria-hidden="true"><path d="{path}"/></svg>'
+        if href is None:
+            return f'<span class="page-arrow" aria-label="{label}" aria-disabled="true">{icon}</span>'
+        return f'<a class="page-arrow" href="{escape(href)}" aria-label="{label}">{icon}</a>'
+
+    before = feed_query_string(result.query, offset=previous) if result.offset else None
+    after = feed_query_string(result.query, offset=result.next_offset) if result.next_offset is not None else None
+    return (f'<nav class="compact-pager" aria-label="分页" title="本页 {first} 到 {last}，共 {result.total} 条"><span class="compact-count" '
+            f'aria-label="本页 {first} 到 {last}，共 {result.total} 条">{first}–{last} / {result.total}</span>'
+            + arrow('上一页', before, 'm15 6-6 6 6 6')
+            + f'<span class="page-number" title="第 {current} 页，共 {pages} 页">{current}/{pages}</span>'
+            + arrow('下一页', after, 'm9 6 6 6-6 6') + '</nav>')
+
+
 # ---------------------------------------------------------------------- #
 # 条目（T-109 的主渲染路径）
 # ---------------------------------------------------------------------- #
@@ -884,6 +1470,10 @@ def _tag_row(item: FeedEntry | FeedItem, labels: Mapping[str, str]) -> str:
         + (f' data-label-key="industry" data-label-value="{escape(tag)}"' if tag == legacy_manual else '')
         + f' href="{escape("/feed?" + urlencode({"tag": tag}))}">{escape(tag)}</a>' for tag in tags
     )
+    if len(tags) > 3:
+        hidden_tags = "、".join(tags[3:])
+        badges += (f'<span class="tag-overflow" title="{escape(hidden_tags)}" '
+                   f'aria-label="另有 {len(tags) - 3} 个标签">+{len(tags) - 3}</span>')
     label_line = _label_line(labels)
     empty = not badges and label_line == '<span class="labels"></span>'
     return (
@@ -937,6 +1527,7 @@ def _render_entry(
     industries: Sequence[str],
     actor: str,
     return_to: str,
+    source_name: str = "",
 ) -> str:
     """一个条目：标题 + 原文链接 + 时间 + 区间 + 一条一次点击打标。
 
@@ -961,7 +1552,7 @@ def _render_entry(
         f"{escape(entry.title)}</a>"
         + (f'<p class="title-zh" lang="zh-CN">{escape(entry.title_zh)}</p>' if entry.title_zh else '')
         + "</div>" + _menu_button()
-        + f'<div class="meta"><span>{escape(entry.channel_id)}</span>'
+        + f'<div class="meta feed-item-meta"><span>{escape(source_name or entry.channel_id)}</span>'
         f'<time datetime="{escape(entry.timestamp.isoformat())}">'
         f'{escape(entry.timestamp.strftime("%Y-%m-%d"))}'
         f'{" · 发布" if entry.published_from_entry else " · 采集"}</time></div>'
@@ -1006,6 +1597,7 @@ def render_entry_page(
     labels: Mapping[str, str],
     notice: str = "",
     back_to: str = "/feed",
+    source_name: str = "",
 ) -> str:
     """「打开原文并高亮该条目区间」的页面。
 
@@ -1037,7 +1629,7 @@ def render_entry_page(
         f'<p><strong>{escape(entry.title)}</strong></p>'
         f'<p><a href="{_safe_href(link)}" rel="noreferrer noopener">{escape(link)}</a></p>'
         f'<p class="meta">时间 {escape(entry.timestamp.isoformat())} · '
-        f"渠道 {escape(entry.channel_id)} · 区间 "
+        f"来源 {escape(source_name or entry.channel_id)} · 区间 "
         f"[{escape(entry.char_start)}, {escape(entry.char_end)})</p>"
         + _tag_row(entry, labels)
         + f'<p class="trace"><code class="raw-id">{escape(entry.raw_id)}</code>'
@@ -1067,7 +1659,8 @@ def render_entry_page(
 def render_article_page(
     entry: FeedEntry, *, labels: Mapping[str, str], actor: str,
     industries: Sequence[str], back_to: str, body_html: str,
-    native_chinese: bool, body_note: str = "",
+    native_chinese: bool, body_note: str = "", embedded: bool = False,
+    source_name: str = "",
 ) -> str:
     """正文 HTML 仅接受阅读服务的清洗结果；其余字段继续逐项转义。"""
     return_to = article_url(entry, back_to=back_to)
@@ -1076,37 +1669,45 @@ def render_article_page(
     if body_html and not native_chinese:
         tabs = (
             f'<div class="reader-tabs" role="tablist" aria-label="正文语言" data-translation-url="{escape(translation_url)}">'
-            '<button type="button" role="tab" id="tab-original" aria-controls="body-original" aria-selected="true" tabindex="0">原文</button>'
-            '<button type="button" role="tab" id="tab-chinese" aria-controls="body-chinese" aria-selected="false" tabindex="-1">中文</button></div>'
+            '<button type="button" role="tab" id="tab-original" aria-controls="body-original" aria-selected="false" tabindex="-1">原文</button>'
+            '<button type="button" role="tab" id="tab-chinese" aria-controls="body-chinese" aria-selected="true" tabindex="0">中文</button></div>'
         )
     original = (
-        '<div id="body-original"' + (' role="tabpanel" aria-labelledby="tab-original" tabindex="0"' if tabs else '') + '>'
+        '<div id="body-original"' + (' role="tabpanel" aria-labelledby="tab-original" tabindex="0" hidden' if tabs else '') + '>'
         '<div class="article-body">' + (body_html or '<p class="empty">正文暂不可用，可通过操作区的原文链接阅读。</p>') + '</div></div>'
     )
     if tabs:
-        original += '<div id="body-chinese" role="tabpanel" aria-labelledby="tab-chinese" tabindex="0" lang="zh-CN" hidden></div>'
+        original += '<div id="body-chinese" role="tabpanel" aria-labelledby="tab-chinese" tabindex="0" lang="zh-CN"><p class="translation-status" role="status">正在准备中文全文…</p></div>'
+    meta = (f'<div class="meta"><span>{escape(source_name or entry.channel_id)}</span>'
+            f'<time datetime="{escape(entry.timestamp.isoformat())}">{escape(entry.timestamp.strftime("%Y-%m-%d %H:%M"))}'
+            f'{" · 发布" if entry.published_from_entry else " · 采集（来源未提供发布时间）"}</time></div>')
+    title = (f'<h2 class="article-title">{escape(entry.title)}</h2>'
+             + (f'<p class="title-zh" lang="zh-CN">{escape(entry.title_zh)}</p>' if entry.title_zh else ''))
+    intro = ('<section class="article-intro"><h3>摘要 / 简介</h3>'
+             f'<p>{escape(entry.summary) if entry.summary else "暂无简介。"}</p>'
+             + (f'<span class="summary-origin">{escape(entry.summary_origin)}</span>' if entry.summary_origin and not entry.summary else '')
+             + '</section>')
+    actions = ('<div class="actions" aria-label="文章打标">'
+               + _valid_action(entry, actor, return_to, LABEL_VALUE_VALID, "标记有效", selected=labels.get(LABEL_KEY_VALID) == LABEL_VALUE_VALID)
+               + _valid_action(entry, actor, return_to, LABEL_VALUE_INVALID, "标记无效", selected=labels.get(LABEL_KEY_VALID) == LABEL_VALUE_INVALID)
+               + _source_action(entry.link or entry.endpoint)
+               + _tag_editor(entry, labels, industries, actor, return_to) + '</div>')
+    heading = title + meta + _tag_row(entry, labels)
+    content = ('<section class="reader-content"><h3>正文</h3>'
+               + (f'<p class="body-note">{escape(body_note)}</p>' if body_note else '')
+               + original + '</section>')
+    back = ('' if embedded else f'<a class="reader-back" href="{escape(back_to)}" aria-label="返回信息流">'
+            '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m15 6-6 6 6 6"/></svg>'
+            '<span>返回信息流</span></a>')
+    content = ('<div class="reader-toolbar">' + back + tabs + actions + _menu_button() + _LABEL_STATUS + '</div>'
+               + '<div class="reader-paper"><header class="reader-heading">' + heading + '</header>'
+               + intro + content
+               + f'<footer class="reader-footer"><span>来源 {escape(source_name or entry.channel_id)}</span>'
+               + f'<span>{escape(entry.timestamp.strftime("%Y-%m-%d %H:%M"))}</span>'
+               + f'<a href="{_safe_href(entry.link or entry.endpoint)}" target="_blank" rel="noreferrer noopener">阅读原文 ↗</a></footer></div>')
     body = (
-        f'<nav class="pager"><a href="{escape(back_to)}">返回信息流</a></nav>'
         f'<article class="item article-detail" id="item-{escape(entry.raw_id)}" data-tracking-detail {_tracking_identity(entry)}>'
-        + _menu_button()
-        + f'<h2 class="article-title">{escape(entry.title)}</h2>'
-        + (f'<p class="title-zh" lang="zh-CN">{escape(entry.title_zh)}</p>' if entry.title_zh else '')
-        + f'<div class="meta"><span>{escape(entry.channel_id)}</span>'
-        f'<time datetime="{escape(entry.timestamp.isoformat())}">{escape(entry.timestamp.strftime("%Y-%m-%d %H:%M"))}'
-        f'{" · 发布" if entry.published_from_entry else " · 采集（来源未提供发布时间）"}</time></div>'
-        + _tag_row(entry, labels)
-        + '<section class="article-intro"><h3>摘要 / 简介</h3>'
-        f'<p>{escape(entry.summary) if entry.summary else "暂无简介。"}</p>'
-        + (f'<span class="summary-origin">{escape(entry.summary_origin)}</span>' if entry.summary_origin and not entry.summary else '')
-        + '</section><section class="reader-content"><h3>正文</h3>'
-        + (f'<p class="body-note">{escape(body_note)}</p>' if body_note else '')
-        + tabs + original + '</section><div class="actions" aria-label="文章打标">'
-        + _valid_action(entry, actor, return_to, LABEL_VALUE_VALID, "标记有效", selected=labels.get(LABEL_KEY_VALID) == LABEL_VALUE_VALID)
-        + _valid_action(entry, actor, return_to, LABEL_VALUE_INVALID, "标记无效", selected=labels.get(LABEL_KEY_VALID) == LABEL_VALUE_INVALID)
-        + _source_action(entry.link or entry.endpoint)
-        + _tag_editor(entry, labels, industries, actor, return_to)
-        + '</div>' + _LABEL_STATUS
-        + _sheet_open()
+        + content + _sheet_open()
         + f'<p>渠道：{escape(entry.channel_id)}</p><p>来源：{escape(entry.link or entry.endpoint)}</p>'
         f'<p>采集时间：{escape(entry.fetched_at.isoformat())}</p>'
         f'<p>HTTP：{escape(entry.http_status)} · {entry.byte_length} 字节</p>'
@@ -1118,7 +1719,8 @@ def render_article_page(
         + f'<p><a href="{escape(entry_anchor_url(entry))}">查看归档原文与条目锚点</a></p>'
         '</details></div></dialog></article>' + _LABEL_SCRIPT + _READER_SCRIPT
     )
-    return _shell(title=entry.title + " · Atlas", heading="文章详情", body=body)
+    return _shell(title=entry.title + " · Atlas", heading="文章详情", body=body,
+                  body_class="embedded-detail" if embedded else "article-page")
 
 
 def _render_item(
@@ -1128,6 +1730,7 @@ def _render_item(
     industries: Sequence[str],
     actor: str,
     return_to: str,
+    source_name: str = "",
 ) -> str:
     status = "" if item.http_status is None else f" · HTTP {item.http_status}"
     return (
@@ -1137,7 +1740,7 @@ def _render_item(
         "</div>"
         f'<div class="endpoint"><a href="{_safe_href(item.endpoint)}" rel="noreferrer noopener">'
         f"{escape(item.endpoint)}</a></div>"
-        f'<div class="meta">{escape(item.channel_id)} · {escape(item.fetched_at.isoformat())} · '
+        f'<div class="meta">{escape(source_name or item.channel_id)} · {escape(item.fetched_at.isoformat())} · '
         f"{escape(item.byte_length)} 字节{escape(status)}</div>"
         + _tag_row(item, labels)
         + '<div class="actions">'

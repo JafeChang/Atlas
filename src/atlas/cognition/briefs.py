@@ -107,7 +107,7 @@ class ArticleRow:
     model: str
 
 
-def read_articles(path: str | Path) -> dict[str, ArticleRow]:
+def read_articles(path: str | Path, *, include_text: bool = True) -> dict[str, ArticleRow]:
     path = Path(path)
     if not path.is_file():
         return {}
@@ -119,10 +119,11 @@ def read_articles(path: str | Path) -> dict[str, ArticleRow]:
         ).fetchone()
         if not exists:
             return {}
+        text_column = "article_text" if include_text else "''"
         return {
             key: ArticleRow(*values)
             for key, *values in db.execute(
-                "SELECT source_key,title_zh,summary_zh,article_text,body_source,status,error,model FROM feed_articles WHERE policy=?",
+                f"SELECT source_key,title_zh,summary_zh,{text_column},body_source,status,error,model FROM feed_articles WHERE policy=?",
                 (BRIEF_VERSION,),
             )
         }

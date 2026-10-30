@@ -157,11 +157,22 @@ def test_browser_labels_update_only_the_current_card(tmp_path, width, height, sc
             sibling.evaluate("el => { window.sibling = el; window.siblingHTML = el.outerHTML; }")
             navigations, requests, errors = [], [], []
             page.on("framenavigated", lambda frame: navigations.append(frame.url))
-            page.on("request", lambda request: requests.append((request.method, request.url)))
+            page.on("request", lambda request: requests.append((request.method, request.url)) if request.url.endswith("/label") else None)
             page.on("pageerror", lambda error: errors.append(str(error)))
+
+            # 归档详情现在位于弹窗中；关闭弹窗后其展开状态仍应保留。
+            card.get_by_role("button", name="更多操作").click()
+            sheet = card.get_by_role("dialog", name="文章操作")
+            sheet.get_by_text("归档详情", exact=True).click()
+            assert sheet.locator(".raw-id").is_visible()
+            sheet.get_by_role("button", name="关闭").click()
+            assert not sheet.is_visible()
+            assert card.locator(".record-details").evaluate("el => el.open")
+
+            # 当前界面使用标签文本输入框，保留未提交的内容以检测卡片是否重建。
             card.locator(".industry-editor summary").click()
-            card.locator(".record-details summary").click()
-            card.locator('select[name="label_value"]').select_option("web")
+            tag_input = card.get_by_label("标签名称")
+            tag_input.fill("尚未提交的标签")
             assert card.locator('.meta').first.evaluate("el => el.nextElementSibling.classList.contains('tag-row')")
             assert card.locator('.tag-row .industry-badges').count() == 1
             assert card.locator('.tag-row .labels').count() == 1
@@ -169,10 +180,11 @@ def test_browser_labels_update_only_the_current_card(tmp_path, width, height, sc
             assert card.locator('.vote-button svg').count() == 2
             assert card.locator('.vote-button').first.inner_text() == ""
 
-            # 暂停真实请求，验证保存反馈、禁止重复提交，然后放行真实落库。
+            # 暂停真实请求，验证保存反馈和防重复提交，再放行真实落库。
             pending = []
             page.route("**/label", lambda route: pending.append(route))
             valid = card.get_by_role("button", name="标记有效", exact=True)
+            invalid = card.get_by_role("button", name="标记无效", exact=True)
             valid.scroll_into_view_if_needed()
             before_scroll = page.evaluate("window.scrollY")
             valid.click()
@@ -189,47 +201,42 @@ def test_browser_labels_update_only_the_current_card(tmp_path, width, height, sc
             assert valid.get_attribute('aria-pressed') == 'true'
             valid_color = valid.evaluate("el => getComputedStyle(el).backgroundColor")
             assert abs(page.evaluate("window.scrollY") - before_scroll) <= 1
-            assert card.locator('select[name="label_value"]').input_value() == "web"
+            assert tag_input.input_value() == "尚未提交的标签"
 
-            card.get_by_role("button", name="标记无效", exact=True).click()
+            # 网络失败保留原判断和页面；重试成功后只更新当前卡片。
+            page.route("**/label", lambda route: route.abort())
+            invalid.click()
+            card.locator(".label-status[data-error]").wait_for()
+            assert valid.get_attribute('aria-pressed') == 'true'
+            assert invalid.get_attribute('aria-pressed') == 'false'
+            assert invalid.is_enabled()
+            page.unroute("**/label")
+            invalid.click()
             card.locator('.act-invalid .vote-button[aria-pressed="true"]').wait_for()
             page.wait_for_function("document.querySelector('article[aria-busy]') === null")
-            assert "valid=" not in card.inner_text()
             assert valid.get_attribute('aria-pressed') == 'false'
-            assert card.get_by_role('button', name='标记无效', exact=True).get_attribute('aria-pressed') == 'true'
-            assert card.locator('.act-invalid .vote-button').evaluate("el => getComputedStyle(el).backgroundColor") != valid_color
+            assert invalid.evaluate("el => getComputedStyle(el).backgroundColor") != valid_color
 
-            # 网络失败不改标签，不离开页面；重试仍走同一个表单。
-            page.route("**/label", lambda route: route.abort())
-            card.get_by_role("button", name="修正行业", exact=True).click()
+            # 非法输入由服务端拒绝，之前成功的判断仍显示为选中。
+            valid_value = valid.locator('xpath=..').locator('input[name="label_value"]')
+            valid_value.evaluate("el => el.value = 'not-valid'")
+            valid.click()
             card.locator(".label-status[data-error]").wait_for()
-            assert card.locator('.tag-manual').count() == 0
-            assert card.get_by_role("button", name="修正行业", exact=True).is_enabled()
-            page.unroute("**/label")
-            card.get_by_role("button", name="修正行业", exact=True).click()
-            card.locator(".industry-badges .tag-manual").filter(has_text="web").wait_for()
-            page.wait_for_function("document.querySelector('article[aria-busy]') === null")
-            assert card.locator('[data-label-key="industry"]').inner_text() == 'web'
-            assert "人工确认" not in card.inner_text() and "已打标" not in card.inner_text()
-
-            # 服务端拒绝也在原卡片提示；保留先前成功的标签。
-            card.locator('select[name="label_value"]').evaluate("el => el.add(new Option('invalid', 'invalid', true, true))")
-            card.get_by_role("button", name="修正行业", exact=True).click()
-            card.locator(".label-status[data-error]").wait_for()
-            assert "不在当前配置" in card.locator(".label-status").inner_text()
-            assert card.locator('[data-label-key="industry"]').inner_text() == 'web'
-            assert card.locator(".industry-editor").evaluate("el => el.open")
+            assert "只接受" in card.locator(".label-status").inner_text()
+            assert invalid.get_attribute('aria-pressed') == 'true'
+            valid_value.evaluate("el => el.value = 'valid'")
             assert card.locator(".record-details").evaluate("el => el.open")
+            assert tag_input.input_value() == "尚未提交的标签"
             assert card.evaluate("el => el === window.originalCard")
             assert sibling.evaluate("el => el === window.sibling && el.outerHTML === window.siblingHTML")
             assert not navigations and not errors
-            assert requests and all(method == "POST" and url.endswith("/label") for method, url in requests)
+            assert requests and all(method == "POST" for method, _ in requests)
             assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
             with open_store(world.db_path) as store:
-                assert store.count() == 3
-            # 整页重新读取后，标签位置和选中图标与局部更新结果保持一致。
+                assert store.count() == 2
+
+            # 整页重新读取后，选中图标与局部更新结果保持一致。
             page.goto(world.app.base_url + '/feed?order=asc&limit=50')
-            assert card.locator('.tag-row .tag-manual').inner_text() == 'web'
             assert "valid=" not in card.inner_text()
             assert card.locator('[data-label-key="valid"]').count() == 0
             assert card.get_by_role('button', name='标记无效', exact=True).get_attribute('aria-pressed') == 'true'

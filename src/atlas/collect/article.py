@@ -257,6 +257,14 @@ class ArticleReader:
     def __init__(self, *, throttle: OriginThrottle | None = None, shared=None):
         self.throttle = throttle or OriginThrottle(shared=shared)
         self.shared = shared or self.throttle.shared
+        self.browser_routes = {}
+        self.browser_fetcher = None
+        if self.shared is not None:
+            from .chromium import ChromiumFetcher, browser_routes
+
+            self.browser_routes = browser_routes(self.shared.root.parent)
+            if self.browser_routes:
+                self.browser_fetcher = ChromiumFetcher()
         fetch = self._robots
         if self.shared is not None:
             def fetch(url, *, user_agent):
@@ -266,8 +274,12 @@ class ArticleReader:
     def _get(self, url: str, *, check_robots: bool):
         for _ in range(6):
             public_url(url)
+            browser_agent = self.browser_routes.get(urlsplit(url).hostname)
             if check_robots:
-                decision = self.robots.check(url)
+                decision = (
+                    self.robots.check(url, user_agent=browser_agent)
+                    if browser_agent else self.robots.check(url)
+                )
                 if not decision.allowed:
                     if self.shared is not None and ("ThrottleTimeout" in decision.reason or "等待站点限速" in decision.reason):
                         raise ArticleReadError("原文等待站点限速：" + decision.reason, url=url)
@@ -275,6 +287,26 @@ class ArticleReader:
                         "robots 拒绝或无法确认允许：" + decision.outcome.value
                     )
             try:
+                if browser_agent:
+                    from .fetch import FetchError, FetchRequest
+
+                    try:
+                        with self.throttle.slot(url, robots_request=not check_robots):
+                            result = self.browser_fetcher(FetchRequest(
+                                url=url, user_agent=browser_agent, timeout_seconds=20
+                            ))
+                    except FetchError as error:
+                        raise ArticleReadError("原文浏览器请求失败：" + str(error), url=url) from error
+                    if result.status_code in (301, 302, 303, 307, 308):
+                        location = result.headers.get("location")
+                        if not location:
+                            raise ArticleReadError("原文重定向缺少目标")
+                        url = urljoin(url, location)
+                        continue
+                    return (
+                        result.status_code, result.content,
+                        result.headers.get("content-type", ""), result.url,
+                    )
                 with (
                     self.throttle.slot(url, robots_request=not check_robots),
                     requests.get(
@@ -320,7 +352,7 @@ class ArticleReader:
 
                 parser = RobotFileParser()
                 parser.parse(body.decode("utf-8", errors="replace").splitlines())
-                delay = parser.crawl_delay(USER_AGENT) or parser.crawl_delay("*")
+                delay = parser.crawl_delay(user_agent) or parser.crawl_delay("*")
                 if delay:
                     self.throttle.set_delay(url, float(delay))
             return RobotsFetchResult(url=final, status_code=status, body=body)
