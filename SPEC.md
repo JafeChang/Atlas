@@ -3483,3 +3483,22 @@ ATLAS_LIVE=1 PYTHONPATH=src .venv-new/bin/python -m atlas.aluminium probe \
   --source-id opa-038978e34d52268d6b1db9a0 --enable-verified \
   --report .tmp_atlas/globenewswire-probe.json
 ```
+
+### 单篇阅读正文定位修复（2026-11-03）
+
+用户反馈 `ent_9e3341ca2d17c33a627afd60f6b7684a` 阅读异常，定位为 The New Stack
+《Developers are downgrading their AI on purpose – and it's working》。该站以
+`#tns-post-body-content` 标记正文，未使用原阅读器支持的 article/main 或正文类名，
+导致回落到整页，订阅表单、导航和推荐列表也进入原文展示及全文翻译。
+
+阅读器现优先选择该正文区，并仅在该区排除学习路线推广卡和作者介绍；继续保留
+文章首尾、四个小节标题、引用、链接及允许的富文本结构。只调整阅读时的 HTML
+投影，不改归档响应、已存清洗正文、译题或简介，不执行全量清洗。正文 HTML 变化
+自然生成新的阅读/翻译键，不更改全局版本使其它文章缓存失效。
+
+该篇已有完整译文，已逐段校验原文片段与旧缓存的译文对应关系，将其中 49 段正文
+复用到新键；没有重新调用模型，旧译文缓存完整保留。35 项阅读、翻译及真实 HTTP/
+Chromium 回归全部通过、无跳过；另用正式归档验证实际文章的 HTTP 原文及缓存译文
+均返回 200，在 375/1366px 验证中文默认展示、原文切换、无订阅/导航污染、无横向溢出。
+网页服务已重启加载，预热完成后 `/health` 返回 200。证据和回退所需的原阅读 HTML、
+旧翻译缓存保存在 `.tmp_atlas/entry-9e3341ca/`。

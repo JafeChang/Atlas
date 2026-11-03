@@ -132,6 +132,58 @@ def test_article_body_is_preferred_over_repository_and_site_navigation():
     )
 
 
+@pytest.mark.parametrize("wrapper", ['<div class="content">', '<div class="entry-content">'])
+def test_new_stack_body_and_translation_exclude_site_chrome(tmp_path, wrapper):
+    document = make_document(
+        "<html><body>"
+        + wrapper
+        + '<div id="tns-subscribe">EMAIL ADDRESS REQUIRED</div>'
+        + '<div class="content-engineering">'
+        + "Unrelated navigation and recommended stories. " * 80
+        + '</div><div id="tns-post-body-content">'
+        + '<p><strong>Anthropic has confirmed new restrictions.</strong> Developers report refusals.</p>'
+        + '<h2 id="reverse-engineering">Reverse engineering hits a wall</h2>'
+        + '<blockquote><p>Work was possible one day.</p></blockquote>'
+        + '<figure><img src="/article.png"><figcaption>Article illustration.</figcaption></figure>'
+        + '<a class="tns-roadmap-card" href="/roadmap">Learning Path AI Engineer</a>'
+        + '<p>The company did not respond before publication.</p>'
+        + '<div class="tns-post-body-content-author"><img src="/author.png">Read more from the author.</div>'
+        + '<script>trackViews()</script></div><div id="tns-post-newsletter">Subscribe to TNS.</div>'
+        + "</div></body></html>",
+        "text/html",
+        "https://thenewstack.io/claude-code-developer-refusals/",
+    )
+    soup = BeautifulSoup(document.html, "html.parser")
+    assert soup.select_one("p strong").get_text() == "Anthropic has confirmed new restrictions."
+    assert soup.select_one("h2")["id"] == "atlas-body-reverse-engineering"
+    assert soup.select_one("blockquote p").get_text() == "Work was possible one day."
+    assert soup.select_one("img")["src"] == "https://thenewstack.io/article.png"
+    assert len(soup.select("img")) == 1
+    assert soup.select("p")[-1].get_text() == "The company did not respond before publication."
+    excluded = ("EMAIL ADDRESS", "Unrelated navigation", "Learning Path", "Read more from", "Subscribe", "trackViews")
+    assert all(text not in document.html for text in excluded)
+
+    calls = []
+
+    class Client:
+        def translate(self, segments):
+            calls.append(dict(segments))
+            return {key: "中文译文：" + text for key, text in segments.items()}
+
+    jobs = TranslationJobs(tmp_path / "translations", client_factory=Client)
+    try:
+        result = finished(jobs, jobs.start(document)["key"])
+        assert result["status"] == "ready"
+        assert "中文译文：Anthropic has confirmed new restrictions." in result["html"]
+        assert "中文译文：The company did not respond before publication." in result["html"]
+        assert all(text not in result["html"] for text in excluded)
+        assert all(text not in str(calls) for text in excluded)
+        assert jobs.start(document)["status"] == "ready"
+        assert len(calls) == 1
+    finally:
+        jobs.close()
+
+
 def test_disk_cache_lru_survives_restart_and_never_exceeds_budget(tmp_path):
     calls = []
 

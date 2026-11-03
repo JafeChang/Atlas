@@ -19,7 +19,7 @@ _MARKDOWN = MarkdownIt("commonmark", {"html": True}).enable(["table", "strikethr
 _ALLOWED = frozenset(
     "p div section article span h1 h2 h3 h4 h5 h6 a strong b em i u s del blockquote pre code ul ol li dl dt dd br hr table thead tbody tfoot tr th td caption figure figcaption img sup sub details summary kbd samp mark abbr math mi mn mo mrow mfrac msub msup msubsup msqrt mroot mtext mtable mtr mtd semantics annotation".split()
 )
-_REMOVE = "script,style,noscript,iframe,object,embed,form,input,button,textarea,select,svg,canvas,video,audio,link,meta,base,template,nav,header,footer,aside,[hidden],[aria-hidden=true],.related-posts,.related-articles,.related-content,.recommended-posts,.newsletter,.cookie-banner,.cookie-consent,.share-buttons,.social-share,.author-bio,.advertisement,.ad-container"
+_REMOVE = "script,style,noscript,iframe,object,embed,form,input,button,textarea,select,svg,canvas,video,audio,link,meta,base,template,nav,header,footer,aside,[hidden],[aria-hidden=true],.related-posts,.related-articles,.related-content,.recommended-posts,.newsletter,.cookie-banner,.cookie-consent,.share-buttons,.social-share,.author-bio,.advertisement,.ad-container,#tns-post-body-content .tns-roadmap-card,#tns-post-body-content .tns-post-body-content-author"
 _CONTENT = '.markdown-body,[itemprop="articleBody"],.entry-content,.post-content,.post-body,.article-body,.article-content,.story-body'
 _MAIN = 'main,[role="main"],#main-content,#content,.readme'
 
@@ -54,9 +54,13 @@ def sanitize_html(value: str, base_url: str, *, extract_main: bool = False) -> s
             links = sum(len(a.get_text(" ", strip=True)) for a in node.select("a"))
             return len(text) - links
 
+        # The New Stack 用 div ID 标识正文；其外层还包含订阅表单和整站导航。
         # 显式正文区优先于 article，再回落 main。GitHub 的 main 还包含文件列表和提交记录。
         candidates = (
-            soup.select(_CONTENT) or soup.select("article") or soup.select(_MAIN)
+            soup.select("#tns-post-body-content")
+            or soup.select(_CONTENT)
+            or soup.select("article")
+            or soup.select(_MAIN)
         )
         root = max(candidates, key=score) if candidates else (soup.body or soup)
     else:
