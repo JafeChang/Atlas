@@ -78,6 +78,7 @@ import os
 import sys
 import threading
 from dataclasses import dataclass, replace
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Sequence, Tuple
 
@@ -547,6 +548,12 @@ def build_webapp(
     def text_length(record: RawRecord) -> int:
         return access.entries_of(record).text_length
 
+    @lru_cache(maxsize=8)
+    def browse_sources(raw_id):
+        # A request can scan hundreds of thousands of historical entries.
+        # Keep nearby Raw lookups cheap without retaining every source map.
+        return access.browse_record(archive.get(raw_id)).sources
+
     labels = StoreLabelAccess(db_path, actor=actor)
     if initialize_labels:
         labels.initialize()
@@ -558,11 +565,8 @@ def build_webapp(
         bodies = read_article_contents(db_path)
         articles = {v.raw_id: v for v in views.values() if v.unit_kind == "article"}
         projected = []
-        sources_by_raw: dict[str, dict[tuple[int, int], BriefSource]] = {}
         for entry in entries:
-            if entry.raw_id not in sources_by_raw:
-                sources_by_raw[entry.raw_id] = access.browse_record(archive.get(entry.raw_id)).sources
-            summary_source = sources_by_raw[entry.raw_id].get((entry.char_start, entry.char_end))
+            summary_source = browse_sources(entry.raw_id).get((entry.char_start, entry.char_end))
             summary, summary_origin = display_brief(summary_source, briefs) if summary_source else ("", "")
             article = briefs.get(summary_source.key) if summary_source else None
             title_zh = article.title_zh if article and article.status == 'ready' and not summary_source.native_chinese else ''
@@ -659,14 +663,12 @@ def build_webapp(
             return None
         if record.content_sha256 != raw_sha256:
             return None
-        return access.browse_record(record).sources.get((char_start, char_end))
+        return browse_sources(record.raw_id).get((char_start, char_end))
 
     def recommend_entries(entries, user_id):
-        sources_by_raw, candidates = {}, []
+        candidates = []
         for entry in entries:
-            if entry.raw_id not in sources_by_raw:
-                sources_by_raw[entry.raw_id] = access.browse_record(archive.get(entry.raw_id)).sources
-            brief = sources_by_raw[entry.raw_id].get((entry.char_start, entry.char_end))
+            brief = browse_sources(entry.raw_id).get((entry.char_start, entry.char_end))
             if brief:
                 candidates.append((entry, brief.key))
         admission = read_admissions(db_path)
@@ -677,11 +679,9 @@ def build_webapp(
         # Keep them all until the normal projection and current-user filtering.
         if query.industries or query.tags or query.labels or query.labeled is not None:
             return entries
-        sources_by_raw, seen, selected = {}, set(), []
+        seen, selected = set(), []
         for entry in sorted(entries, key=lambda entry: (entry.fetched_at, entry.raw_id), reverse=True):
-            if entry.raw_id not in sources_by_raw:
-                sources_by_raw[entry.raw_id] = access.browse_record(archive.get(entry.raw_id)).sources
-            brief = sources_by_raw[entry.raw_id].get((entry.char_start, entry.char_end))
+            brief = browse_sources(entry.raw_id).get((entry.char_start, entry.char_end))
             if brief is None or brief.key not in seen:
                 selected.append(entry)
                 if brief:
@@ -689,12 +689,9 @@ def build_webapp(
         return selected
 
     def search_entries(entries, text, mode):
-        sources_by_raw = {}
         keys = {}
         for entry in entries:
-            if entry.raw_id not in sources_by_raw:
-                sources_by_raw[entry.raw_id] = access.browse_record(archive.get(entry.raw_id)).sources
-            brief = sources_by_raw[entry.raw_id].get((entry.char_start, entry.char_end))
+            brief = browse_sources(entry.raw_id).get((entry.char_start, entry.char_end))
             if brief:
                 keys[(entry.raw_id, entry.char_start, entry.char_end)] = brief.key
         ranked = search.search(text, mode, set(keys.values()))

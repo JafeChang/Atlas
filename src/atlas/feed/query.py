@@ -474,7 +474,7 @@ class RawEntriesView(Protocol):
 EntriesLookup = Callable[[RawRecord], RawEntriesView]
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class FeedEntry:
     """投影出的一个**可浏览单元**（条目粒度的 `FeedItem` 等价物）。
 
@@ -741,7 +741,11 @@ def _run_entry_query(
         units = _select_existing_entries(units, entry_selector)
     if entry_projection is not None:
         projected = list(entry_projection(tuple(units)))
-        if [(u.raw_id, u.raw_sha256, u.entry_id, u.char_start, u.char_end) for u in projected] != [(u.raw_id, u.raw_sha256, u.entry_id, u.char_start, u.char_end) for u in units]:
+        if len(projected) != len(units) or any(
+            (p.raw_id, p.raw_sha256, p.entry_id, p.char_start, p.char_end)
+            != (u.raw_id, u.raw_sha256, u.entry_id, u.char_start, u.char_end)
+            for p, u in zip(projected, units)
+        ):
             raise SourceContractError("条目投影不得更改原文身份、区间、顺序或数量")
         units = [u for u in projected if (
             (not query.industries or bool(set(query.industries) & set(u.industry_values or ((u.industry,) if u.industry else ()))))

@@ -558,6 +558,7 @@ def test_criterion_8_only_registered_python_dependencies() -> None:
         "atlas",
         "dataclasses",
         "datetime",
+        "functools",
         "hashlib",
         "html",
         "http",
