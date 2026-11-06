@@ -1,0 +1,21 @@
+[Unit]
+Description=Atlas incremental article vectors for search and recommendations
+After=network.target
+RequiresMountsFor=@ATLAS_ROOT@
+
+[Service]
+Type=oneshot
+WorkingDirectory=@ATLAS_ROOT@
+Environment=PYTHONUNBUFFERED=1
+Environment=OPENBLAS_NUM_THREADS=1
+Environment=OMP_NUM_THREADS=4
+ExecStart=@ATLAS_ROOT@/.venv-new/bin/python -m atlas.brief_search_cli update
+TimeoutStartSec=600
+TimeoutStopSec=20
+Nice=10
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=@ATLAS_ROOT@/data @ATLAS_ROOT@/logs

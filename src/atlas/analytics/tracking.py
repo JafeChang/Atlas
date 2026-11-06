@@ -38,6 +38,7 @@ TRACKING_SCRIPT = r"""<script>
   const context = {collection_version: 'v2'};
   if (feed) {
     context.strategy = feed.dataset.strategy;
+    if (feed.dataset.recommendationId) context.recommendation_id = feed.dataset.recommendationId;
     context.order = feed.dataset.order;
     for (const key of ['offset', 'limit', 'total']) context[key] = Number(feed.dataset[key]);
     context.filter_mask = Number(feed.dataset.filterMask);
@@ -68,7 +69,11 @@ TRACKING_SCRIPT = r"""<script>
     if (flushing || !window.fetch || !queue.size) return;
     flushing = true;
     try {
-      for (const [key, event] of queue) {
+      while (queue.size) {
+        // Confirm recommendation signals before draining the rest of a served page.
+        const [key, event] = Array.from(queue).find(([, event]) =>
+          ['detail_view', 'read_progress', 'list_impression'].includes(event.event_type))
+          || queue.entries().next().value;
         let response;
         try {
           response = await fetch('/events', {method: 'POST', headers: {'Content-Type': 'application/json'},
@@ -98,7 +103,10 @@ TRACKING_SCRIPT = r"""<script>
       const parent = JSON.parse(window.sessionStorage.getItem('atlas_parent_view') || 'null');
       const item = itemData(detail);
       if (parent && Date.now() - parent.time < 600000 && parent.raw_id === item.raw_id &&
-          parent.char_start === item.char_start && parent.char_end === item.char_end) context.parent_view_id = parent.view_id;
+          parent.char_start === item.char_start && parent.char_end === item.char_end) {
+        context.parent_view_id = parent.view_id;
+        if (parent.recommendation_id) context.recommendation_id = parent.recommendation_id;
+      }
       window.sessionStorage.removeItem('atlas_parent_view');
     } catch (_) { /* session storage unavailable */ }
     send('detail_view', itemData(detail));
@@ -202,7 +210,8 @@ TRACKING_SCRIPT = r"""<script>
     } else if (card && card.hasAttribute('data-tracking-list-item') && event.button === 0 &&
       !event.metaKey && !event.ctrlKey && !event.shiftKey && !event.altKey && !window.getSelection().toString()) action = 'open_detail';
     if (action === 'open_detail' && card && card.hasAttribute('data-tracking-list-item')) {
-      try { window.sessionStorage.setItem('atlas_parent_view', JSON.stringify({...itemData(card), view_id: view, time: Date.now()})); }
+      try { window.sessionStorage.setItem('atlas_parent_view', JSON.stringify({...itemData(card), view_id: view,
+        recommendation_id: context.recommendation_id, time: Date.now()})); }
       catch (_) { /* session storage unavailable */ }
     }
     if (action) send('click', {...itemData(card), action});

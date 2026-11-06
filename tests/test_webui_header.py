@@ -36,6 +36,7 @@ def test_header_keeps_two_rows_and_menus_work(tmp_path, width):
             assert top["y"] + top["height"] <= bottom["y"]
             for selector in (
                 ".feed-brand",
+                ".feed-search-trigger",
                 ".feed-source-management",
                 ".filter-panel summary",
                 ".theme-toggle",

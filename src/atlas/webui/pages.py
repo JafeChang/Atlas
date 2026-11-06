@@ -47,12 +47,14 @@ SPEC §6.5 的结论：前端此前只显示 `raw_id` / 渠道 / 字节数，**�
 from __future__ import annotations
 
 import html
+from dataclasses import replace
 from string import Template
 from typing import Any, Mapping, Sequence  # noqa: UP035
 from urllib.parse import urlencode
 
 from atlas.analytics.tracking import TRACKING_SCRIPT
 from atlas.feed import FeedEntry, FeedItem, FeedQuery, FeedResult
+from atlas.webui.search import SearchOptions
 
 __all__ = [
     "LABEL_KEY_INDUSTRY",
@@ -121,7 +123,8 @@ def article_url(entry: FeedEntry, *, back_to: str = "/feed") -> str:
 # 查询串（分页与「返回本页」用）
 # ---------------------------------------------------------------------- #
 def feed_query_string(
-    query: FeedQuery, *, offset: int = 0, labeled: Any = _KEEP, channels: Any = _KEEP
+    query: FeedQuery, *, offset: int = 0, labeled: Any = _KEEP, channels: Any = _KEEP,
+    search: SearchOptions = SearchOptions(),
 ) -> str:
     """把 `FeedQuery` 投影回 URL 查询串（**只做投影**，筛选/排序语义仍归 `atlas.feed`）。
 
@@ -149,7 +152,7 @@ def feed_query_string(
         params.append(("since", query.since.isoformat()))
     if query.until is not None:
         params.append(("until", query.until.isoformat()))
-    return "/feed?" + urlencode(params)
+    return "/feed?" + urlencode(params + search.params())
 
 
 # ---------------------------------------------------------------------- #
@@ -289,6 +292,29 @@ code, .raw-id { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; fon
 .record-details .meta { display: block; }
 .notice { border-left: 4px solid currentColor; padding: 0.4rem 0.6rem; margin: 0.8rem 0; }
 .empty { opacity: 0.8; }
+.feed-search-dialog { width: min(32rem, calc(100vw - 2rem)); max-width: calc(100vw - 2rem);
+    max-height: calc(100dvh - 2rem); margin: auto; padding: 0; overflow-y: auto;
+    border: 1px solid var(--border); border-radius: 14px; background: var(--surface);
+    color: var(--text); box-shadow: 0 16px 48px #141e2d4d; }
+.feed-search-dialog::backdrop { background: #0006; }
+.feed-search-heading { display: flex; align-items: center; justify-content: space-between;
+    gap: 12px; padding: 12px 12px 8px 20px; }
+.feed-search-heading h2 { margin: 0; font-size: 1rem; }
+.feed-search { padding: 0 20px 20px; background: var(--surface); }
+.feed-search form { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 8px; align-items: end; }
+.feed-search label { display: block; font-size: 12px; color: var(--muted); }
+.feed-search input[type=search] { width: 100%; min-width: 0; min-height: 44px; padding: 8px 10px; border: 1px solid var(--border); border-radius: 9px; }
+.feed-search input[type=search]:focus-visible { outline: none; border-color: var(--muted); }
+.feed-search select { width: 88px; padding-inline: 8px; }
+.feed-search button { min-height: 44px; padding-inline: 14px; }
+.feed-search-note { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 4px 12px; margin: 6px 0 0; color: var(--muted); font-size: 12px; }
+@media (max-width: 520px) {
+  .feed-search-heading { padding-left: 16px; }
+  .feed-search { padding: 0 16px 16px; }
+  .feed-search form { grid-template-columns: minmax(0, 1fr) auto; }
+  .feed-search .search-input { grid-column: 1 / -1; }
+  .feed-search select { width: 100%; }
+}
 .entry-slice { margin: 0.8rem 0; padding: 0.6rem 0.8rem; border-left: 4px solid currentColor;
                white-space: pre-wrap; overflow-wrap: anywhere; max-height: 60rem; overflow: auto; }
 .entry-slice mark { background: color-mix(in srgb, currentColor 22%, transparent); color: inherit; }
@@ -393,20 +419,22 @@ body.embedded-detail .article-detail { margin: 0; padding: 0; border: 0; }
   .feed-source-management { flex: none; text-decoration: none; }
   .feed-brand strong { font-weight: 650; }
   .feed-brand span { color: var(--muted); }
-  .feed-brand svg, .feed-source-management svg, .theme-toggle svg, .feed-user svg, .filter-panel summary svg, .source-menu svg {
+  .feed-brand svg, .feed-search-trigger svg, .feed-source-management svg, .theme-toggle svg, .feed-user svg, .filter-panel summary svg, .source-menu svg {
     width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 1.75;
     stroke-linecap: round; stroke-linejoin: round; flex: none; }
   .feed-brand svg { width: 20px; height: 20px; color: var(--accent); }
   .account, .source-tabs, .feed-top-pager { display: none; }
   .filter-panel { order: 1; position: static; padding: 0; border: 0; background: transparent; }
-  .feed-source-management, .filter-panel summary, .feed-user summary, .theme-toggle { display: grid; place-items: center;
+  .feed-search-trigger, .feed-source-management, .filter-panel summary, .feed-user summary, .theme-toggle { display: grid; place-items: center;
     width: 36px; height: 36px; min-height: 36px; padding: 0; border: 0; border-radius: 8px;
     color: var(--muted); background: transparent; list-style: none; cursor: pointer; }
   .filter-panel summary::-webkit-details-marker, .feed-user summary::-webkit-details-marker,
   .source-menu summary::-webkit-details-marker { display: none; }
   .filter-panel summary svg { display: block; }
   .filter-panel summary span { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
-  .feed-source-management:hover, .filter-panel summary:hover, .feed-user summary:hover, .theme-toggle:hover { background: var(--neutral-bg); color: var(--text); }
+  .feed-search-trigger { flex: none; width: 44px; height: 44px; min-height: 44px; }
+  .feed-search-trigger.has-search { color: var(--accent); background: var(--tint); }
+  .feed-search-trigger:hover, .feed-source-management:hover, .filter-panel summary:hover, .feed-user summary:hover, .theme-toggle:hover { background: var(--neutral-bg); color: var(--text); }
   .filter-panel .filters { position: absolute; top: calc(100% + 4px); right: 10px; z-index: 8;
     display: flex; width: min(21rem, calc(100vw - 2rem)); padding: 0.85rem; border: 1px solid var(--border);
     border-radius: 12px; background: var(--surface); box-shadow: 0 10px 30px #141e2d2e; }
@@ -431,6 +459,7 @@ body.embedded-detail .article-detail { margin: 0; padding: 0; border: 0; }
   .source-menu nav a { display: block; min-height: 36px; padding: 8px 10px; border-radius: 8px;
     color: var(--text); text-decoration: none; overflow-wrap: anywhere; }
   .source-menu nav a:hover, .source-menu nav a[aria-current=page] { background: var(--tint); }
+  .source-menu nav a.recommendation-link { min-height: 44px; font-weight: 600; }
   .source-menu-group + .source-menu-group { margin-top: 4px; padding-top: 4px; border-top: 1px solid var(--border); }
   .source-menu-group-title { padding: 6px 10px; font-size: 12px; font-weight: 650; color: var(--muted); overflow-wrap: anywhere; }
   .source-menu-group-count { font-weight: 400; }
@@ -517,7 +546,7 @@ body.embedded-detail .article-detail { margin: 0; padding: 0; border: 0; }
     padding-top: env(safe-area-inset-top, 0px);
     padding-left: max(14px, env(safe-area-inset-left, 0px));
     padding-right: max(10px, env(safe-area-inset-right, 0px)); }
-  .feed-items { overflow: visible; padding-bottom: env(safe-area-inset-bottom, 0px); }
+  .feed-items { overflow: visible; padding-bottom: max(12px, env(safe-area-inset-bottom, 0px)); }
   .feed-items .item { scroll-margin-top: calc(104px + env(safe-area-inset-top, 0px)); }
   .feed-brand { flex-basis: auto; }
   .source-menu { min-width: 0; max-width: none; }
@@ -538,8 +567,7 @@ body.embedded-detail .article-detail { margin: 0; padding: 0; border: 0; }
   .quick { margin-left: 0; }
   .quick a { font-size: 12px; padding-inline: 3px; }
   .source-menu summary { gap: 4px; padding-inline: 6px; }
-  .source-menu summary span { display: none; }
-  .source-menu summary::before { content: '来源'; white-space: nowrap; font-size: 12px; }
+  .source-menu summary span { display: block; min-width: 0; }
 }
 :is(body.embedded-detail, body.article-page) { --bg: #eceff1; --surface: #fbfcfc; --text: #181b1f; --muted: #626a73;
   --border: #d9dee2; --accent: #27508a; --tint: #dbe5f4; --neutral-bg: #e1e6ea;
@@ -652,14 +680,66 @@ body.embedded-detail .article-detail { margin: 0; padding: 0; border: 0; }
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme=light]) button, :root:not([data-theme=light]) .quick a[aria-current=page] { color: #101720; }
   :root:not([data-theme=light]) .vote-button, :root:not([data-theme=light]) .icon-action { color: var(--muted); }
-  :root:not([data-theme=light]) .theme-toggle, :root:not([data-theme=light]) .feed-user summary,
+  :root:not([data-theme=light]) .feed-search-trigger, :root:not([data-theme=light]) .theme-toggle, :root:not([data-theme=light]) .feed-user summary,
   :root:not([data-theme=light]) .filter-panel summary, :root:not([data-theme=light]) .quick a[aria-current=page] { color: var(--text); }
 }
 :root[data-theme=dark] button, :root[data-theme=dark] .quick a[aria-current=page] { color: #101720; }
 :root[data-theme=dark] .vote-button, :root[data-theme=dark] .icon-action { color: var(--muted); }
-:root[data-theme=dark] .theme-toggle, :root[data-theme=dark] .feed-user summary,
+:root[data-theme=dark] .feed-search-trigger, :root[data-theme=dark] .theme-toggle, :root[data-theme=dark] .feed-user summary,
 :root[data-theme=dark] .filter-panel summary, :root[data-theme=dark] .quick a[aria-current=page] { color: var(--text); }
+.feed-page .feed-search-trigger.has-search { color: var(--accent); }
 """
+
+_SEARCH_SCRIPT = """<script>
+(() => {
+  const form = document.querySelector('[data-search-form]');
+  if (!form) return;
+  const dialog = document.getElementById('feed-search-dialog');
+  const trigger = document.querySelector('[data-search-open]');
+  const input = form.querySelector('input[type="search"]');
+  trigger.addEventListener('click', () => {
+    if (dialog.open) return;
+    document.querySelectorAll('.feed-header details[open]').forEach(panel => { panel.open = false; });
+    dialog.showModal();
+    trigger.setAttribute('aria-expanded', 'true');
+    input.focus({preventScroll: true});
+    input.select();
+  });
+  dialog.querySelector('[data-search-close]').addEventListener('click', () => { dialog.close(); });
+  dialog.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape' && !event.isComposing) {
+      event.preventDefault();
+      dialog.close();
+    }
+  });
+  dialog.addEventListener('click', (event) => {
+    if (event.target !== dialog) return;
+    const rect = dialog.getBoundingClientRect();
+    if (event.clientX < rect.left || event.clientX > rect.right ||
+        event.clientY < rect.top || event.clientY > rect.bottom) dialog.close();
+  });
+  dialog.addEventListener('close', () => {
+    trigger.setAttribute('aria-expanded', 'false');
+    trigger.focus({preventScroll: true});
+  });
+  const button = form.querySelector('button[type="submit"]');
+  const status = document.querySelector('.feed-search-note [role="status"]');
+  const original = status.textContent;
+  form.addEventListener('submit', () => {
+    button.disabled = true;
+    button.textContent = '搜索中…';
+    form.setAttribute('aria-busy', 'true');
+    status.textContent = '正在搜索，请稍候…';
+  });
+  window.addEventListener('pageshow', () => {
+    button.disabled = false;
+    button.textContent = '搜索';
+    form.removeAttribute('aria-busy');
+    status.textContent = original;
+  });
+})();
+</script>"""
+
 
 _LABEL_SCRIPT = """<script>
 function atlasApplyLabels(card, values, tagValue) {
@@ -1097,6 +1177,7 @@ _SHELL = Template(
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1$viewport_fit">
 <title>$title</title>
+<link rel="icon" type="image/png" href="/favicon.png?v=1">
 <script>try { const theme = localStorage.getItem('atlas-theme'); if (theme === 'light' || theme === 'dark') document.documentElement.dataset.theme = theme; } catch (_) {}</script>
 <style>$style</style>
 </head>
@@ -1200,6 +1281,8 @@ def render_feed_page(
     show_account: bool = False,
     channel_names: Mapping[str, str] | None = None,
     channel_groups: Mapping[str, str] | None = None,
+    search: SearchOptions = SearchOptions(),
+    recommendation: Any = None,
 ) -> str:
     """渲染一页 feed：筛选器 + 排序 + 分页 + 每条一次点击打标。
 
@@ -1213,7 +1296,10 @@ def render_feed_page(
         return_to: 打标成功后回到的地址；默认为本页的规范查询串。
     """
     channel_names = channel_names or {}
-    page_url = return_to or feed_query_string(result.query, offset=result.offset)
+    recommending = search.view == "recommended"
+    strategy = "personalized-content-v2" if recommending else "brief-" + search.mode + "-v1" if search.text else "chronological-v1"
+    decision = f' data-recommendation-id="{escape(recommendation.decision_id)}"' if recommendation else ''
+    page_url = return_to or feed_query_string(result.query, offset=result.offset, search=search)
     filter_mask = sum(bit for enabled, bit in (
         (bool(result.query.channels), 1), (bool(result.query.industries), 2),
         (bool(result.query.tags), 4), (bool(result.query.labels), 8),
@@ -1221,34 +1307,39 @@ def render_feed_page(
         (result.query.until is not None, 64),
     ) if enabled)
     parts: list[str] = [
-        f'<div hidden data-feed-context data-strategy="chronological-v1" '
-        f'data-order="{escape(result.query.order)}" data-offset="{result.offset}" '
-        f'data-limit="{result.limit}" data-total="{result.total}" data-filter-mask="{filter_mask}"></div>'
+        f'<div hidden data-feed-context data-strategy="{strategy}" '
+        f'data-order="{"personalized" if recommending else "relevance" if search.text else escape(result.query.order)}" data-offset="{result.offset}" '
+        f'data-limit="{result.limit}" data-total="{result.total}" data-filter-mask="{filter_mask}"{decision}></div>'
     ]
     if show_account:
         parts.append(f'<div class="account"><span>当前用户：{escape(actor)}</span><form method="post" action="/logout"><button type="submit">退出登录</button></form></div>')
     parts += [
         '<div class="feed-header-main">',
         '<div class="feed-brand"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><ellipse cx="12" cy="12" rx="4" ry="9"/><path d="M3 12h18"/></svg><strong>Atlas</strong><span>Feed</span></div>',
+        f'<button class="feed-search-trigger{" has-search" if search.text else ""}" type="button" data-search-open '
+        'aria-label="搜索文章" title="搜索文章" aria-haspopup="dialog" aria-controls="feed-search-dialog" aria-expanded="false">'
+        '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 4.5 4.5"/></svg></button>',
         '<a class="feed-source-management" href="/sources" aria-label="信源管理" title="信源管理"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 11a9 9 0 0 1 9 9M4 4a16 16 0 0 1 16 16"/><circle cx="5" cy="19" r="1"/></svg></a>',
-        _render_filters(result.query, industries),
+        _render_filters(result.query, industries, search=search),
         '<button class="theme-toggle" type="button" aria-label="切换主题" title="切换主题"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 14.5A8 8 0 0 1 9.5 4 8 8 0 1 0 20 14.5z"/></svg></button>',
     ]
     if show_account:
         parts.append(f'<details class="feed-user"><summary title="用户" aria-label="当前用户：{escape(actor)}"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/></svg></summary><div><span>当前用户：{escape(actor)}</span><p>标签展示与筛选仅使用当前用户的判断。</p><form method="post" action="/logout"><button type="submit">退出登录</button></form></div></details>')
     parts += [
         '</div><div class="feed-header-controls">',
-        _render_source_menu(result.query, result.channels, channel_names, channel_groups),
-        _render_source_tabs(result.query, result.channels, channel_names),
-        _render_quick_switches(result.query),
-        _render_compact_pager(result),
+        _render_source_menu(result.query, result.channels, channel_names, channel_groups, search=search, show_recommendations=show_account),
+        _render_source_tabs(result.query, result.channels, channel_names, search=search),
+        _render_quick_switches(result.query, search=search),
+        _render_compact_pager(result, search=search),
         '</div>',
     ]
     header = "\n".join(parts)
-    parts = ['<div class="feed-top-pager">' + _render_pager(result) + '</div>']
+    parts = ['<div class="feed-top-pager">' + _render_pager(result, search=search) + '</div>']
     if not result.items:
         parts.append(
-            '<p class="empty">没有符合条件的记录。可放宽筛选条件，或先跑采集。</p>'
+            '<p class="empty">没有找到匹配的文章。试试缩短关键词、换一种说法，或放宽来源与标签筛选。</p>' if search.text
+            else '<p class="empty">暂时没有符合条件的推荐。可放宽筛选，或切换到全部来源。</p>' if recommending
+            else '<p class="empty">没有符合条件的记录。可放宽筛选条件，或先跑采集。</p>'
         )
     for item in result.items:
         labels = values.get(item.raw_id, {})
@@ -1279,19 +1370,57 @@ def render_feed_page(
     layout = (
         '<main class="feed-layout"><section class="feed-list" aria-label="信息流">'
         '<header class="feed-header">' + header + '</header>'
-        '<div class="feed-items">' + "\n".join(parts) + '</div></section>'
+        + '<div class="feed-items">' + "\n".join(parts) + '</div></section>'
         '<aside class="feed-detail" aria-label="文章详情">'
         '<p class="detail-placeholder" role="status">选择一篇文章查看详情</p>'
         '<iframe id="feed-detail-frame" name="atlas-detail" title="文章详情" hidden></iframe>'
         '</aside></main>'
+        + _render_search(result.query, search, recommendation=recommendation)
     )
-    return _shell(title="Atlas Feed", heading="Atlas Feed", body=layout + _LABEL_SCRIPT + _READER_SCRIPT, body_class="feed-page")
+    return _shell(title="Atlas Feed", heading="Atlas Feed", body=layout + _SEARCH_SCRIPT + _LABEL_SCRIPT + _READER_SCRIPT, body_class="feed-page")
 
 
-def _render_filters(query: FeedQuery, industries: Sequence[str]) -> str:
+def _render_search(query: FeedQuery, search: SearchOptions, *, recommendation=None) -> str:
+    from urllib.parse import parse_qsl, urlsplit
+    preserved = parse_qsl(urlsplit(feed_query_string(query, search=replace(search, text=""))).query)
+    hidden = ''.join(f'<input type="hidden" name="{escape(key)}" value="{escape(value)}">'
+                     for key, value in preserved if key != "offset")
+    options = ''.join(f'<option value="{mode}"{" selected" if mode == search.mode else ""}>{label}</option>'
+                      for mode, label in (("hybrid", "综合"), ("keyword", "关键词"), ("semantic", "语义")))
+    note = "搜索已有中文标题和简介 · 支持中英文提问"
+    if search.text:
+        note = "按相关度排列 · 相同文章合并展示"
+        if search.mode != "keyword":
+            note += " · 包含语义相关结果"
+    if search.view == "recommended":
+        note = "为你推荐 · 根据你的阅读动态调整 · 包含近期内容"
+        if recommendation is not None and not recommendation.profile_size:
+            note = "为你推荐 · 先看看近期内容，阅读后会逐步了解你的兴趣"
+        if search.text:
+            note += " · 已按搜索条件筛选"
+    clear = f'<a href="{escape(feed_query_string(query, search=replace(search, text="")))}">清除搜索</a>' if search.text else ''
+    return ('<dialog id="feed-search-dialog" class="feed-search-dialog" aria-labelledby="feed-search-title">'
+            '<div class="feed-search-heading"><h2 id="feed-search-title">搜索文章</h2>'
+            '<button type="button" class="icon-action" data-search-close aria-label="关闭搜索" title="关闭搜索">'
+            '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true">'
+            '<path d="M6 6l12 12M18 6 6 18"/></svg></button></div>'
+            '<section class="feed-search" aria-label="文章搜索"><form method="get" action="/feed" data-search-form>'
+            + hidden + '<label class="search-input" for="feed-search-input">搜索文章'
+            f'<input id="feed-search-input" type="search" name="q" value="{escape(search.text)}" maxlength="200" '
+            'placeholder="输入关键词，或描述你想找的内容" enterkeyhint="search"></label>'
+            '<div><label for="feed-search-mode">搜索方式</label>'
+            f'<select id="feed-search-mode" name="search_mode">{options}</select></div>'
+            '<button type="submit">搜索</button></form>'
+            f'<p class="feed-search-note"><span role="status">{note}</span>{clear}</p></section></dialog>')
+
+
+def _render_filters(query: FeedQuery, industries: Sequence[str], *, search: SearchOptions = SearchOptions()) -> str:
     desc = " selected" if query.order == "desc" else ""
     asc = " selected" if query.order == "asc" else ""
     preserved = [("channel", value) for value in query.channels]
+    preserved += search.params()
+    if search.text or search.view == "recommended":
+        preserved.append(("order", query.order))
     preserved += [("industry", value) for value in query.industries]
     preserved += [("tag", value) for value in query.tags[1:]]
     if query.labels:
@@ -1315,12 +1444,12 @@ def _render_filters(query: FeedQuery, industries: Sequence[str]) -> str:
         + '<label>标签'
         f'<input type="text" name="tag" value="{escape(query.tags[0] if query.tags else "")}" placeholder="输入标签筛选">'
         "</label>"
-        "<label>排序"
+        + ('<span>按兴趣推荐排列</span>' if search.view == "recommended" else '<span>按相关度排列</span>' if search.text else "<label>排序"
         '<select name="order">'
         f'<option value="desc"{desc}>最新优先</option>'
         f'<option value="asc"{asc}>最早优先</option>'
-        "</select></label>"
-        "<label>每页"
+        "</select></label>")
+        + "<label>每页"
         f'<input type="number" name="limit" min="1" max="200" value="{escape(query.limit)}" required>'
         "</label>"
         '<input type="hidden" name="offset" value="0">'
@@ -1329,16 +1458,17 @@ def _render_filters(query: FeedQuery, industries: Sequence[str]) -> str:
     )
 
 
-def _render_source_menu(query: FeedQuery, channels: Sequence[str], names: Mapping[str, str] | None = None, groups: Mapping[str, str] | None = None) -> str:
+def _render_source_menu(query: FeedQuery, channels: Sequence[str], names: Mapping[str, str] | None = None, groups: Mapping[str, str] | None = None, *, search: SearchOptions = SearchOptions(), show_recommendations: bool = False) -> str:
     names = names or {}
     selected = "全部来源" if not query.channels else "、".join(names.get(channel, channel) for channel in query.channels)
     active_channels = frozenset(query.channels)
+    recommending = search.view == "recommended"
 
     def link(label: str, selected_channels: tuple[str, ...], *, active: bool | None = None) -> str:
-        href = feed_query_string(query, offset=0, channels=selected_channels)
+        href = feed_query_string(query, offset=0, channels=selected_channels, search=replace(search, view="all"))
         if active is None:
             active = active_channels == frozenset(selected_channels)
-        current = ' aria-current="page"' if active else ''
+        current = ' aria-current="page"' if active and not recommending else ''
         return f'<a href="{escape(href)}" title="{escape(label)}"{current}>{escape(label)}</a>'
 
     available = sorted(set(channels) | set(query.channels), key=lambda channel: (names.get(channel, channel).casefold(), channel))
@@ -1353,7 +1483,7 @@ def _render_source_menu(query: FeedQuery, channels: Sequence[str], names: Mappin
             all_label = group.removesuffix(" 信源") + "全部"
             # 单来源组仍优先展示具体来源；多来源选择不受 URL 参数顺序影响。
             group_active = len(channels_in_group) > 1 and active_channels == frozenset(channels_in_group)
-            if group_active:
+            if group_active and not recommending:
                 selected = all_label
             shortcuts.append(link(all_label, tuple(channels_in_group), active=group_active))
             label_id = f"source-group-{index}"
@@ -1367,17 +1497,24 @@ def _render_source_menu(query: FeedQuery, channels: Sequence[str], names: Mappin
         items = "".join(shortcuts + sections)
     else:
         items = "".join(link(names.get(channel, channel), (channel,)) for channel in available)
+    recommendation_link = ''
+    if show_recommendations:
+        href = feed_query_string(query, offset=0, channels=(), search=replace(search, text="", view="recommended"))
+        current = ' aria-current="page"' if recommending else ''
+        recommendation_link = f'<a class="recommendation-link" href="{escape(href)}"{current}>为你推荐</a>'
+    if recommending:
+        selected = "为你推荐"
     return (f'<details class="source-menu"><summary aria-label="切换来源" title="{escape(selected)}">'
             f'<span title="{escape(selected)}">{escape(selected)}</span><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg></summary>'
             '<nav aria-label="切换来源">' + link("全部来源", ())
-            + items + '</nav></details>')
+            + recommendation_link + items + '</nav></details>')
 
 
-def _render_source_tabs(query: FeedQuery, channels: Sequence[str], names: Mapping[str, str] | None = None) -> str:
+def _render_source_tabs(query: FeedQuery, channels: Sequence[str], names: Mapping[str, str] | None = None, *, search: SearchOptions = SearchOptions()) -> str:
     names = names or {}
     def link(label: str, selected_channels: tuple[str, ...]) -> str:
-        href = feed_query_string(query, offset=0, channels=selected_channels)
-        current = ' aria-current="page"' if query.channels == selected_channels else ''
+        href = feed_query_string(query, offset=0, channels=selected_channels, search=replace(search, view="all"))
+        current = ' aria-current="page"' if query.channels == selected_channels and search.view != "recommended" else ''
         return f'<a href="{escape(href)}"{current}>{escape(label)}</a>'
 
     # 显式查询不存在的渠道时也保留当前选择，避免页面没有选中状态。
@@ -1390,9 +1527,9 @@ def _render_source_tabs(query: FeedQuery, channels: Sequence[str], names: Mappin
     )
 
 
-def _render_quick_switches(query: FeedQuery) -> str:
+def _render_quick_switches(query: FeedQuery, *, search: SearchOptions = SearchOptions()) -> str:
     def link(label: str, labeled: Any) -> str:
-        href = feed_query_string(query, offset=0, labeled=labeled)
+        href = feed_query_string(query, offset=0, labeled=labeled, search=search)
         current = ' aria-current="page"' if query.labeled is labeled else ''
         return f'<a href="{escape(href)}"{current}>{escape(label)}</a>'
 
@@ -1405,22 +1542,22 @@ def _render_quick_switches(query: FeedQuery) -> str:
     )
 
 
-def _render_pager(result: FeedResult) -> str:
+def _render_pager(result: FeedResult, *, search: SearchOptions = SearchOptions()) -> str:
     shown = len(result.items)
     first = result.offset + 1 if shown else 0
     parts = [f'<span class="count">共 {result.total} 条 · 本页 {first}–{result.offset + shown}</span>']
     if result.offset > 0:
         previous = max(0, result.offset - result.limit)
-        href = feed_query_string(result.query, offset=previous)
+        href = feed_query_string(result.query, offset=previous, search=search)
         parts.append(f'<a href="{escape(href)}">上一页</a>')
     if result.has_more and result.next_offset is not None:
-        href = feed_query_string(result.query, offset=result.next_offset)
+        href = feed_query_string(result.query, offset=result.next_offset, search=search)
         parts.append(f'<a href="{escape(href)}">下一页</a>')
-    parts.append(f'<a href="{escape(feed_query_string(result.query, offset=0))}">回到第一页</a>')
+    parts.append(f'<a href="{escape(feed_query_string(result.query, offset=0, search=search))}">回到第一页</a>')
     return '<nav class="pager">' + " ".join(parts) + "</nav>"
 
 
-def _render_compact_pager(result: FeedResult) -> str:
+def _render_compact_pager(result: FeedResult, *, search: SearchOptions = SearchOptions()) -> str:
     shown = len(result.items)
     first = result.offset + 1 if shown else 0
     last = result.offset + shown if shown else 0
@@ -1434,8 +1571,8 @@ def _render_compact_pager(result: FeedResult) -> str:
             return f'<span class="page-arrow" aria-label="{label}" aria-disabled="true">{icon}</span>'
         return f'<a class="page-arrow" href="{escape(href)}" aria-label="{label}">{icon}</a>'
 
-    before = feed_query_string(result.query, offset=previous) if result.offset else None
-    after = feed_query_string(result.query, offset=result.next_offset) if result.next_offset is not None else None
+    before = feed_query_string(result.query, offset=previous, search=search) if result.offset else None
+    after = feed_query_string(result.query, offset=result.next_offset, search=search) if result.next_offset is not None else None
     return (f'<nav class="compact-pager" aria-label="分页" title="本页 {first} 到 {last}，共 {result.total} 条"><span class="compact-count" '
             f'aria-label="本页 {first} 到 {last}，共 {result.total} 条">{first}–{last} / {result.total}</span>'
             + arrow('上一页', before, 'm15 6-6 6 6 6')

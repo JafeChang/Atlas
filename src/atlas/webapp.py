@@ -58,7 +58,8 @@ PYTHONPATH=src ./.venv-new/bin/python -m atlas.webapp
 风格照 `atlas.compose.cli`：argparse、`--store-root` 默认 `data/store`
 （可用 `ATLAS_STORE_ROOT` 覆盖）、失败打印到 stderr 并非零退出。
 
-**它负责界面与按需阅读服务**：页面 GET 只读取既有数据，不采集、不调用模型、不改配置；
+**它负责界面与按需阅读服务**：页面 GET 只读取既有数据，搜索执行本地向量推理；
+不采集、不调用外部模型、不改配置；
 图片按浏览需要进入独立缓存，详情页的浏览器默认通过同源 POST 请求中文全文，复用翻译缓存。
 三条硬要求：
 
@@ -96,7 +97,7 @@ from atlas.cognition import (
     read_articles,
     read_classifications,
 )
-from atlas.contracts import RawRecord
+from atlas.contracts import NotFoundError, RawRecord
 from atlas.entries import (
     EntryParseError,
     is_challenge_page,
@@ -613,7 +614,82 @@ def build_webapp(
         image_cache=image_cache, client_factory=translation_client_factory,
     )
 
+    from atlas.brief_search import BriefSearch
+    from atlas.brief_search_cli import DEFAULT_MODEL
+
+    search = BriefSearch(
+        Path(root) / "brief-search.sqlite",
+        model_dir=Path(root).parent / "models" / "multilingual-e5-small" / DEFAULT_MODEL.name,
+    )
+    from atlas.recommendations import RecommendationEngine
+
+    recommendations = RecommendationEngine(
+        Path(root) / "brief-search.sqlite",
+        Path(db_path).with_name("analytics.db"),
+        Path(db_path).with_name("recommendations.db"),
+    )
+
+    def resolve_interest(raw_id, raw_sha256, char_start, char_end):
+        try:
+            record = archive.get(raw_id)
+        except NotFoundError:
+            return None
+        if record.content_sha256 != raw_sha256:
+            return None
+        return access.browse_record(record).sources.get((char_start, char_end))
+
+    def recommend_entries(entries, user_id):
+        sources_by_raw, candidates = {}, []
+        for entry in entries:
+            if entry.raw_id not in sources_by_raw:
+                sources_by_raw[entry.raw_id] = access.browse_record(archive.get(entry.raw_id)).sources
+            brief = sources_by_raw[entry.raw_id].get((entry.char_start, entry.char_end))
+            if brief:
+                candidates.append((entry, brief.key))
+        admission = read_admissions(db_path)
+        return recommendations.rank(candidates, user_id, resolve_interest, allows=admission.allows)
+
+    def select_search_entries(entries, query):
+        # These filters can distinguish archive occurrences of the same source.
+        # Keep them all until the normal projection and current-user filtering.
+        if query.industries or query.tags or query.labels or query.labeled is not None:
+            return entries
+        sources_by_raw, seen, selected = {}, set(), []
+        for entry in sorted(entries, key=lambda entry: (entry.fetched_at, entry.raw_id), reverse=True):
+            if entry.raw_id not in sources_by_raw:
+                sources_by_raw[entry.raw_id] = access.browse_record(archive.get(entry.raw_id)).sources
+            brief = sources_by_raw[entry.raw_id].get((entry.char_start, entry.char_end))
+            if brief is None or brief.key not in seen:
+                selected.append(entry)
+                if brief:
+                    seen.add(brief.key)
+        return selected
+
+    def search_entries(entries, text, mode):
+        sources_by_raw = {}
+        keys = {}
+        for entry in entries:
+            if entry.raw_id not in sources_by_raw:
+                sources_by_raw[entry.raw_id] = access.browse_record(archive.get(entry.raw_id)).sources
+            brief = sources_by_raw[entry.raw_id].get((entry.char_start, entry.char_end))
+            if brief:
+                keys[(entry.raw_id, entry.char_start, entry.char_end)] = brief.key
+        ranked = search.search(text, mode, set(keys.values()))
+        rank = {key: index for index, key in enumerate(ranked)}
+        matches = [entry for entry in entries if keys.get((entry.raw_id, entry.char_start, entry.char_end)) in rank]
+        # Prefer the latest eligible archive occurrence of each matching URL.
+        matches.sort(key=lambda entry: (entry.fetched_at, entry.raw_id), reverse=True)
+        matches.sort(key=lambda entry: rank[keys[(entry.raw_id, entry.char_start, entry.char_end)]])
+        seen, result = set(), []
+        for entry in matches:
+            url = entry.link or entry.endpoint
+            if url not in seen:
+                seen.add(url)
+                result.append(entry)
+        return result
+
     def close_resources():
+        search.close()
         reader.close()
         archive.close()
 
@@ -633,6 +709,9 @@ def build_webapp(
         locate_entry=locate_entry,
         text_length=text_length,
         entry_projection=project_entries,
+        entry_search=search_entries,
+        entry_search_selection=select_search_entries,
+        entry_recommend=recommend_entries,
         reader=reader,
         on_close=close_resources,
         host=host,

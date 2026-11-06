@@ -14,6 +14,7 @@ _TEXT_LIMITS = {
     "event_type": 32, "page": 16, "occurred_at": 40, "raw_id": 256,
     "entry_id": 256, "raw_sha256": 64, "channel_id": 256, "action": 80,
     "order": 16, "strategy": 80, "collection_version": 32, "parent_view_id": 80,
+    "recommendation_id": 80,
 }
 _INTS = {"char_start", "char_end", "position", "offset", "limit", "total", "visible_ms", "read_ms", "scroll_pct", "filter_mask"}
 _REQUIRED = {"event_id", "visitor_id", "session_id", "view_id", "event_type", "page", "occurred_at"}

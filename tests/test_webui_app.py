@@ -792,7 +792,7 @@ def test_raw_exists_from_source_covers_paged_fallback() -> None:
 
 
 def test_webui_package_files_exist() -> None:
-    assert [path.name for path in WEBUI_MODULES] == ["__init__.py", "app.py", "pages.py"]
+    assert [path.name for path in WEBUI_MODULES] == ["__init__.py", "app.py", "pages.py", "search.py"]
 
 
 #: 允许 import 的根模块：标准库 + 已提交的 atlas 包。没有 Web 框架、没有 sqlite3。
@@ -801,6 +801,7 @@ ALLOWED_IMPORT_ROOTS = frozenset(
         "__future__",
         "<relative>",
         "atlas",
+        "dataclasses",
         "html",
         "http",
         "json",

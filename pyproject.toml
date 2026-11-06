@@ -48,6 +48,12 @@ dependencies = [
 browser = [
     "playwright>=1.64.1",
 ]
+semantic = [
+    # 本地中文译题/简介向量索引：CPU 推理、分词和向量计算。
+    "numpy>=2.5.4",
+    "onnxruntime>=1.31.1",
+    "tokenizers>=0.23.3",
+]
 
 [dependency-groups]
 dev = [

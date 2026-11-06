@@ -40,6 +40,7 @@ SPEC §2.11 的硬边界
 | GET | `/translation-stream` | SSE 推送翻译进度及已完成的段落 |
 | POST | `/label` | 提交一个判断；`Accept: application/json` 返回当前标签，普通表单 `303` 回到 feed |
 | GET | `/health` | 存活探测（不碰数据源、不碰标签库） |
+| GET | `/favicon.png` `/favicon.ico` | 网站图标；无需登录 |
 
 其它路径 → `404`；方法不匹配 → `405` + `Allow`。
 
@@ -113,6 +114,7 @@ from atlas.feed import (
 from atlas.feed.query import SOURCE_PAGE_SIZE
 from atlas.labels import LabelStore, open_store
 from atlas.users import SESSION_SECONDS, UserStore
+from atlas.webui.search import SearchOptions
 
 from .pages import (
     LABEL_KEY_INDUSTRY,
@@ -547,6 +549,14 @@ def _memoized_lookup(session: LabelSession) -> LabelLookup:
     return lookup
 
 
+class _SearchUnavailable(Exception):
+    pass
+
+
+class _RecommendationsUnavailable(Exception):
+    pass
+
+
 class WebUIRequestHandler(BaseHTTPRequestHandler):
     """GET 浏览 / POST 打标。业务逻辑复用 `atlas.feed` 与 `atlas.labels`，这里只做 HTTP 翻译。"""
 
@@ -566,6 +576,20 @@ class WebUIRequestHandler(BaseHTTPRequestHandler):
         self._session_cookie = None
         target = urlsplit(self.path)
         path = _normalize_path(target.path)
+        if path == "/favicon.png":
+            self._send_bytes(
+                HTTPStatus.OK,
+                Path(__file__).with_name("static").joinpath("favicon.png").read_bytes(),
+                content_type="image/png",
+                extra_headers={
+                    "Cache-Control": "public, max-age=86400",
+                    "X-Content-Type-Options": "nosniff",
+                },
+            )
+            return
+        if path == "/favicon.ico":
+            self._redirect(HTTPStatus.PERMANENT_REDIRECT, "/favicon.png?v=1")
+            return
         if path == "/health":
             self._send_json(
                 HTTPStatus.OK,
@@ -821,7 +845,10 @@ class WebUIRequestHandler(BaseHTTPRequestHandler):
         server = self.server
         params = parse_qs(query_string, keep_blank_values=True)
         try:
+            search = SearchOptions.from_params(params)
             query = self._entry_query(params)
+            if (search.text or search.view == "recommended") and not query.is_entry_mode:
+                raise InvalidQueryError("granularity", "搜索和推荐只支持文章条目")
         except InvalidQueryError as exc:
             self._send_error(
                 HTTPStatus.BAD_REQUEST,
@@ -829,6 +856,33 @@ class WebUIRequestHandler(BaseHTTPRequestHandler):
                 f"参数 {exc.parameter!r}：{exc.message}",
             )
             return
+
+        recommending = search.view == "recommended"
+        if recommending and server.users is None:
+            self._send_error(HTTPStatus.UNAUTHORIZED, "请先登录", "推荐列表需要登录用户。")
+            return
+        recommendation = None
+
+        def rank_entries(entries):
+            nonlocal recommendation
+            if search.text:
+                try:
+                    if server.entry_search is None:
+                        raise RuntimeError("未配置搜索索引")
+                    entries = server.entry_search(entries, search.text, search.mode)
+                except Exception as exc:
+                    _log.exception("搜索失败")
+                    raise _SearchUnavailable() from exc
+            if recommending:
+                try:
+                    if server.entry_recommend is None:
+                        raise RuntimeError("未配置推荐服务")
+                    recommendation = server.entry_recommend(entries, self.current_user_id)
+                    entries = recommendation.entries
+                except Exception as exc:
+                    _log.exception("推荐失败")
+                    raise _RecommendationsUnavailable() from exc
+            return entries
 
         try:
             with self._request_labels().read_session() as session:
@@ -838,10 +892,18 @@ class WebUIRequestHandler(BaseHTTPRequestHandler):
                     label_lookup=_memoized_lookup(session),
                     entries_of=server.entries_lookup,
                     entry_projection=(lambda entries: server.entry_projection(entries, session)) if server.entry_projection else None,
+                    entry_ranker=rank_entries if search.text or recommending else None,
+                    entry_selector=(lambda entries: server.entry_search_selection(entries, query)) if (search.text or recommending) and server.entry_search_selection else None,
                 )
                 values = {
                     item.raw_id: session.values_for(item.raw_id) for item in result.items
                 }
+        except _SearchUnavailable:
+            self._send_error(HTTPStatus.SERVICE_UNAVAILABLE, "搜索暂时不可用", "索引尚未就绪或搜索繁忙，请稍后重试。仍可返回信息流浏览。")
+            return
+        except _RecommendationsUnavailable:
+            self._send_error(HTTPStatus.SERVICE_UNAVAILABLE, "推荐暂时不可用", "推荐索引尚未就绪或服务繁忙，请稍后重试。仍可选择全部来源浏览。")
+            return
         except FeedQueryError as exc:
             _log.error("feed 查询失败：%s", exc)
             self._send_error(
@@ -865,6 +927,8 @@ class WebUIRequestHandler(BaseHTTPRequestHandler):
             show_account=server.users is not None,
             channel_names=server.source_management.channel_names() if server.source_management else {},
             channel_groups=server.source_management.channel_groups() if server.source_management else {},
+            search=search,
+            recommendation=recommendation,
         )
         self._send_html(HTTPStatus.OK, document)
 
@@ -875,6 +939,8 @@ class WebUIRequestHandler(BaseHTTPRequestHandler):
         调用方显式传了 `granularity` 就尊重它（否则传 `document` 会被静默改写，
         那种"看着接受了其实没用"正是要避免的）；缺省时用条目粒度。
         """
+        SearchOptions.from_params(params)
+        params = {key: value for key, value in params.items() if key not in ("q", "search_mode", "view")}
         if "tag" in params:
             tags = [value for value in params["tag"] if value.strip()]
             params = {key: value for key, value in params.items() if key != "tag"}
@@ -1691,7 +1757,9 @@ def _validate_return_to(return_to: str) -> None:
         )
     query_string = return_to.split("?", 1)[1] if "?" in return_to else ""
     try:
-        FeedQuery.from_params(parse_qs(query_string, keep_blank_values=True))
+        params = parse_qs(query_string, keep_blank_values=True)
+        SearchOptions.from_params(params)
+        FeedQuery.from_params({key: value for key, value in params.items() if key not in ("q", "search_mode", "view")})
     except InvalidQueryError as exc:
         raise _FormRejected(
             HTTPStatus.BAD_REQUEST,
@@ -1722,6 +1790,9 @@ class WebUIHTTPServer(ThreadingHTTPServer):
         locate_entry: Any = None,
         text_length: Any = None,
         entry_projection: Any = None,
+        entry_search: Any = None,
+        entry_search_selection: Any = None,
+        entry_recommend: Any = None,
         reader: Any = None,
         events: Any = None,
         users: UserStore | None = None,
@@ -1738,6 +1809,9 @@ class WebUIHTTPServer(ThreadingHTTPServer):
         self.locate_entry = locate_entry or _whole_document_entry
         self.text_length = text_length or _default_text_length
         self.entry_projection = entry_projection
+        self.entry_search = entry_search
+        self.entry_search_selection = entry_search_selection
+        self.entry_recommend = entry_recommend
         self.reader = reader
         self.events = events
         self.users = users
@@ -1817,6 +1891,9 @@ class WebUIApplication:
         locate_entry: Any = None,
         text_length: Any = None,
         entry_projection: Any = None,
+        entry_search: Any = None,
+        entry_search_selection: Any = None,
+        entry_recommend: Any = None,
         reader: Any = None,
         events: Any = None,
         users: UserStore | None = None,
@@ -1838,6 +1915,9 @@ class WebUIApplication:
             locate_entry=locate_entry,
             text_length=text_length,
             entry_projection=entry_projection,
+            entry_search=entry_search,
+            entry_search_selection=entry_search_selection,
+            entry_recommend=entry_recommend,
             reader=reader,
             events=events,
             users=users,

@@ -587,6 +587,8 @@ def run_query(
     label_lookup: LabelLookup | None = None,
     entries_of: EntriesLookup | None = None,
     entry_projection: Callable[[Sequence[FeedEntry]], Sequence[FeedEntry]] | None = None,
+    entry_ranker: Callable[[Sequence[FeedEntry]], Sequence[FeedEntry]] | None = None,
+    entry_selector: Callable[[Sequence[FeedEntry]], Sequence[FeedEntry]] | None = None,
 ) -> FeedResult:
     """执行一次只读查询。
 
@@ -640,6 +642,8 @@ def run_query(
                 label_lookup=label_lookup,
                 entries_of=entries_of,
                 entry_projection=entry_projection,
+                entry_ranker=entry_ranker,
+                entry_selector=entry_selector,
             ),
             channels=channels,
         )
@@ -699,6 +703,8 @@ def _run_entry_query(
     label_lookup: LabelLookup | None,
     entries_of: EntriesLookup | None,
     entry_projection: Callable[[Sequence[FeedEntry]], Sequence[FeedEntry]] | None = None,
+    entry_ranker: Callable[[Sequence[FeedEntry]], Sequence[FeedEntry]] | None = None,
+    entry_selector: Callable[[Sequence[FeedEntry]], Sequence[FeedEntry]] | None = None,
 ) -> FeedResult:
     """条目粒度：把筛选后的 Raw 展开成可浏览单元，再排序 / 分页。"""
     assert entries_of is not None  # 由 run_query 保证
@@ -731,6 +737,8 @@ def _run_entry_query(
             )
         )
 
+    if entry_selector is not None:
+        units = _select_existing_entries(units, entry_selector)
     if entry_projection is not None:
         projected = list(entry_projection(tuple(units)))
         if [(u.raw_id, u.raw_sha256, u.entry_id, u.char_start, u.char_end) for u in projected] != [(u.raw_id, u.raw_sha256, u.entry_id, u.char_start, u.char_end) for u in units]:
@@ -746,7 +754,10 @@ def _run_entry_query(
         counts = {status: sum(u.admission_status == status for u in isolated) for status in ("pending", "rejected")}
         notices.append(f"入站审核：{counts['pending']} 条待审或内容不可读取，{counts['rejected']} 条已拦截；均未进入文章队列。")
         units = [u for u in units if u.admission_status not in ("pending", "rejected")]
-    ordered = _stable_entry_order(units, query.order)
+    if entry_ranker is not None:
+        ordered = _select_existing_entries(units, entry_ranker)
+    else:
+        ordered = _stable_entry_order(units, query.order)
     total = len(ordered)
     page = ordered[query.offset : query.offset + query.limit]
     returned = len(page)
@@ -761,6 +772,17 @@ def _run_entry_query(
         next_offset=(query.offset + returned) if has_more else None,
         notices=tuple(dict.fromkeys(notices)),
     )
+
+
+def _select_existing_entries(units, selector):
+    selected = list(selector(tuple(units)))
+    def identity(unit):
+        return (unit.raw_id, unit.raw_sha256, unit.entry_id, unit.char_start, unit.char_end)
+    eligible = {identity(unit): unit for unit in units}
+    identities = [identity(unit) for unit in selected]
+    if len(set(identities)) != len(identities) or any(eligible.get(identity(unit)) != unit for unit in selected):
+        raise SourceContractError("条目选择只能返回输入条目的不重复子集，不得修改条目")
+    return selected
 
 
 def _entry_units(
