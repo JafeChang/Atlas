@@ -1,0 +1,9 @@
+[Unit]
+Description=Shared resource budget for Atlas background processing
+
+[Slice]
+CPUQuota=200%
+MemoryHigh=2G
+MemoryMax=3G
+MemorySwapMax=256M
+IOWeight=20

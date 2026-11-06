@@ -13,7 +13,7 @@ fi
 
 # 采集不触发行业分类；已启用的译题/简介任务独立处理新增文章。
 export ATLAS_COGNITION=0
-.venv-new/bin/python -u -m atlas.compose run --due-only --allow-partial "$@"
+.venv-new/bin/python -u -m atlas.ingest --allow-partial "$@"
 # 行业候选来自已经归档的响应，不额外请求信源。结构化提取沿用模型路由，
 # 只有显式配置 ATLAS_ALUMINIUM_EXTRACT=1 才调用模型/读取详情。
 if .venv-new/bin/python -c 'from atlas.aluminium.store import has_aluminium; import sys; sys.exit(not has_aluminium("data/store/atlas.db"))'; then

@@ -1,0 +1,19 @@
+[Unit]
+Description=Atlas incremental collection without execution history snapshots
+After=network-online.target
+Wants=network-online.target
+RequiresMountsFor=@ATLAS_ROOT@
+
+[Service]
+Type=oneshot
+WorkingDirectory=@ATLAS_ROOT@
+Environment=PYTHONUNBUFFERED=1
+Environment=ATLAS_LIVE=1
+EnvironmentFile=-@ATLAS_ROOT@/data/store/article-content.env
+ExecStart=@ATLAS_ROOT@/scripts/collect-due.sh
+TimeoutStartSec=1200
+TimeoutStopSec=30
+Nice=10
+Slice=atlas-background.slice
+IOWeight=20
+

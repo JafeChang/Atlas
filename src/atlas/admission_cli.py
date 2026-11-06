@@ -16,7 +16,6 @@ import requests
 
 from atlas.archive import (
     ArticleContentStore,
-    open_archive,
     read_article_body,
     read_article_contents,
 )
@@ -36,7 +35,6 @@ from atlas.collect.article import (
     read_source,
 )
 from atlas.collect.network_policy import SharedNetworkPolicy
-from atlas.webapp import ArchiveEntriesAccess
 
 
 def main(argv=None):
@@ -89,32 +87,38 @@ def run(args, root, db_path, parser):
         ):
             print("入站审核模型冷却中，待审条目保持隔离。", flush=True)
             return 1
-        with open_archive(root) as archive:
-            access = ArchiveEntriesAccess(archive)
-            records = sorted(
-                (archive.get(rid) for rid in archive.all_raw_ids()),
-                key=lambda r: (r.fetched_at, r.raw_id),
-                reverse=True,
-            )
-            sources = {}
-            for record in records:
-                for source in access.brief_sources(record.raw_id).values():
-                    sources.setdefault(source.key, source)
+        from atlas.source_index import read_sources, refresh_sources
+
+        refresh_sources(root)
+        sources = read_sources(root)
         if args.source_key and set(args.source_key) - sources.keys():
             parser.error("指定的来源键不存在")
-        briefs = read_articles(db_path)
         bodies = read_article_contents(db_path)
         network_policy = SharedNetworkPolicy(root)
         pending = []
         skipped = 0
-        for source in sources.values():
+        # Put due origin retries first before applying the batch bound.
+        ordered_sources = sorted(sources.values(), key=lambda source: not (
+            source.url in bodies
+            and bodies[source.url].failure_code == "site_deferred"
+            and time.time() >= network_policy.ready_at(source.url)
+        ))
+        for source in ordered_sources:
             if args.source_key and source.key not in args.source_key:
                 continue
             previous = state.reviews.get(source.key)
             if previous and previous.decision != "pending" and not args.refresh:
                 skipped += 1
                 continue
-            article = briefs.get(source.key)
+            if args.limit and len(pending) >= args.limit:
+                continue
+            if previous is None:
+                # New work needs no historical input-hash comparison. Load its
+                # body only after the batch limit has selected the candidates.
+                pending.append(source)
+                continue
+            source = read_sources(root, keys=[source.key], include_body=True)[source.key]
+            article = read_articles(db_path, source_keys=[source.key]).get(source.key)
             if article and article.article_text and article.body_source == "original":
                 source = replace(source, body=article.article_text, kind="original")
             elif source.url in bodies and (
@@ -162,6 +166,21 @@ def run(args, root, db_path, parser):
         )
         if args.limit:
             pending = pending[: args.limit]
+        hydrated = read_sources(root, keys=[s.key for s in pending], include_body=True)
+        selected_briefs = read_articles(db_path, source_keys=hydrated)
+        selected = []
+        for source in pending:
+            if not source.body:
+                source = hydrated[source.key]
+                article = selected_briefs.get(source.key)
+                if article and article.article_text and article.body_source == "original":
+                    source = replace(source, body=article.article_text, kind="original")
+                elif source.url in bodies and not source.has_body:
+                    saved = read_article_body(db_path, source.url)
+                    if saved:
+                        source = replace(source, body=saved.cleaned_text, kind="original")
+            selected.append(source)
+        pending = selected
         counts = Counter(
             total_sources=len(sources),
             selected=len(pending),

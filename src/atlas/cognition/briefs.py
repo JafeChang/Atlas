@@ -107,7 +107,7 @@ class ArticleRow:
     model: str
 
 
-def read_articles(path: str | Path, *, include_text: bool = True) -> dict[str, ArticleRow]:
+def read_articles(path: str | Path, *, include_text: bool = True, source_keys=None) -> dict[str, ArticleRow]:
     path = Path(path)
     if not path.is_file():
         return {}
@@ -120,13 +120,15 @@ def read_articles(path: str | Path, *, include_text: bool = True) -> dict[str, A
         if not exists:
             return {}
         text_column = "article_text" if include_text else "''"
-        return {
-            key: ArticleRow(*values)
-            for key, *values in db.execute(
-                f"SELECT source_key,title_zh,summary_zh,{text_column},body_source,status,error,model FROM feed_articles WHERE policy=?",
-                (BRIEF_VERSION,),
-            )
-        }
+        query = f"SELECT source_key,title_zh,summary_zh,{text_column},body_source,status,error,model FROM feed_articles WHERE policy=?"
+        if source_keys is None:
+            return {key: ArticleRow(*values) for key, *values in db.execute(query, (BRIEF_VERSION,))}
+        keys, result = list(source_keys), {}
+        for start in range(0, len(keys), 400):
+            batch = keys[start:start + 400]
+            selected = query + " AND source_key IN (" + ",".join("?" for _ in batch) + ")"
+            result.update((key, ArticleRow(*values)) for key, *values in db.execute(selected, (BRIEF_VERSION, *batch)))
+        return result
 
 
 def read_briefs(path: str | Path) -> dict[str, str]:

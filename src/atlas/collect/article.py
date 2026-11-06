@@ -169,12 +169,12 @@ def public_url(url: str) -> None:
 def clean_document(content: bytes, content_type: str = "") -> CleanedDocument:
     if content.startswith(b"%PDF") or "application/pdf" in content_type:
         from pypdf import PdfReader
-        from pypdf.errors import PdfReadError
+        from pypdf.errors import PyPdfError
 
         try:
             reader = PdfReader(BytesIO(content))
             text = "\n".join(page.extract_text() or "" for page in reader.pages[:500])
-        except (PdfReadError, ValueError, KeyError) as error:
+        except (PyPdfError, ValueError, KeyError) as error:
             raise ArticleReadError("原文 PDF 无法提取文字") from error
         text = clean_paragraphs(text)
         return CleanedDocument(

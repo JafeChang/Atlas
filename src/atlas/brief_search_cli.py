@@ -366,12 +366,6 @@ def build_index(
             previous = index_metadata(destination)
             if any(previous.get(key) != protocol.get(key) for key in PROTOCOL_KEYS):
                 raise ValueError("增量更新的模型协议与索引不符，请显式全量 build")
-            with closing(readonly(destination)) as db:
-                for row in db.execute(
-                    "SELECT source_key,text_sha256,embedding FROM brief_search_documents"
-                ):
-                    validate_vector(row["embedding"])
-                    cache[row["source_key"]] = (row["text_sha256"], row["embedding"])
             if previous.get("source_snapshot_sha256") == snapshot.sha256:
                 return {
                     **previous,
@@ -382,6 +376,12 @@ def build_index(
                     "elapsed_seconds": time.perf_counter() - started,
                     "path": str(destination),
                 }
+            with closing(readonly(destination)) as db:
+                for row in db.execute(
+                    "SELECT source_key,text_sha256,embedding FROM brief_search_documents"
+                ):
+                    validate_vector(row["embedding"])
+                    cache[row["source_key"]] = (row["text_sha256"], row["embedding"])
         for revision in range(3):
             if not snapshot.documents and previous is None:
                 raise ValueError("没有已通过审核的中文译题和简介")

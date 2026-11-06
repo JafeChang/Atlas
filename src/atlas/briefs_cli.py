@@ -17,7 +17,6 @@ import requests
 
 from atlas.archive import (
     ArticleContentStore,
-    open_archive,
     read_article_body,
     read_article_contents,
 )
@@ -30,7 +29,6 @@ from atlas.collect.article import (
     read_source,
 )
 from atlas.collect.network_policy import SharedNetworkPolicy
-from atlas.webapp import ArchiveEntriesAccess
 
 
 def main(argv=None):
@@ -88,21 +86,20 @@ def main(argv=None):
 
 
 def _run(args, root, db_path, parser):
+    from atlas.source_index import read_sources, refresh_sources
+
     network_policy = SharedNetworkPolicy(root)
-    with open_archive(root) as archive:
-        access = ArchiveEntriesAccess(archive)
-        records = sorted(
-            (archive.get(rid) for rid in archive.all_raw_ids()),
-            key=lambda r: (r.fetched_at, r.raw_id),
-            reverse=True,
-        )
-        sources = {}
-        for record in records:
-            for source in access.brief_sources(record.raw_id).values():
-                sources.setdefault(source.key, source)
+    # Cooldown is checked before opening/parsing any historical content.
+    if args.report_dir and args.failure_cooldown:
+        retry_path = Path(args.report_dir) / "retry-after.json"
+        if retry_path.exists() and time.time() < json.loads(retry_path.read_text())["until"]:
+            print("上一轮生成失败，冷却期内不重复调用模型。", flush=True)
+            return 0
+    refresh_sources(root)
+    sources = read_sources(root)
     admission = read_admissions(db_path)
     sources = {k: s for k, s in sources.items() if admission.allows(k)}
-    existing = read_articles(db_path)
+    existing = read_articles(db_path, include_text=False)
     retained_bodies = read_article_contents(db_path)
     if args.source_key and set(args.source_key) - sources.keys():
         parser.error("指定的来源键不存在")
@@ -132,6 +129,9 @@ def _run(args, root, db_path, parser):
         pending = [s for s in pending if s.key in args.source_key]
     if args.limit:
         pending = pending[: args.limit]
+    selected = read_sources(root, keys=[s.key for s in pending], include_body=True)
+    pending = [selected[s.key] for s in pending]
+    existing.update(read_articles(db_path, source_keys=selected))
     report_dir = (
         Path(args.report_dir)
         if args.report_dir

@@ -230,6 +230,23 @@ class ArchiveEntriesAccess:
         with self._browse_lock:
             cached = self._browse_cache.get(record.raw_id)
             if cached is not None:
+                self._browse_cache[record.raw_id] = self._browse_cache.pop(record.raw_id)
+                return cached
+            from atlas.source_index import read_browse
+
+            saved = read_browse(
+                Path(self._archive.db_path).parent, record.raw_id,
+                (record.channel_id, record.endpoint) in self._subscription_sources,
+            )
+            if saved is not None:
+                refs = {
+                    (start, end): BriefSource(key, title, "", kind, url)
+                    for start, end, key, title, kind, url in saved.pop("sources")
+                }
+                saved["entries"] = tuple(_BrowseEntry(**entry) for entry in saved["entries"])
+                saved["problems"] = tuple(saved["problems"])
+                cached = _BrowseRecord(_RawEntriesView(**saved), refs)
+                self._remember_browse(record.raw_id, cached)
                 return cached
             analysis = self._analyse(record)
             sources = self.brief_sources(record.raw_id)
@@ -260,8 +277,14 @@ class ArchiveEntriesAccess:
                 for span, s in sources.items()
             }
             cached = _BrowseRecord(view, refs)
-            self._browse_cache[record.raw_id] = cached
+            self._remember_browse(record.raw_id, cached)
             return cached
+
+    def _remember_browse(self, raw_id, record):
+        # The complete index lives on disk; memory covers only recent pages.
+        while len(self._browse_cache) >= 128:
+            del self._browse_cache[next(iter(self._browse_cache))]
+        self._browse_cache[raw_id] = record
 
     def _analyse(self, record: RawRecord) -> _Analysis:
         with self._cache_lock:

@@ -18,7 +18,6 @@ from urllib.parse import urlsplit
 from atlas.archive import (
     ArticleContentStore,
     enable_wal,
-    open_archive,
     read_article_contents,
 )
 from atlas.cognition import BriefStore
@@ -35,14 +34,14 @@ from atlas.collect.article import (
 )
 from atlas.collect.article_failure import classify_article_failure
 from atlas.collect.network_policy import SharedNetworkPolicy
-from atlas.webapp import ArchiveEntriesAccess
 
 
 def seed_existing(store, db_path):
     existing = read_article_contents(db_path)
     with sqlite3.connect(db_path, timeout=30) as db:
         rows = db.execute(
-            "SELECT source_url,article_text,body_source,status,error,resolved_url,updated_at FROM feed_articles"
+            "SELECT source_url,article_text,body_source,status,error,resolved_url,updated_at FROM feed_articles f "
+            "WHERE NOT EXISTS (SELECT 1 FROM article_contents a WHERE a.source_url=f.source_url)"
         ).fetchall()
     chosen = {}
     rank = {"original": 3, "excerpt": 2, "abstract": 1, "title": 0}
@@ -159,23 +158,19 @@ def main(argv=None):
     except BlockingIOError:
         parser.error("同范围正文任务正在运行")
     enable_wal(db_path)
-    with open_archive(root) as archive:
-        access = ArchiveEntriesAccess(archive)
-        sources, recency, paper_channels = {}, {}, {}
-        for rid in archive.all_raw_ids():
-            record = archive.get(rid)
-            entries = {(e.char_start, e.char_end): e for e in access.entries_of(record).entries}
-            for position, source in access.brief_sources(rid).items():
-                sources[source.key] = source
-                timestamp = _source_recency(record, entries.get(position))
-                recency[source.url] = max(recency.get(source.url, 0), timestamp)
-                if is_paper(source.url) and record.channel_id.startswith("arxiv-"):
-                    paper_channels.setdefault(source.url, record.channel_id)
+    from atlas.source_index import read_sources, refresh_sources, source_priorities
+
+    refresh_sources(root)
+    sources = read_sources(root)
+    recency, paper_channels = source_priorities(root)
     admission = read_admissions(db_path)
     sources = {k: s for k, s in sources.items() if admission.allows(k)}
     brief_store = BriefStore(db_path)
     try:
-        brief_store.ensure_sources(list(sources.values()))
+        known = {row[0] for row in brief_store.db.execute("SELECT source_key FROM feed_articles")}
+        missing = [key for key in sources if key not in known]
+        for start in range(0, len(missing), 100):
+            brief_store.ensure_sources(list(read_sources(root, keys=missing[start:start + 100], include_body=True).values()))
     finally:
         brief_store.close()
     store = ArticleContentStore(db_path)
