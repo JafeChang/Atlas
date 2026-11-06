@@ -12,7 +12,7 @@ from atlas.collect.article import clean_document
 from atlas.contracts import RawRecord
 from atlas.ingest import collect_due
 from atlas.source_index import FILENAME, read_sources, refresh_sources
-from atlas.webapp import ArchiveEntriesAccess
+from atlas.webapp import ArchiveEntriesAccess, store_summary
 from tests.test_compose_pipeline import FakeFetcher, _dependencies, _register_channel
 
 URL = "https://example.test/feed"
@@ -284,6 +284,19 @@ def test_idle_vector_update_does_not_load_or_validate_all_vectors(
         ]
         == 1
     )
+
+
+def test_startup_summary_uses_index_without_reparsing_historical_bodies(tmp_path, monkeypatch):
+    put(tmp_path)
+    put(tmp_path, b"A whole article without a feed container.")
+    expected = store_summary(tmp_path)
+    assert (expected.records, expected.containers, expected.derived_entries, expected.direct_entries) == (2, 1, 1, 1)
+    assert refresh_sources(tmp_path) == 2
+    monkeypatch.setattr(
+        ArchiveEntriesAccess, "_analyse",
+        lambda *a: pytest.fail("startup reparsed an indexed historical response"),
+    )
+    assert store_summary(tmp_path) == expected
 
 
 def test_failed_poll_has_backoff_without_changing_last_success(tmp_path):

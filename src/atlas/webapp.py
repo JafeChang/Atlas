@@ -822,25 +822,26 @@ class StoreSummary:
 def store_summary(root: Any) -> StoreSummary:
     """只读盘点一份归档：归档记录数 / 容器数 / 派生条目数。
 
-    **不写任何字节**：只 `get_content` + `parse_entries`。归档句柄用完即关。
+    只读已有浏览索引，缺失时解析原文；归档句柄用完即关。
     """
     path = Path(root)
     archive = open_archive(path)
     try:
-        access = ArchiveEntriesAccess(archive)
-        containers = access.container_ids()
-        derived = 0
-        for raw_id in containers:
-            derived += len(access.entries_of(archive.get(raw_id)).entries)
+        access = ArchiveEntriesAccess(archive, cache_size=1)
+        raw_ids = archive.all_raw_ids()
+        containers = derived = unavailable = 0
+        for raw_id in raw_ids:
+            view = access.browse_record(archive.get(raw_id)).view
+            if view.is_feed:
+                containers += 1
+                derived += len(view.entries)
+            unavailable += bool(view.unavailable_reason)
         return StoreSummary(
             root=path,
-            records=len(archive.all_raw_ids()),
-            containers=len(containers),
+            records=len(raw_ids),
+            containers=containers,
             derived_entries=derived,
-            unavailable_records=sum(
-                bool(access.entries_of(archive.get(raw_id)).unavailable_reason)
-                for raw_id in archive.all_raw_ids()
-            ),
+            unavailable_records=unavailable,
         )
     finally:
         archive.close()
